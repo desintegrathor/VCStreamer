@@ -15,6 +15,7 @@ Inject the receiver.dll
 Connect to the desired server and log in as a spectator. Use arrow keys to select "Player cameras" and stay there.
 
 //Delay detection not yet implemented
+
 Now the program detects the spectator delay (it compares the total number of kills made by players in both game instances (Scraper - live, Receiver - delayed) and detects delta time.
 
 For this to work, at least one kill has to be made, and you have to wait at least the delay time (up to 180 s based on the server settings).
