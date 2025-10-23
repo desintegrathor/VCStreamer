@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include "GameMemoryReader.h"
 
 static uintptr_t baseGame = 0;
 static std::vector<PlayerInfo> currentPlayers;
@@ -27,7 +28,7 @@ static int lastFlagCarrierVC = 0; // Poslední známý nosič VC vlajky
 // ---------------------------
 void InitSpectatorController(uintptr_t baseGameAddr) {
     baseGame = baseGameAddr;
-    std::cout << "[Spectator] Modul inicializovan (base 0x"
+    std::cout << "[Spectator] Module initialized (base 0x"
         << std::hex << baseGame << std::dec << ")\n";
 }
 
@@ -54,19 +55,41 @@ static void UpdateAlphabeticalOrder() {
 // Nastaven� spectatoru na konkr�tn�ho hr��e
 // ---------------------------
 static void SetSpectatorToPlayerId(int playerId) {
-    auto it = alphabeticalIndex.find(playerId);
-    if (it == alphabeticalIndex.end()) {
-        std::cout << "[Spectator] ID " << playerId << " nebyl nalezen ve scoreboardu.\n";
+    // Resolve ID -> order using our local scoreboard (read from game memory) right before switching.
+    auto localPlayers = GameMemoryReader::ReadPlayerList();
+
+    std::vector<std::pair<std::string, int>> sorted;
+    for (const auto& p : localPlayers) {
+        sorted.emplace_back(p.name, p.id);
+    }
+
+    // Sort alphabetically by name; for duplicate names, sort by ID ascending
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        if (a.first == b.first) return a.second < b.second;
+        return a.first < b.first;
+    });
+
+    int index = -1;
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        if (sorted[i].second == playerId) {
+            index = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (index == -1) {
+        std::cout << "[Spectator] ID " << playerId << " was not found in local scoreboard.\n";
         return;
     }
 
-    int index = it->second;
     uintptr_t addr = baseGame + 0x7AE348;
     *(int*)addr = index;
     currentSpectatorIndex = index;
 
-    std::cout << "[Spectator] Prepinam pohled na hrace #" << index
-        << " (ID " << playerId << ")\n";
+    // Find player name for logging
+    std::string name = "Unknown";
+    for (const auto& p : localPlayers) if (p.id == playerId) { name = p.name; break; }
+    std::cout << "[Spectator] Switching view to player " << name << " (ID " << playerId << ")\n";
 }
 
 // ---------------------------
@@ -83,8 +106,8 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
     }
 
     UpdateAlphabeticalOrder();
-    std::cout << "[Spectator] Scoreboard aktualizovan ("
-        << currentPlayers.size() << " hracu)\n";
+    std::cout << "[Spectator] Scoreboard updated ("
+        << currentPlayers.size() << " players)\n";
 }
 
 // ---------------------------
@@ -93,16 +116,21 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
 void ProcessKillEvent(int killerId, int victimId) {
     std::lock_guard<std::mutex> lock(dataMutex);
 
-    if (watchingFlag) {
-        std::cout << "[Spectator] Ignoruji kill event - kamera sleduje vlajku.\n";
+    // Pokud je aktivní flag watching nebo cooldown, jen přepneme kameru bez zpráv
+    if (watchingFlag || isCooldown) {
         return;
     }
 
-    if (isCooldown) {
-        std::cout << "[Spectator] Kill event ignorovan - cooldown bezi.\n";
-        return;
+    // Najít jména hráčů
+    std::string killerName = "Unknown";
+    std::string victimName = "Unknown";
+    
+    for (const auto& player : currentPlayers) {
+        if (player.id == killerId) killerName = player.name;
+        if (player.id == victimId) victimName = player.name;
     }
 
+    std::cout << "[Kill] " << killerName << " zabije " << victimName << "\n";
     SetSpectatorToPlayerId(killerId);
 
     // Nastav cooldown
@@ -110,7 +138,6 @@ void ProcessKillEvent(int killerId, int victimId) {
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(15));
         isCooldown = false;
-        std::cout << "[Spectator] Cooldown skoncil.\n";
         }).detach();
 }
 
@@ -198,7 +225,7 @@ void ProcessFlagEvent(int usCarrier, int vcCarrier) {
         // Spustíme časovač pouze pokud jsme sledovali vlajku a časovač ještě neběží
         if (watchingFlag && !flagPriorityTimer) {
             flagPriorityTimer = true;
-            std::cout << "[Flag] Vlajka ztracena - držím kameru ještě 3 sekundy.\n";
+            std::cout << "[Flag] Flag lost - keeping camera on carrier for 3 more seconds.\n";
             
             // Spustíme časovač pro vypnutí priority
             std::thread([&]() {
@@ -208,7 +235,7 @@ void ProcessFlagEvent(int usCarrier, int vcCarrier) {
                     lastFlagCarrierUS = 0;
                     lastFlagCarrierVC = 0;
                     flagPriorityTimer = false;
-                    std::cout << "[Flag] Časovač vypršel - vracím kontrolu killům.\n";
+                    std::cout << "[Flag] Timer expired - returning control to kills.\n";
                 }
             }).detach();
         }
