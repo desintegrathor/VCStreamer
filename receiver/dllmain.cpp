@@ -63,11 +63,12 @@ void PipeListener() {
             }
 
             // ---------------------------
-            // KILL EVENT (kameru na OBĚŤ)
+            // KILL EVENT (kameru na KILLERA)
             // ---------------------------
             else if (type == "kill") {
+                int killer = j["killer"];
                 int victim = j["victim"];
-                ProcessKillEvent(victim);
+                ProcessKillEvent(killer, victim);
             }
 
             // ---------------------------

@@ -15,5 +15,5 @@ struct PlayerInfo {
 
 void InitSpectatorController(uintptr_t baseGameAddr);
 void UpdateScoreboard(const std::vector<PlayerInfo>& players);
-void ProcessKillEvent(int victimId);
+void ProcessKillEvent(int killerId, int victimId);
 void ProcessFlagEvent(int usCarrier, int vcCarrier);

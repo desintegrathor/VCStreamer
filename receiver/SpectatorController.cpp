@@ -7,17 +7,20 @@
 
 static uintptr_t baseGame = 0;
 static std::vector<PlayerInfo> currentPlayers;
-static std::map<int, int> alphabeticalIndex; // playerId ? po¯adÌ
+static std::map<int, int> alphabeticalIndex; // playerId ? poÔøΩadÔøΩ
 static std::mutex dataMutex;
 
 // Spectator control
 static std::atomic<bool> isCooldown{ false };
 static std::atomic<bool> watchingFlag{ false };
 static std::atomic<bool> flagThreadRunning{ false };
+static std::atomic<bool> flagPriorityTimer{ false };
 
 static int currentSpectatorIndex = -1;
-static int flagCarrierUS = 0; // ID hr·Ëe s US vlajkou
-static int flagCarrierVC = 0; // ID hr·Ëe s VC vlajkou
+static int flagCarrierUS = 0; // ID hr√°ƒçe s US vlajkou
+static int flagCarrierVC = 0; // ID hr√°ƒçe s VC vlajkou
+static int lastFlagCarrierUS = 0; // Posledn√≠ zn√°m√Ω nosiƒç US vlajky
+static int lastFlagCarrierVC = 0; // Posledn√≠ zn√°m√Ω nosiƒç VC vlajky
 
 // ---------------------------
 // Inicializace
@@ -29,7 +32,7 @@ void InitSpectatorController(uintptr_t baseGameAddr) {
 }
 
 // ---------------------------
-// Se¯azenÌ podle jmÈna (duplicitnÌ jmÈna -> podle ID)
+// SeÔøΩazenÔøΩ podle jmÔøΩna (duplicitnÔøΩ jmÔøΩna -> podle ID)
 // ---------------------------
 static void UpdateAlphabeticalOrder() {
     std::vector<std::pair<std::string, int>> sorted;
@@ -48,7 +51,7 @@ static void UpdateAlphabeticalOrder() {
 }
 
 // ---------------------------
-// NastavenÌ spectatoru na konkrÈtnÌho hr·Ëe
+// NastavenÔøΩ spectatoru na konkrÔøΩtnÔøΩho hrÔøΩÔøΩe
 // ---------------------------
 static void SetSpectatorToPlayerId(int playerId) {
     auto it = alphabeticalIndex.find(playerId);
@@ -85,22 +88,22 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
 }
 
 // ---------------------------
-// Kill event ñ kamera na OBÃç
+// Kill event - kamera na killera
 // ---------------------------
-void ProcessKillEvent(int victimId) {
+void ProcessKillEvent(int killerId, int victimId) {
     std::lock_guard<std::mutex> lock(dataMutex);
 
     if (watchingFlag) {
-        std::cout << "[Spectator] Ignoruji kill event ñ kamera sleduje vlajku.\n";
+        std::cout << "[Spectator] Ignoruji kill event - kamera sleduje vlajku.\n";
         return;
     }
 
     if (isCooldown) {
-        std::cout << "[Spectator] Kill event ignorovan ñ cooldown bezi.\n";
+        std::cout << "[Spectator] Kill event ignorovan - cooldown bezi.\n";
         return;
     }
 
-    SetSpectatorToPlayerId(victimId);
+    SetSpectatorToPlayerId(killerId);
 
     // Nastav cooldown
     isCooldown = true;
@@ -112,7 +115,7 @@ void ProcessKillEvent(int victimId) {
 }
 
 // ---------------------------
-// Vnit¯nÌ vl·kno sledujÌcÌ vlajkonoöe
+// VnitÔøΩnÔøΩ vlÔøΩkno sledujÔøΩcÔøΩ vlajkonoÔøΩe
 // ---------------------------
 static void FlagWatcherThread() {
     flagThreadRunning = true;
@@ -124,13 +127,17 @@ static void FlagWatcherThread() {
         }
 
         int localUS = 0, localVC = 0;
+        int lastUS = 0, lastVC = 0;
 
         {
             std::lock_guard<std::mutex> lock(dataMutex);
             localUS = flagCarrierUS;
             localVC = flagCarrierVC;
+            lastUS = lastFlagCarrierUS;
+            lastVC = lastFlagCarrierVC;
         }
 
+        // Pou≈æ√≠v√°me aktu√°ln√≠ vlajkono≈°e, pokud existuj√≠
         if (localUS != 0 && localVC == 0) {
             SetSpectatorToPlayerId(localUS);
         }
@@ -138,12 +145,21 @@ static void FlagWatcherThread() {
             SetSpectatorToPlayerId(localVC);
         }
         else if (localUS != 0 && localVC != 0) {
-            // obÏ vlajky neseny ? p¯epÌnej mezi nimi kaûd˝ch 5s
+            // Obƒõ vlajky neseny - p≈ôep√≠nej mezi nimi ka≈æd√Ωch 5s
             SetSpectatorToPlayerId(localUS);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             SetSpectatorToPlayerId(localVC);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
+        }
+        // Pokud nikdo nenese vlajku, ale jsme v ƒçasov√©m oknƒõ po ztr√°tƒõ vlajky
+        else if (flagPriorityTimer && (lastUS != 0 || lastVC != 0)) {
+            if (lastUS != 0) {
+                SetSpectatorToPlayerId(lastUS);
+            }
+            else if (lastVC != 0) {
+                SetSpectatorToPlayerId(lastVC);
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -153,26 +169,52 @@ static void FlagWatcherThread() {
 }
 
 // ---------------------------
-// Flag event ñ p¯epÌn·nÌ na hr·Ëe s vlajkou
+// Flag event - p≈ôep√≠n√°n√≠ na hr√°ƒçe s vlajkou
 // ---------------------------
 void ProcessFlagEvent(int usCarrier, int vcCarrier) {
     {
         std::lock_guard<std::mutex> lock(dataMutex);
+        
+        // Pokud nƒõkter√Ω z vlajkono≈°≈Ø p≈ôestal n√©st vlajku, ulo≈æ√≠me si jeho ID
+        if (flagCarrierUS != 0 && usCarrier == 0) {
+            lastFlagCarrierUS = flagCarrierUS;
+        }
+        if (flagCarrierVC != 0 && vcCarrier == 0) {
+            lastFlagCarrierVC = flagCarrierVC;
+        }
+        
         flagCarrierUS = usCarrier;
         flagCarrierVC = vcCarrier;
     }
 
-    if (usCarrier == 0 && vcCarrier == 0) {
-        if (watchingFlag) {
-            std::cout << "[Flag] Nikdo nenese vlajku ñ vracim kontrolu killum.\n";
+    // Pokud nƒõkdo nese vlajku, nastav√≠me watching flag
+    if (usCarrier != 0 || vcCarrier != 0) {
+        watchingFlag = true;
+        // Reset ƒçasovaƒçe priority
+        flagPriorityTimer = false;
+    }
+    // Pokud nikdo nenese vlajku
+    else if (usCarrier == 0 && vcCarrier == 0) {
+        // Spust√≠me ƒçasovaƒç pouze pokud jsme sledovali vlajku a ƒçasovaƒç je≈°tƒõ nebƒõ≈æ√≠
+        if (watchingFlag && !flagPriorityTimer) {
+            flagPriorityTimer = true;
+            std::cout << "[Flag] Vlajka ztracena - dr≈æ√≠m kameru je≈°tƒõ 3 sekundy.\n";
+            
+            // Spust√≠me ƒçasovaƒç pro vypnut√≠ priority
+            std::thread([&]() {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                if (flagPriorityTimer) { // Kontrola, zda mezit√≠m nƒõkdo nevzal vlajku
+                    watchingFlag = false;
+                    lastFlagCarrierUS = 0;
+                    lastFlagCarrierVC = 0;
+                    flagPriorityTimer = false;
+                    std::cout << "[Flag] ƒåasovaƒç vypr≈°el - vrac√≠m kontrolu kill≈Øm.\n";
+                }
+            }).detach();
         }
-        watchingFlag = false;
-        return;
     }
 
-    watchingFlag = true;
-
-    // SpustÌ watcher jen jednou
+    // Spust√≠ watcher jen jednou
     if (!flagThreadRunning) {
         std::thread(FlagWatcherThread).detach();
     }
