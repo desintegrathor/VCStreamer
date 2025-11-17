@@ -68,6 +68,14 @@ std::vector<PlayerInfo> GameMemoryReader::ReadPlayerList() {
         player.kills = *((int*)entry + 2912);
         player.deaths = *((int*)entry + 2913);
         player.score = *((int*)entry + 2914);
+
+        // Read player rotation (offsets in bytes: +672, +676, +680)
+        // Converting to float pointer for proper reading
+        float* entryFloat = (float*)entry;
+        player.pitch = *(entryFloat + 168);  // +672 bytes / 4 = offset 168
+        player.yaw = *(entryFloat + 169);    // +676 bytes / 4 = offset 169
+        player.roll = *(entryFloat + 170);   // +680 bytes / 4 = offset 170
+
         players.push_back(player);
     }
 
@@ -81,4 +89,30 @@ int GameMemoryReader::GetTotalKills() {
         total += player.kills;
     }
     return total;
+}
+
+float GameMemoryReader::ReadCameraYaw() {
+    if (!baseGame) return 0.0f;
+
+    // Based on documentation: Vietcong - Spectator Mode 2 Camera Yaw Analysis
+    // Global structure base: 0x14EE320
+    // Free camera entry array starts at: 0x14EE350 (base + 0x30)
+    // Entry size: 20 bytes (0x14)
+    // Yaw offset within entry: +0x0C
+    //
+    // For camera index 0:
+    //   Entry base = 0x14EE350 + (0 * 20) = 0x14EE350
+    //   Yaw address = 0x14EE350 + 0x0C = 0x14EE35C
+    //
+    // Full offset from game.dll base: 0xAEE35C
+
+    uintptr_t cameraYawAddr = baseGame + 0xAEE35C;
+
+    __try {
+        float yaw = *(float*)cameraYawAddr;
+        return yaw;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0.0f;
+    }
 }

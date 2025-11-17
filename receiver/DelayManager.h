@@ -38,21 +38,13 @@ struct DelayedAction {
 class DelayManager {
 public:
     static void Init();
-    static void UpdateLocalKills(int kills);
-    static void UpdatePipeKills(int kills);
     static void AddDelayedAction(const DelayedAction& action);
     static void ProcessActions();
     static int GetCurrentDelay() { return currentDelay; }
-    static bool IsDelayDetected() { return delayDetected; }
 
 private:
     static std::queue<DelayedAction> actions;
-    static int localKills;
-    static int pipeKills;
-    static int currentDelay;  // v milisekundách
-    static bool delayDetected;
-    static std::chrono::system_clock::time_point lastLocalKillsUpdate;
-    static std::chrono::system_clock::time_point lastPipeKillsUpdate;
+    static int currentDelay;  // v milisekundách (loaded from INI)
 
-    static void TryDetectDelay();
+    static int LoadDelayFromINI();
 };

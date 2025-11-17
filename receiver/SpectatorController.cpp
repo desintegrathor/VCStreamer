@@ -18,6 +18,7 @@ static std::atomic<bool> flagThreadRunning{ false };
 static std::atomic<bool> flagPriorityTimer{ false };
 
 static int currentSpectatorIndex = -1;
+static int currentSpectatorPlayerId = -1; // Currently watched player ID
 static int flagCarrierUS = 0; // ID hráče s US vlajkou
 static int flagCarrierVC = 0; // ID hráče s VC vlajkou
 static int lastFlagCarrierUS = 0; // Poslední známý nosič US vlajky
@@ -28,8 +29,10 @@ static int lastFlagCarrierVC = 0; // Poslední známý nosič VC vlajky
 // ---------------------------
 void InitSpectatorController(uintptr_t baseGameAddr) {
     baseGame = baseGameAddr;
-    std::cout << "[Spectator] Module initialized (base 0x"
-        << std::hex << baseGame << std::dec << ")\n";
+
+    // Patch camera distance on startup
+    // Using shorter distances for better visibility: 3.0m normal, 1.5m crouched
+    PatchCameraDistance(3.0f, 1.5f);
 }
 
 // ---------------------------
@@ -85,11 +88,12 @@ static void SetSpectatorToPlayerId(int playerId) {
     uintptr_t addr = baseGame + 0x7AE348;
     *(int*)addr = index;
     currentSpectatorIndex = index;
+    currentSpectatorPlayerId = playerId;  // Remember which player we're watching
 
     // Find player name for logging
     std::string name = "Unknown";
     for (const auto& p : localPlayers) if (p.id == playerId) { name = p.name; break; }
-    std::cout << "[Spectator] Switching view to player " << name << " (ID " << playerId << ")\n";
+    // Camera switch logging moved to ProcessKillEvent/ProcessFlagEvent
 }
 
 // ---------------------------
@@ -106,8 +110,6 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
     }
 
     UpdateAlphabeticalOrder();
-    std::cout << "[Spectator] Scoreboard updated ("
-        << currentPlayers.size() << " players)\n";
 }
 
 // ---------------------------
@@ -130,7 +132,7 @@ void ProcessKillEvent(int killerId, int victimId) {
         if (player.id == victimId) victimName = player.name;
     }
 
-    std::cout << "[Kill] " << killerName << " zabije " << victimName << "\n";
+    std::cout << "[Kill] " << killerName << " killed " << victimName << " -> switching to " << killerName << "\n";
     SetSpectatorToPlayerId(killerId);
 
     // Nastav cooldown
@@ -164,15 +166,28 @@ static void FlagWatcherThread() {
             lastVC = lastFlagCarrierVC;
         }
 
+        // Get player names for logging
+        std::string usName = "Unknown", vcName = "Unknown";
+        {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            for (const auto& p : currentPlayers) {
+                if (p.id == localUS) usName = p.name;
+                if (p.id == localVC) vcName = p.name;
+            }
+        }
+
         // Používáme aktuální vlajkonoše, pokud existují
         if (localUS != 0 && localVC == 0) {
+            std::cout << "[Flag] Following US flag carrier: " << usName << "\n";
             SetSpectatorToPlayerId(localUS);
         }
         else if (localVC != 0 && localUS == 0) {
+            std::cout << "[Flag] Following VC flag carrier: " << vcName << "\n";
             SetSpectatorToPlayerId(localVC);
         }
         else if (localUS != 0 && localVC != 0) {
             // Obě vlajky neseny - přepínej mezi nimi každých 5s
+            std::cout << "[Flag] Both flags taken - alternating between " << usName << " (US) and " << vcName << " (VC)\n";
             SetSpectatorToPlayerId(localUS);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             SetSpectatorToPlayerId(localVC);
@@ -244,5 +259,77 @@ void ProcessFlagEvent(int usCarrier, int vcCarrier) {
     // Spustí watcher jen jednou
     if (!flagThreadRunning) {
         std::thread(FlagWatcherThread).detach();
+    }
+}
+
+// ---------------------------
+// Camera Orientation Control
+// ---------------------------
+
+void SetCameraOrientation(float pitch, float yaw, float roll) {
+    if (!baseGame) return;
+
+    // Based on spectator_orientation_lock.txt documentation:
+    // We need to find the "free camera entry" structure and write rotation there
+    // The structure contains rotation at offsets:
+    // +0x8  = pitch (rotation_x)
+    // +0xC  = yaw (rotation_y)
+    // +0x10 = distance (we don't modify this here)
+
+    // For spectator mode 2 (Free Camera), the camera rotation is stored in a structure
+    // that we need to find. According to the docs, this is loaded during GNET_SpectatorCtrl_FillCamera
+    // For now, we'll try writing to player entity rotation which might be mirrored to camera
+
+    // Alternative approach: Write directly to the spectator camera structure
+    // This needs to be discovered through reverse engineering
+    // Placeholder addresses - these need to be verified!
+
+    // TODO: Find actual camera rotation addresses through memory scanning
+    // For now, this function is prepared but needs proper addresses
+
+    std::cout << "[Camera] Setting orientation: pitch=" << pitch
+              << " yaw=" << yaw << " roll=" << roll << "\n";
+}
+
+void UpdateCameraOrientation() {
+    // Placeholder for future camera orientation sync
+    // Currently disabled - no debug output
+}
+
+// ---------------------------
+// Camera Distance Patch
+// ---------------------------
+
+void PatchCameraDistance(float normalDistance, float crouchedDistance) {
+    if (!baseGame) return;
+
+    // Based on spectator_camera_distance.txt documentation:
+    // Function: GPLAYER_CalculateFollowCameraPosition at 0x1012E570
+    //
+    // Normal stance distance (default 7.0m):
+    //   Address: 0x1012E60D (RVA in game.dll)
+    //   Original bytes: C7 44 24 18 00 00 E0 40
+    //   This is: mov [esp+50h+var_38], 0x40E00000  (7.0f)
+    //
+    // Crouched distance (default 2.0m):
+    //   Address: 0x1012E617 (RVA in game.dll)
+    //   Original bytes: C7 44 24 18 00 00 00 40
+    //   This is: mov [esp+50h+var_38], 0x40000000  (2.0f)
+
+    uintptr_t normalDistAddr = baseGame + 0x1012E60D + 4;  // +4 to skip to the immediate value
+    uintptr_t crouchedDistAddr = baseGame + 0x1012E617 + 4;
+
+    DWORD oldProtect;
+
+    // Patch normal distance
+    if (VirtualProtect((LPVOID)normalDistAddr, sizeof(float), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        *(float*)normalDistAddr = normalDistance;
+        VirtualProtect((LPVOID)normalDistAddr, sizeof(float), oldProtect, &oldProtect);
+    }
+
+    // Patch crouched distance
+    if (VirtualProtect((LPVOID)crouchedDistAddr, sizeof(float), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        *(float*)crouchedDistAddr = crouchedDistance;
+        VirtualProtect((LPVOID)crouchedDistAddr, sizeof(float), oldProtect, &oldProtect);
     }
 }

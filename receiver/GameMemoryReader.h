@@ -19,6 +19,7 @@ public:
     static void Init(uintptr_t baseAddr);
     static std::vector<PlayerInfo> ReadPlayerList();
     static int GetTotalKills();
+    static float ReadCameraYaw();  // Read spectator camera yaw rotation
 
 private:
     static uintptr_t baseGame;
