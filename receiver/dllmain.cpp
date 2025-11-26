@@ -6,6 +6,7 @@
 #include "SpectatorController.h"
 #include "GameMemoryReader.h"
 #include "DelayManager.h"
+#include "FirstPersonCamera.h"
 
 using json = nlohmann::json;
 
@@ -121,10 +122,32 @@ DWORD WINAPI MainThread(LPVOID) {
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    uintptr_t base = GetModuleBase(L"game.dll");
+    // Wait for game.dll to be loaded
+    std::cout << "[VCStreamer] Waiting for game.dll...\n";
+    uintptr_t base = 0;
+    for (int i = 0; i < 300; i++) {  // Max 30 seconds
+        base = GetModuleBase(L"game.dll");
+        if (base != 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (base == 0) {
+        std::cout << "[VCStreamer] ERROR: game.dll not found!\n";
+        return 1;
+    }
+
+    std::cout << "[VCStreamer] game.dll found at 0x" << std::hex << base << std::dec << "\n";
+
+    // Wait additional time for game.dll to fully initialize
+    std::cout << "[VCStreamer] Waiting for game initialization...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
     InitSpectatorController(base);
     GameMemoryReader::Init(base);
     DelayManager::Init();
+
+    // Initialize first-person camera hook
+    InitFirstPersonCamera(base);
 
     // Spusť monitoring scoreboardu
     std::thread scoreboardThread(ScoreboardMonitor);

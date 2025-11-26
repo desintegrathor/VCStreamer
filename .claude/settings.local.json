@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir /B)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\":*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\" receiver.sln -p:Configuration=Release -p:Platform=x86 -t:Build)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\" receiver.sln -p:Configuration=Release -p:Platform=x86 -t:Clean,Build)",
+      "Bash(dir /s /b *.txt)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nReplaced automatic delay detection with INI configuration and cleaned console output\n\n- Removed automatic delay detection logic\n- Added INI file reader for delay configuration (vcstreamer.ini)\n- Default delay: 10 seconds (configurable)\n- Cleaned up console output to show only game events\n- Added player rotation reading infrastructure (pitch/yaw/roll at +672/+676/+680)\n- Implemented camera distance patching (3.0m normal, 1.5m crouched)\n- Improved flag event logging with player names\n- Removed all debug/technical messages for cleaner output\n\nConsole now shows only:\n- Kill events with player names and camera switches\n- Flag carrier tracking with player names\n- Flag priority timer messages\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git push:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
