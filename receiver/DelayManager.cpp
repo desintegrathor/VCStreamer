@@ -7,6 +7,13 @@
 
 std::queue<DelayedAction> DelayManager::actions;
 int DelayManager::currentDelay = 0;
+float DelayManager::fpvOffsetBack = 0.8f;
+float DelayManager::fpvOffsetLeft = 0.3f;
+float DelayManager::fpvOffsetUp = 0.3f;
+float DelayManager::fpvPitchOffset = 0.785f;
+int DelayManager::fpvChance = 50;
+bool DelayManager::debugMode = false;
+DWORD DelayManager::lastConfigReload = 0;
 
 int DelayManager::LoadDelayFromINI() {
     // Get the directory where the DLL is located
@@ -51,21 +58,49 @@ int DelayManager::LoadDelayFromINI() {
                     if (key == "delay") {
                         try {
                             int delaySeconds = std::stoi(value);
-                            return delaySeconds * 1000; // Convert to milliseconds
+                            currentDelay = delaySeconds * 1000; // Convert to milliseconds
                         } catch (...) {
                             // Invalid value, use default
                         }
+                    } else if (key == "fpv_offset_back") {
+                        try { fpvOffsetBack = std::stof(value); } catch (...) {}
+                    } else if (key == "fpv_offset_left") {
+                        try { fpvOffsetLeft = std::stof(value); } catch (...) {}
+                    } else if (key == "fpv_offset_up") {
+                        try { fpvOffsetUp = std::stof(value); } catch (...) {}
+                    } else if (key == "fpv_pitch_offset") {
+                        try { fpvPitchOffset = std::stof(value); } catch (...) {}
+                    } else if (key == "fpv_chance") {
+                        try { fpvChance = std::stoi(value); } catch (...) {}
+                    } else if (key == "debug_mode") {
+                        try { debugMode = (std::stoi(value) != 0); } catch (...) {}
                     }
                 }
             }
             iniFile.close();
+            return currentDelay != 0 ? currentDelay : 10000;
         } else {
             // Create default INI file
             std::ofstream outFile(iniPath);
             if (outFile.is_open()) {
                 outFile << "; VCStreamer Configuration File\n";
+                outFile << "\n";
                 outFile << "; Spectator delay in seconds (time between scraper and streamer)\n";
                 outFile << "delay=10\n";
+                outFile << "\n";
+                outFile << "; FPV camera offsets (in meters, relative to player direction)\n";
+                outFile << "fpv_offset_back=0.8\n";
+                outFile << "fpv_offset_left=0.3\n";
+                outFile << "fpv_offset_up=0.3\n";
+                outFile << "\n";
+                outFile << "; FPV pitch offset in radians (0.785 = ~45 degrees down)\n";
+                outFile << "fpv_pitch_offset=0.785\n";
+                outFile << "\n";
+                outFile << "; FPV chance in percent (0-100, chance of FPV vs 3PV when switching players)\n";
+                outFile << "fpv_chance=50\n";
+                outFile << "\n";
+                outFile << "; Debug mode (0=normal, 1=reload config periodically for live tuning)\n";
+                outFile << "debug_mode=0\n";
                 outFile.close();
                 return 10000; // Default 10 seconds
             }
@@ -119,4 +154,20 @@ void DelayManager::ProcessActions() {
             break;
         }
     }
+}
+
+void DelayManager::ReloadConfigIfNeeded() {
+    // Only reload periodically in debug mode
+    if (!debugMode) {
+        return;
+    }
+
+    DWORD now = GetTickCount();
+    if (now - lastConfigReload < CONFIG_RELOAD_INTERVAL) {
+        return;  // Too soon since last reload
+    }
+    lastConfigReload = now;
+
+    // Re-read config (LoadDelayFromINI also loads FPV config)
+    LoadDelayFromINI();
 }

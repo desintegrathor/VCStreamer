@@ -1,4 +1,5 @@
 #include "FirstPersonCamera.h"
+#include "DelayManager.h"
 #include "minhook/MinHook.h"
 #include <iostream>
 #include <cmath>
@@ -22,6 +23,11 @@ enum class CameraMode {
 // Configuration
 constexpr bool FPV_ENABLED = true;             // Enable random FPV/3PV selection
 constexpr int FPV_CHANCE_PERCENT = 50;         // Chance of FPV when switching players (0-100)
+
+// 3PV distance smoothing
+constexpr float MAX_CAMERA_DISTANCE = 2.5f;    // Max distance from player
+constexpr float ZOOM_IN_FACTOR = 0.3f;         // Fast zoom in (collision)
+constexpr float ZOOM_OUT_FACTOR = 0.005f;      // Very slow zoom out
 
 // Game.dll offsets (IDA addresses minus IDA base 0xD40000)
 constexpr uintptr_t OFFSET_FILL_CAMERA = 0x147650;           // IDA: 0xE87650
@@ -104,6 +110,10 @@ static float g_fpvSmoothedYaw = 0.0f;
 static float g_fpvSmoothedPitch = 0.0f;
 static bool g_fpvInitialized = false;
 
+// 3PV distance smoothing state
+static float g_smoothedDistance = 2.5f;
+static bool g_distanceInitialized = false;
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -134,20 +144,22 @@ void OnPlayerChanged(void* newPlayerEntity) {
     InitRandom();
 
     if (FPV_ENABLED) {
-        // Random chance for FPV vs 3PV
+        // Random chance for FPV vs 3PV (from config)
         int roll = rand() % 100;
-        if (roll < FPV_CHANCE_PERCENT) {
+        if (roll < DelayManager::GetFpvChance()) {
             g_currentCameraMode = CameraMode::FirstPerson;
             g_fpvInitialized = false;  // Reset FPV smoothing
             std::cout << "[Camera] Switched to FPV mode\n";
         } else {
             g_currentCameraMode = CameraMode::ThirdPerson;
             g_yawInitialized = false;  // Reset 3PV smoothing
+            g_distanceInitialized = false;  // Reset distance smoothing
             std::cout << "[Camera] Switched to 3PV mode\n";
         }
     } else {
         g_currentCameraMode = CameraMode::ThirdPerson;
         g_yawInitialized = false;
+        g_distanceInitialized = false;
     }
 
     g_lastPlayerEntity = newPlayerEntity;
@@ -229,6 +241,9 @@ bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, float* 
 
 // Using __fastcall to handle __thiscall convention (thisPtr in ECX, ignore EDX)
 int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraProp) {
+    // Periodically reload config from INI file
+    DelayManager::ReloadConfigIfNeeded();
+
     // Check spectator mode - only modify Mode 2 (follow player)
     int mode = *(int*)((char*)thisPtr + SPECTATOR_CTRL_MODE);
 
@@ -309,6 +324,57 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
     // Call original function - it will use our overwritten yaw/pitch values
     int result = g_OriginalFillCamera(thisPtr, cameraProp);
 
+    // Post-processing for 3PV mode - distance smoothing
+    if (mode == SPECTATOR_MODE_FREE && result && g_currentCameraMode == CameraMode::ThirdPerson) {
+        void* client = *(void**)((char*)thisPtr + SPECTATOR_CTRL_CLIENT);
+        if (client) {
+            void* playerEntity = *(void**)((char*)client + CLIENT_PLAYER_ENTITY);
+            if (playerEntity && g_GetChestPosition) {
+                // Get player chest position
+                float playerPos[3];
+                g_GetChestPosition(playerEntity, playerPos);
+
+                // Get current camera position
+                float* camPos = (float*)cameraProp;
+
+                // Calculate direction and actual distance
+                float dx = camPos[0] - playerPos[0];
+                float dy = camPos[1] - playerPos[1];
+                float dz = camPos[2] - playerPos[2];
+                float originalDistance = sqrtf(dx*dx + dy*dy + dz*dz);
+
+                // Target distance is clamped to max
+                float targetDistance = originalDistance;
+                if (targetDistance > MAX_CAMERA_DISTANCE)
+                    targetDistance = MAX_CAMERA_DISTANCE;
+
+                // Initialize or smooth distance
+                if (!g_distanceInitialized) {
+                    g_smoothedDistance = targetDistance;
+                    g_distanceInitialized = true;
+                } else {
+                    // Asymmetric smoothing: fast zoom in, slow zoom out
+                    float factor = (targetDistance < g_smoothedDistance)
+                        ? ZOOM_IN_FACTOR   // Moving closer (collision) - fast
+                        : ZOOM_OUT_FACTOR; // Moving farther - slow
+                    g_smoothedDistance += (targetDistance - g_smoothedDistance) * factor;
+                }
+
+                // Clamp smoothed distance too
+                if (g_smoothedDistance > MAX_CAMERA_DISTANCE)
+                    g_smoothedDistance = MAX_CAMERA_DISTANCE;
+
+                // Apply smoothed distance - use ORIGINAL distance for scale!
+                if (originalDistance > 0.01f) {
+                    float scale = g_smoothedDistance / originalDistance;
+                    camPos[0] = playerPos[0] + dx * scale;
+                    camPos[1] = playerPos[1] + dy * scale;
+                    camPos[2] = playerPos[2] + dz * scale + 0.5f;  // +0.5m up
+                }
+            }
+        }
+    }
+
     // Post-processing for FPV mode (needs to override position after original)
     if (mode == SPECTATOR_MODE_FREE && result && g_currentCameraMode == CameraMode::FirstPerson) {
         void* client = *(void**)((char*)thisPtr + SPECTATOR_CTRL_CLIENT);
@@ -322,38 +388,45 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                     // Get eye position
                     float eyePos[3];
                     if (g_GetEyeWorldPos && g_GetEyeWorldPos(skeleton, eyePos)) {
+                        // Use bone rotation (same as 3PV) but inverted axes for FPV
                         float yaw = 0.0f, pitch = 0.0f;
+                        GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch);
+                        yaw = -yaw + 3.14159265f;  // Invert yaw and add PI to look forward
+                        pitch = -pitch + DelayManager::GetFpvPitchOffset();  // Invert pitch and offset from config
 
-                        // Get rotation from head bone
-                        if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
-                            // FPV pitch: clamp to ±10° and offset slightly upward
-                            constexpr float MAX_PITCH_FPV = 0.175f;  // 10 degrees
-                            constexpr float PITCH_OFFSET_FPV = -0.09f; // ~5° upward (negative = up)
-                            pitch += PITCH_OFFSET_FPV;
-                            if (pitch > MAX_PITCH_FPV) pitch = MAX_PITCH_FPV;
-                            if (pitch < -MAX_PITCH_FPV) pitch = -MAX_PITCH_FPV;
+                        // Initialize FPV smoothing on first use or player change
+                        if (!g_fpvInitialized || playerEntity != g_lastPlayerEntity) {
+                            g_fpvSmoothedYaw = yaw;
+                            g_fpvSmoothedPitch = pitch;
+                            g_fpvInitialized = true;
+                        }
 
-                            // Initialize FPV smoothing on first use or player change
-                            if (!g_fpvInitialized || playerEntity != g_lastPlayerEntity) {
-                                g_fpvSmoothedYaw = yaw;
-                                g_fpvSmoothedPitch = pitch;
-                                g_fpvInitialized = true;
-                            }
+                        // FPV smoothing (0.03 = smooth, 3PV uses 0.01)
+                        constexpr float FPV_SMOOTH_FACTOR = 0.03f;
+                        g_fpvSmoothedYaw = LerpAngle(g_fpvSmoothedYaw, yaw, FPV_SMOOTH_FACTOR);
+                        g_fpvSmoothedPitch = g_fpvSmoothedPitch + (pitch - g_fpvSmoothedPitch) * FPV_SMOOTH_FACTOR;
 
-                            // FPV smoothing (0.03 = smooth, 3PV uses 0.01)
-                            constexpr float FPV_SMOOTH_FACTOR = 0.03f;
-                            g_fpvSmoothedYaw = LerpAngle(g_fpvSmoothedYaw, yaw, FPV_SMOOTH_FACTOR);
-                            g_fpvSmoothedPitch = g_fpvSmoothedPitch + (pitch - g_fpvSmoothedPitch) * FPV_SMOOTH_FACTOR;
+                        // Set camera at eye position with offset
+                        // Use raw yaw (before transform) for direction vectors
+                        float rawYaw = 0.0f, rawPitch = 0.0f;
+                        GetBoneRotation(skeleton, BONE_HEAD, &rawYaw, &rawPitch);
 
-                            // Set camera at eye position
-                            float* camPos = (float*)cameraProp;
-                            camPos[0] = eyePos[0];
-                            camPos[1] = eyePos[1];
-                            camPos[2] = eyePos[2];
+                        // Direction vectors: forward=(sin,cos), back=(-sin,-cos), left=(-cos,sin)
+                        float sinY = sinf(rawYaw);
+                        float cosY = cosf(rawYaw);
 
-                            if (g_SetCameraRotation) {
-                                g_SetCameraRotation(cameraProp, g_fpvSmoothedPitch, 0.0f, g_fpvSmoothedYaw);
-                            }
+                        // Offset from config
+                        float offBack = DelayManager::GetFpvOffsetBack();
+                        float offLeft = DelayManager::GetFpvOffsetLeft();
+                        float offUp = DelayManager::GetFpvOffsetUp();
+
+                        float* camPos = (float*)cameraProp;
+                        camPos[0] = eyePos[0] + sinY * offBack + cosY * offLeft;  // back + left
+                        camPos[1] = eyePos[1] + cosY * offBack - sinY * offLeft;  // back + left
+                        camPos[2] = eyePos[2] + offUp;                             // up
+
+                        if (g_SetCameraRotation) {
+                            g_SetCameraRotation(cameraProp, g_fpvSmoothedPitch, 0.0f, g_fpvSmoothedYaw);
                         }
                     }
                 }
