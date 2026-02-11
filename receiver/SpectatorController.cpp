@@ -6,9 +6,16 @@
 #include <chrono>
 #include "GameMemoryReader.h"
 
+// Spectator controller memory offsets (game.dll v16)
+// Based on reverse engineering of c_GNET_SpectatorCtrl class
+constexpr uintptr_t SPECTATOR_CTRL_OFFSET = 0x7AECC0;  // dword_151ECC0 in IDA
+constexpr uintptr_t SPECTATOR_PLAYER_COUNT_OFFSET = 0x24;  // this[9] - player count
+constexpr uintptr_t SPECTATOR_CURRENT_INDEX_OFFSET = 0x28; // this[10] - current index
+constexpr uintptr_t SPECTATOR_PLAYER_ARRAY_OFFSET = 0x2C;  // this[11]+ - player array start
+constexpr size_t SPECTATOR_ENTRY_SIZE = 20;  // 5 DWORDs per entry (handle, name ptr, etc.)
+
 static uintptr_t baseGame = 0;
 static std::vector<PlayerInfo> currentPlayers;
-static std::map<int, int> alphabeticalIndex; // playerId ? po�ad�
 static std::mutex dataMutex;
 
 // Spectator control
@@ -36,64 +43,76 @@ void InitSpectatorController(uintptr_t baseGameAddr) {
 }
 
 // ---------------------------
-// Se�azen� podle jm�na (duplicitn� jm�na -> podle ID)
+// Nastaven� spectatoru na konkr�tn�ho hr��e
 // ---------------------------
-static void UpdateAlphabeticalOrder() {
-    std::vector<std::pair<std::string, int>> sorted;
-    for (auto& p : currentPlayers)
-        sorted.push_back({ p.name, p.id });
+static void SetSpectatorToPlayerId(int playerId) {
+    if (!baseGame) return;
 
-    std::sort(sorted.begin(), sorted.end(),
-        [](auto& a, auto& b) {
+    // Read spectator order directly from game's spectator controller
+    // The game maintains an alphabetically sorted player list at SPECTATOR_CTRL_OFFSET
+    uintptr_t spectatorCtrl = baseGame + SPECTATOR_CTRL_OFFSET;
+    int cameraType = *(int*)(spectatorCtrl);  // offset 0x00 = camera type
+    int playerCount = *(int*)(spectatorCtrl + SPECTATOR_PLAYER_COUNT_OFFSET);
+
+    // Debug: show camera type and player count
+    // std::cout << "[Spectator] Debug: cameraType=" << cameraType << " playerCount=" << playerCount << "\n";
+
+    if (playerCount <= 0 || playerCount > 64) {
+        // Fallback to alphabetical sorting when spectator list not available
+        auto localPlayers = GameMemoryReader::ReadPlayerList();
+
+        std::vector<std::pair<std::string, int>> sorted;
+        for (const auto& p : localPlayers) {
+            sorted.emplace_back(p.name, p.id);
+        }
+
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
             if (a.first == b.first) return a.second < b.second;
             return a.first < b.first;
         });
 
-    alphabeticalIndex.clear();
-    for (size_t i = 0; i < sorted.size(); ++i)
-        alphabeticalIndex[sorted[i].second] = static_cast<int>(i);
-}
+        int index = -1;
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            if (sorted[i].second == playerId) {
+                index = static_cast<int>(i);
+                break;
+            }
+        }
 
-// ---------------------------
-// Nastaven� spectatoru na konkr�tn�ho hr��e
-// ---------------------------
-static void SetSpectatorToPlayerId(int playerId) {
-    // Resolve ID -> order using our local scoreboard (read from game memory) right before switching.
-    auto localPlayers = GameMemoryReader::ReadPlayerList();
+        if (index == -1) {
+            std::cout << "[Spectator] ID " << playerId << " not found (fallback mode).\n";
+            return;
+        }
 
-    std::vector<std::pair<std::string, int>> sorted;
-    for (const auto& p : localPlayers) {
-        sorted.emplace_back(p.name, p.id);
+        uintptr_t addr = baseGame + 0x7AE348;
+        *(int*)addr = index;
+        currentSpectatorIndex = index;
+        currentSpectatorPlayerId = playerId;
+        return;
     }
 
-    // Sort alphabetically by name; for duplicate names, sort by ID ascending
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-        if (a.first == b.first) return a.second < b.second;
-        return a.first < b.first;
-    });
-
+    // Search for playerId in the game's sorted spectator list
     int index = -1;
-    for (size_t i = 0; i < sorted.size(); ++i) {
-        if (sorted[i].second == playerId) {
-            index = static_cast<int>(i);
+    uintptr_t playerArray = spectatorCtrl + SPECTATOR_PLAYER_ARRAY_OFFSET;
+
+    for (int i = 0; i < playerCount; ++i) {
+        int handle = *(int*)(playerArray + i * SPECTATOR_ENTRY_SIZE);
+        if (handle == playerId) {
+            index = i;
             break;
         }
     }
 
     if (index == -1) {
-        std::cout << "[Spectator] ID " << playerId << " was not found in local scoreboard.\n";
+        std::cout << "[Spectator] ID " << playerId << " not found in game's spectator list.\n";
         return;
     }
 
+    // Write to spectator index
     uintptr_t addr = baseGame + 0x7AE348;
     *(int*)addr = index;
     currentSpectatorIndex = index;
     currentSpectatorPlayerId = playerId;  // Remember which player we're watching
-
-    // Find player name for logging
-    std::string name = "Unknown";
-    for (const auto& p : localPlayers) if (p.id == playerId) { name = p.name; break; }
-    // Camera switch logging moved to ProcessKillEvent/ProcessFlagEvent
 }
 
 // ---------------------------
@@ -108,8 +127,8 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
             continue;
         currentPlayers.push_back(p);
     }
-
-    UpdateAlphabeticalOrder();
+    // Note: No longer need to maintain alphabetical order locally
+    // Spectator order is now read directly from game's spectator controller
 }
 
 // ---------------------------

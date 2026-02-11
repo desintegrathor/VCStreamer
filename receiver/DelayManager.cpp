@@ -5,6 +5,7 @@
 #include <string>
 #include <Windows.h>
 
+uintptr_t DelayManager::gameBase = 0;
 std::queue<DelayedAction> DelayManager::actions;
 int DelayManager::currentDelay = 0;
 float DelayManager::fpvOffsetBack = 0.8f;
@@ -111,13 +112,25 @@ int DelayManager::LoadDelayFromINI() {
     return 10000;
 }
 
-void DelayManager::Init() {
+void DelayManager::Init(uintptr_t base) {
+    gameBase = base;
     currentDelay = LoadDelayFromINI();
 }
 
+int DelayManager::GetGameDelaySeconds() {
+    if (!gameBase) return 0;
+    // game.dll + 0x20DB48 = dword_F7DB48 (spectator delay in seconds, set by server)
+    // IDA address 0xF7DB48, IDA base 0xD70000, offset = 0x20DB48
+    int delaySec = *(int*)(gameBase + 0x20DB48);
+    // Sanity: server caps at 180s, but be safe
+    if (delaySec < 0 || delaySec > 300) delaySec = 0;
+    return delaySec;
+}
+
 void DelayManager::AddDelayedAction(const DelayedAction& action) {
-    // Pokud je zpoždění 6 sekund nebo méně, spusť akci okamžitě
-    if (currentDelay <= 6000) {
+    // If action is scheduled for now or in the past, execute immediately
+    auto now = std::chrono::system_clock::now();
+    if (action.executeTime <= now) {
         switch (action.type) {
             case DelayedAction::Type::KILL:
                 ProcessKillEvent(action.killerId, action.victimId);

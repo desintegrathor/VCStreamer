@@ -37,10 +37,14 @@ struct DelayedAction {
 
 class DelayManager {
 public:
-    static void Init();
+    static void Init(uintptr_t baseGame = 0);
     static void AddDelayedAction(const DelayedAction& action);
     static void ProcessActions();
     static int GetCurrentDelay() { return currentDelay; }
+
+    // Read spectator delay directly from game.dll memory (dword_F7DB48)
+    // Returns delay in seconds as set by server via "set srvspectators <max> <delay>"
+    static int GetGameDelaySeconds();
 
     // FPV camera offsets (loaded from INI)
     static float GetFpvOffsetBack() { return fpvOffsetBack; }
@@ -54,6 +58,7 @@ public:
     static void ReloadConfigIfNeeded();
 
 private:
+    static uintptr_t gameBase;
     static std::queue<DelayedAction> actions;
     static int currentDelay;  // v milisekundách (loaded from INI)
 
