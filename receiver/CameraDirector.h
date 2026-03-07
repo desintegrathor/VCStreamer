@@ -30,6 +30,12 @@ struct CameraConfig {
     float worldCamLOSPenalty       = 60.0f;
     float worldCamStickiness       = 5.0f;
 
+    // World camera auto-zoom
+    float worldCamZoomStartDist    = 25.0f;
+    float worldCamZoomMaxDist      = 50.0f;
+    float worldCamZoomMaxFactor    = 0.4f;
+    float worldCamZoomSmoothFactor = 0.05f;
+
     // 3PV smoothing
     float tpvMaxDistance           = 2.5f;
     float tpvYawSmoothFactor      = 0.01f;

@@ -281,6 +281,37 @@ void WorldCameraTracker_ClearTarget() {
     g_switchCooldownFrames = 0;
 }
 
+int WorldCameraTracker_GetCurrentCamType() {
+    if (g_targetHandle.load() == 0) return -1;
+    return g_currentCamType;
+}
+
+bool WorldCameraTracker_GetCurrentCamPos(float* outPos) {
+    if (g_currentCamIndex < 0) return false;
+
+    // Need spectator object to read camera arrays — use game base to find it
+    if (!g_baseGame) return false;
+    int* spectObj = (int*)(g_baseGame + 0x7AE320);
+
+    if (g_currentCamType == 0) {
+        uintptr_t arr = (uintptr_t)spectObj[5];
+        if (!arr) return false;
+        StaticCamEntry* cam = (StaticCamEntry*)(arr + 32 * g_currentCamIndex);
+        outPos[0] = cam->x;
+        outPos[1] = cam->y;
+        outPos[2] = cam->z;
+        return true;
+    } else if (g_currentCamType == 1) {
+        if (g_currentCamIndex >= 16 || !g_dynCamPosResolved) return false;
+        outPos[0] = g_dynCamPos[g_currentCamIndex][0];
+        outPos[1] = g_dynCamPos[g_currentCamIndex][1];
+        outPos[2] = g_dynCamPos[g_currentCamIndex][2];
+        return true;
+    }
+
+    return false;
+}
+
 void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
     if (!g_initialized) return;
 

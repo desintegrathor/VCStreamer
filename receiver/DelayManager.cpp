@@ -237,6 +237,11 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.worldCamLOSPenalty        = ReadIniFloat(iniPath, "worldcam_los_penalty", 60.0f);
     cfg.worldCamStickiness        = ReadIniFloat(iniPath, "worldcam_stickiness", 5.0f);
 
+    cfg.worldCamZoomStartDist     = ReadIniFloat(iniPath, "worldcam_zoom_start_dist", 25.0f);
+    cfg.worldCamZoomMaxDist       = ReadIniFloat(iniPath, "worldcam_zoom_max_dist", 50.0f);
+    cfg.worldCamZoomMaxFactor     = ReadIniFloat(iniPath, "worldcam_zoom_max_factor", 0.4f);
+    cfg.worldCamZoomSmoothFactor  = ReadIniFloat(iniPath, "worldcam_zoom_smooth_factor", 0.05f);
+
     cfg.tpvMaxDistance            = ReadIniFloat(iniPath, "tpv_max_distance", 2.5f);
     cfg.tpvYawSmoothFactor       = ReadIniFloat(iniPath, "tpv_yaw_smooth_factor", 0.01f);
     cfg.tpvZoomInFactor           = ReadIniFloat(iniPath, "tpv_zoom_in_factor", 0.3f);

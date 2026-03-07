@@ -267,6 +267,47 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         }
     }
 
+    // World camera auto-zoom: reduce FOV when player is far from camera
+    {
+        static float s_smoothedFovScale = 1.0f;
+        static int s_prevCamType = -1;
+
+        int wcType = WorldCameraTracker_GetCurrentCamType();
+        if (wcType == 0 || wcType == 1) {
+            float wcPos[3];
+            if (WorldCameraTracker_GetCurrentCamPos(wcPos) && playerEntity) {
+                float playerPos3[3];
+                GetEntityPos(playerEntity, playerPos3);
+
+                float dx = wcPos[0] - playerPos3[0];
+                float dy = wcPos[1] - playerPos3[1];
+                float dz = wcPos[2] - playerPos3[2];
+                float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+                float targetFovScale = 1.0f;
+                if (dist > cfg.worldCamZoomStartDist) {
+                    float t = (dist - cfg.worldCamZoomStartDist)
+                            / (cfg.worldCamZoomMaxDist - cfg.worldCamZoomStartDist);
+                    if (t > 1.0f) t = 1.0f;
+                    targetFovScale = 1.0f - t * (1.0f - cfg.worldCamZoomMaxFactor);
+                }
+
+                // Reset smoothing on camera type transition
+                if (s_prevCamType != 0 && s_prevCamType != 1) {
+                    s_smoothedFovScale = targetFovScale;
+                } else {
+                    s_smoothedFovScale += (targetFovScale - s_smoothedFovScale) * cfg.worldCamZoomSmoothFactor;
+                }
+
+                float* fovScale = (float*)((char*)cameraProp + 0x0C);
+                *fovScale *= s_smoothedFovScale;
+            }
+        } else {
+            s_smoothedFovScale = 1.0f;
+        }
+        s_prevCamType = wcType;
+    }
+
     // KillCam phased logic
     if (dirState == CameraState::KillCam && result) {
         float elapsed = CameraDirector_GetKillCamElapsed();
