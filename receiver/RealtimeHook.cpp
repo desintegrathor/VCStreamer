@@ -1,229 +1,105 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include "RealtimeHook.h"
 #include "SpectatorController.h"
 #include "DelayManager.h"
+#include "TickDelayBuffer.h"
 #include <iostream>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
+#include <cstdarg>
+#include <cstdio>
 
-// ============================================================================
-// Offsets from game.dll base
-// ============================================================================
+static FILE* g_killLog = nullptr;
 
-// Message dispatch loop body - executed for EVERY incoming message before
-// the switch statement routes it. This catches ALL message types including
-// type 0x22 (kill) which never reaches the delay buffer enqueue.
-// At this point: ebx = pointer to message data (first byte = message type)
-constexpr uintptr_t OFFSET_MSG_DISPATCH = 0x15CD2E;
+static void KillLog(const char* fmt, ...) {
+    if (!g_killLog) {
+        g_killLog = fopen("killdetect_debug.log", "w");
+        if (!g_killLog) return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_killLog, fmt, args);
+    fflush(g_killLog);
+    va_end(args);
+}
 
 // ============================================================================
 // Message type constants (first byte of message data)
 // ============================================================================
 
-constexpr BYTE MSG_KILL = 0x22;       // Kill event (34 decimal)
+constexpr BYTE MSG_KILL = 0x50;       // Kill score event (80 decimal)
+constexpr int KILL_MSG_SIZE = 10;     // Minimum size of kill message
+constexpr BYTE MSG_STATE_VAR = 0x5A;  // State variable update (90 decimal)
+constexpr int STATE_VAR_MSG_SIZE = 9; // 1 opcode + 4 index + 4 value
+constexpr int FLAG_INDEX_US = 0x200;  // US team flag carrier index
+constexpr int FLAG_INDEX_VC = 0x201;  // VC team flag carrier index
 
 // ============================================================================
 // Kill deduplication
 // ============================================================================
 
-// Key: simple hash of killer + victim + approximate time
-// Used to avoid processing the same kill twice (once at enqueue, once at dequeue)
 static std::mutex g_realtimeMutex;
 static std::unordered_set<uint64_t> g_recentKills;
 static DWORD g_lastKillCleanup = 0;
-constexpr DWORD KILL_DEDUP_WINDOW_MS = 30000; // 30s window for dedup
-constexpr DWORD KILL_CLEANUP_INTERVAL_MS = 10000; // Cleanup every 10s
+constexpr DWORD KILL_DEDUP_WINDOW_MS = 30000;
+constexpr DWORD KILL_CLEANUP_INTERVAL_MS = 10000;
 
 static uint64_t MakeKillKey(int killerId, int victimId) {
-    // Combine killer and victim IDs with a coarse time bucket (10s granularity)
     DWORD timeBucket = GetTickCount() / 10000;
     return ((uint64_t)killerId << 32) | ((uint64_t)victimId << 16) | (timeBucket & 0xFFFF);
 }
 
 // ============================================================================
-// Hook globals
+// State
 // ============================================================================
 
-static uintptr_t g_baseGame = 0;
-static uintptr_t g_hookAddr = 0;
-static uintptr_t g_returnAddr = 0;
-static BYTE g_originalBytes[9];
-static bool g_hookInstalled = false;
-
-// Guard flag: only process messages after DLL is fully initialized
 static volatile bool g_hookReady = false;
 
-// VirtualAlloc'd code cave for our trampoline
-static BYTE* g_codeCave = nullptr;
-
 // ============================================================================
-// Message handler - called from hook with real-time message data
+// Kill handler
 // ============================================================================
 
-static void __cdecl OnMessageBeforeDelay(BYTE* msgData) {
-    if (!msgData) return;
+static void ProcessKillMessage(BYTE* msgData) {
+    // Kill message format (from GNET_ProcessKillEvent):
+    //   Byte 0:    0x50 (message type)
+    //   Byte 1:    weapon/cause ID
+    //   Bytes 2-5: victim DP handle (DWORD)
+    //   Bytes 6-9: killer DP handle (DWORD)
+    int victimHandle = *(int*)(msgData + 2);
+    int killerHandle = *(int*)(msgData + 6);
 
-    BYTE subType = msgData[0];
+    if (killerHandle == 0 && victimHandle == 0) return;
 
-    // ---------------------------
-    // KILL EVENT (0x22)
-    // ---------------------------
-    if (subType == MSG_KILL) {
-        // Kill message format:
-        //   Byte 0:    0x22 (message type)
-        //   Byte 1:    weapon/cause ID
-        //   Bytes 2-5: victim player handle (DWORD)
-        //   Bytes 6-9: killer player handle (DWORD)
-        int victimHandle = *(int*)(msgData + 2);
-        int killerHandle = *(int*)(msgData + 6);
+    uint64_t key = MakeKillKey(killerHandle, victimHandle);
+    {
+        std::lock_guard<std::mutex> lock(g_realtimeMutex);
 
-        // Skip invalid handles
-        if (killerHandle == 0 && victimHandle == 0) return;
-
-        // Deduplication: check if we already processed this kill
-        uint64_t key = MakeKillKey(killerHandle, victimHandle);
-        {
-            std::lock_guard<std::mutex> lock(g_realtimeMutex);
-
-            // Periodic cleanup of old entries
-            DWORD now = GetTickCount();
-            if (now - g_lastKillCleanup > KILL_CLEANUP_INTERVAL_MS) {
-                g_recentKills.clear();
-                g_lastKillCleanup = now;
-            }
-
-            // Check and insert
-            if (g_recentKills.count(key)) {
-                return; // Already processed
-            }
-            g_recentKills.insert(key);
+        DWORD now = GetTickCount();
+        if (now - g_lastKillCleanup > KILL_CLEANUP_INTERVAL_MS) {
+            g_recentKills.clear();
+            g_lastKillCleanup = now;
         }
 
-        // Player handles in kill messages ARE the player IDs (offset 0 of player struct)
-
-        // Read the spectator delay from game memory (set by server)
-        int gameDelaySec = DelayManager::GetGameDelaySeconds();
-
-        // We want camera to switch 5s BEFORE the spectator view shows the kill.
-        // Hook fires at realtime (0s), spectator shows at +gameDelay seconds.
-        // So we schedule: (gameDelay - 5) seconds from now.
-        // If delay <= 5s, execute immediately.
-        constexpr int ADVANCE_SECONDS = 5;
-        int waitMs = (gameDelaySec > ADVANCE_SECONDS)
-            ? (gameDelaySec - ADVANCE_SECONDS) * 1000
-            : 0;
-
-        std::cout << "[RealtimeHook] Kill detected: killer=" << killerHandle
-                  << " victim=" << victimHandle
-                  << " weapon=" << (int)msgData[1]
-                  << " gameDelay=" << gameDelaySec << "s"
-                  << " scheduling in " << waitMs << "ms\n";
-
-        auto action = DelayedAction::CreateKillAction(killerHandle, victimHandle, waitMs);
-        DelayManager::AddDelayedAction(action);
-    }
-}
-
-// ============================================================================
-// Naked hook trampoline (x86 inline assembly)
-// ============================================================================
-
-// The hook replaces 9 bytes at game.dll + 0x15CD2E (message dispatch loop body):
-//
-// Original:
-//   ECCD2E: 33 C0           xor eax, eax
-//   ECCD30: 8A 03           mov al, [ebx]         ; ebx = msg data ptr, al = type byte
-//   ECCD32: 05 30 1B 0F 00  add eax, 0F1B30h
-//
-// We overwrite with: JMP to code cave (5 bytes) + 4x NOP
-// Code cave does: save regs, push ebx, call handler, cleanup, restore regs,
-//                 execute original 3 instructions, JMP back to ECCD37 (push eax)
-//
-// Register state at hook point:
-//   ebx = pointer to current message data (first byte = message type)
-
-// ============================================================================
-// Code cave builder
-// ============================================================================
-
-static bool BuildCodeCave() {
-    // Allocate executable memory for our code cave
-    g_codeCave = (BYTE*)VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!g_codeCave) {
-        std::cout << "[RealtimeHook] Failed to allocate code cave\n";
-        return false;
+        if (g_recentKills.count(key)) {
+            return;
+        }
+        g_recentKills.insert(key);
     }
 
-    int i = 0;
+    int gameDelaySec = DelayManager::GetGameDelaySeconds();
+    int bufferDelayMs = GetTickDelayMs();
+    int totalDelayMs = gameDelaySec * 1000 + bufferDelayMs;
+    constexpr int ADVANCE_MS = 5000;
+    int waitMs = (totalDelayMs > ADVANCE_MS)
+        ? totalDelayMs - ADVANCE_MS
+        : 0;
 
-    // --- Save all state ---
-    g_codeCave[i++] = 0x60;  // pushad
-    g_codeCave[i++] = 0x9C;  // pushfd
+    KillLog("[RealtimeHook] Kill detected: killer=%d victim=%d weapon=%d gameDelay=%ds bufferDelay=%dms scheduling in %dms\n",
+            killerHandle, victimHandle, (int)msgData[1], gameDelaySec, bufferDelayMs, waitMs);
 
-    // --- Guard flag check: cmp byte ptr [&g_hookReady], 0 ---
-    g_codeCave[i++] = 0x80;  // cmp byte ptr [imm32], imm8
-    g_codeCave[i++] = 0x3D;
-    uintptr_t guardAddr = (uintptr_t)&g_hookReady;
-    memcpy(g_codeCave + i, &guardAddr, 4); i += 4;
-    g_codeCave[i++] = 0x00;  // compare with 0
-
-    // je skip_handler (patch offset later)
-    g_codeCave[i++] = 0x74;  // je rel8
-    int skipGuardPatchPos = i;
-    g_codeCave[i++] = 0x00;  // placeholder
-
-    // --- Read message type in assembly: xor eax, eax; mov al, [ebx] ---
-    g_codeCave[i++] = 0x33; g_codeCave[i++] = 0xC0;  // xor eax, eax
-    g_codeCave[i++] = 0x8A; g_codeCave[i++] = 0x03;  // mov al, [ebx]
-
-    // --- Filter: cmp al, 0x22 (kill message type) ---
-    g_codeCave[i++] = 0x3C; g_codeCave[i++] = 0x22;  // cmp al, 0x22
-
-    // jne skip_handler (patch offset later)
-    g_codeCave[i++] = 0x75;  // jne rel8
-    int skipTypePatchPos = i;
-    g_codeCave[i++] = 0x00;  // placeholder
-
-    // --- Kill message detected: call C++ handler ---
-    // push ebx (msgData pointer)
-    g_codeCave[i++] = 0x53;
-
-    // call OnMessageBeforeDelay
-    uintptr_t callTarget = (uintptr_t)&OnMessageBeforeDelay;
-    uintptr_t callFrom = (uintptr_t)(g_codeCave + i + 5);
-    int32_t callRel = (int32_t)(callTarget - callFrom);
-    g_codeCave[i++] = 0xE8;  // call rel32
-    memcpy(g_codeCave + i, &callRel, 4); i += 4;
-
-    // add esp, 4 (cleanup 1 arg)
-    g_codeCave[i++] = 0x83; g_codeCave[i++] = 0xC4; g_codeCave[i++] = 0x04;
-
-    // --- skip_handler label: both je's jump here ---
-    int skipTarget = i;
-    g_codeCave[skipGuardPatchPos] = (BYTE)(skipTarget - (skipGuardPatchPos + 1));
-    g_codeCave[skipTypePatchPos] = (BYTE)(skipTarget - (skipTypePatchPos + 1));
-
-    // --- Restore all state ---
-    g_codeCave[i++] = 0x9D;  // popfd
-    g_codeCave[i++] = 0x61;  // popad
-
-    // --- Execute original 3 instructions that we overwrote (9 bytes) ---
-    // 1. xor eax, eax  (33 C0)
-    g_codeCave[i++] = 0x33; g_codeCave[i++] = 0xC0;
-    // 2. mov al, [ebx]  (8A 03)
-    g_codeCave[i++] = 0x8A; g_codeCave[i++] = 0x03;
-    // 3. add eax, 0F1B30h  (05 30 1B 0F 00)
-    g_codeCave[i++] = 0x05;
-    g_codeCave[i++] = 0x30; g_codeCave[i++] = 0x1B;
-    g_codeCave[i++] = 0x0F; g_codeCave[i++] = 0x00;
-
-    // --- jmp back to original code (g_returnAddr = ECCD37) ---
-    uintptr_t jmpFrom = (uintptr_t)(g_codeCave + i + 5);
-    int32_t jmpRel = (int32_t)(g_returnAddr - jmpFrom);
-    g_codeCave[i++] = 0xE9;  // jmp rel32
-    memcpy(g_codeCave + i, &jmpRel, 4); i += 4;
-
-    return true;
+    auto action = DelayedAction::CreateKillAction(killerHandle, victimHandle, waitMs);
+    DelayManager::AddDelayedAction(action);
 }
 
 // ============================================================================
@@ -232,76 +108,76 @@ static bool BuildCodeCave() {
 
 void SetHookReady() {
     g_hookReady = true;
-    std::cout << "[RealtimeHook] Hook activated (ready for messages)\n";
+    std::cout << "[RealtimeHook] Kill scanning activated\n";
 }
 
 bool InitRealtimeHook(uintptr_t baseGame) {
-    g_baseGame = baseGame;
-    g_hookAddr = baseGame + OFFSET_MSG_DISPATCH;
-    g_returnAddr = g_hookAddr + 9; // Skip 9 bytes (2 + 2 + 5)
-
-    std::cout << "[RealtimeHook] Initializing realtime message hook...\n";
-    std::cout << "[RealtimeHook] game.dll base: 0x" << std::hex << baseGame << "\n";
-    std::cout << "[RealtimeHook] Hook address: 0x" << g_hookAddr << "\n";
-    std::cout << "[RealtimeHook] Return address: 0x" << g_returnAddr << std::dec << "\n";
-
-    // Save original bytes (9 bytes: xor eax,eax + mov al,[ebx] + add eax,0F1B30h)
-    memcpy(g_originalBytes, (void*)g_hookAddr, 9);
-
-    // Build the code cave
-    if (!BuildCodeCave()) {
-        return false;
-    }
-
-    // Patch the original code: JMP to code cave (5 bytes) + 4x NOP
-    DWORD oldProtect;
-    if (!VirtualProtect((LPVOID)g_hookAddr, 9, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        std::cout << "[RealtimeHook] Failed to change memory protection\n";
-        VirtualFree(g_codeCave, 0, MEM_RELEASE);
-        g_codeCave = nullptr;
-        return false;
-    }
-
-    // Write JMP rel32 to code cave
-    BYTE* hookPtr = (BYTE*)g_hookAddr;
-    int32_t jmpOffset = (int32_t)((uintptr_t)g_codeCave - (g_hookAddr + 5));
-    hookPtr[0] = 0xE9; // JMP rel32
-    memcpy(hookPtr + 1, &jmpOffset, 4);
-
-    // Fill remaining 4 bytes with NOPs
-    hookPtr[5] = 0x90;
-    hookPtr[6] = 0x90;
-    hookPtr[7] = 0x90;
-    hookPtr[8] = 0x90;
-
-    // Restore original protection
-    VirtualProtect((LPVOID)g_hookAddr, 9, oldProtect, &oldProtect);
-
-    // Flush instruction cache
-    FlushInstructionCache(GetCurrentProcess(), (LPVOID)g_hookAddr, 9);
-
-    g_hookInstalled = true;
-    std::cout << "[RealtimeHook] Hook installed successfully!\n";
+    std::cout << "[RealtimeHook] Initialized (scanning via TickDelayBuffer hook)\n";
     return true;
 }
 
 void ShutdownRealtimeHook() {
-    if (!g_hookInstalled) return;
+    g_hookReady = false;
+}
 
-    // Restore original bytes
-    DWORD oldProtect;
-    if (VirtualProtect((LPVOID)g_hookAddr, 9, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy((void*)g_hookAddr, g_originalBytes, 9);
-        VirtualProtect((LPVOID)g_hookAddr, 9, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), (LPVOID)g_hookAddr, 9);
+void ScanBufferForKills(BYTE* data, DWORD size) {
+    if (!g_hookReady || !data || size < KILL_MSG_SIZE) return;
+    if (data[0] != MSG_KILL) return;
+
+    // Each NET_ReadMessages call returns exactly one message.
+    // If first byte is 0x50, this IS the kill message (10 bytes).
+    int victimHandle = *(int*)(data + 2);
+    int killerHandle = *(int*)(data + 6);
+
+    if (killerHandle > 0 && killerHandle < 0x10000 &&
+        victimHandle > 0 && victimHandle < 0x10000) {
+        ProcessKillMessage(data);
     }
+}
 
-    // Free code cave
-    if (g_codeCave) {
-        VirtualFree(g_codeCave, 0, MEM_RELEASE);
-        g_codeCave = nullptr;
-    }
+// ============================================================================
+// Flag carrier tracking
+// ============================================================================
 
-    g_hookInstalled = false;
-    std::cout << "[RealtimeHook] Hook removed\n";
+static int g_lastRawUSCarrier = 0;
+static int g_lastRawVCCarrier = 0;
+
+void ScanBufferForFlags(BYTE* data, DWORD size) {
+    if (!g_hookReady || !data || size < STATE_VAR_MSG_SIZE) return;
+    if (data[0] != MSG_STATE_VAR) return;
+
+    // State variable update format (opcode 0x5A, 9 bytes):
+    //   byte[0]   = 0x5A
+    //   bytes[1-4] = index (DWORD LE) — 0x200 = US flag, 0x201 = VC flag
+    //   bytes[5-8] = value (DWORD LE) — player handle or 0
+    int index = *(int*)(data + 1);
+    int value = *(int*)(data + 5);
+
+    if (index != FLAG_INDEX_US && index != FLAG_INDEX_VC) return;
+
+    // Track both carriers, only fire action on change
+    int newUS = g_lastRawUSCarrier;
+    int newVC = g_lastRawVCCarrier;
+
+    if (index == FLAG_INDEX_US) newUS = value;
+    if (index == FLAG_INDEX_VC) newVC = value;
+
+    if (newUS == g_lastRawUSCarrier && newVC == g_lastRawVCCarrier) return;
+
+    g_lastRawUSCarrier = newUS;
+    g_lastRawVCCarrier = newVC;
+
+    int gameDelaySec = DelayManager::GetGameDelaySeconds();
+    int bufferDelayMs = GetTickDelayMs();
+    int totalDelayMs = gameDelaySec * 1000 + bufferDelayMs;
+    constexpr int ADVANCE_MS = 5000;
+    int waitMs = (totalDelayMs > ADVANCE_MS)
+        ? totalDelayMs - ADVANCE_MS
+        : 0;
+
+    KillLog("[RealtimeHook] Flag change: US=%d VC=%d gameDelay=%ds bufferDelay=%dms scheduling in %dms\n",
+            newUS, newVC, gameDelaySec, bufferDelayMs, waitMs);
+
+    auto action = DelayedAction::CreateFlagAction(newUS, newVC, waitMs);
+    DelayManager::AddDelayedAction(action);
 }

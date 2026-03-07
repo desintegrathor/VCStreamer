@@ -1,16 +1,20 @@
 #pragma once
 #include <Windows.h>
 
-// Initialize inline hook on game.dll's message dispatch loop.
-// This intercepts all network messages at the per-message dispatch point,
-// giving us real-time access to kill events (type 0x22) which bypass the delay buffer.
-// Must be called after game.dll is loaded.
-// Returns true on success, false on failure.
+// Initialize realtime kill detection.
+// No longer patches game code — kill scanning is done from the TickDelayBuffer hook.
 bool InitRealtimeHook(uintptr_t baseGame);
 
-// Remove the inline hook and restore original bytes.
+// Shutdown and cleanup.
 void ShutdownRealtimeHook();
 
-// Signal that all DLL initialization is complete and the hook can process messages.
-// Must be called after all Init*() functions have completed.
+// Signal that all DLL initialization is complete and kill scanning can begin.
 void SetHookReady();
+
+// Scan raw network buffer for kill messages (opcode 0x50).
+// Called from Hooked_NET_ReadMessages with real-time data before it enters the delay buffer.
+void ScanBufferForKills(BYTE* data, DWORD size);
+
+// Scan raw network buffer for flag carrier updates (opcode 0x5A, indices 0x200/0x201).
+// Called from Hooked_NET_ReadMessages with real-time data before it enters the delay buffer.
+void ScanBufferForFlags(BYTE* data, DWORD size);

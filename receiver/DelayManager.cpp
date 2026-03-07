@@ -3,10 +3,14 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <mutex>
 #include <Windows.h>
+
+static std::mutex g_actionsMutex;
 
 std::queue<DelayedAction> DelayManager::actions;
 int DelayManager::currentDelay = 0;
+uintptr_t DelayManager::gameBase = 0;
 float DelayManager::fpvOffsetBack = 0.8f;
 float DelayManager::fpvOffsetLeft = 0.3f;
 float DelayManager::fpvOffsetUp = 0.3f;
@@ -115,6 +119,18 @@ void DelayManager::Init() {
     currentDelay = LoadDelayFromINI();
 }
 
+int DelayManager::GetGameDelaySeconds() {
+    // Read server-configured spectator delay from game memory
+    // dword_F7DB48 (IDA addr), RVA = 0x20DB48
+    if (!gameBase) return 0;
+    constexpr uintptr_t SPECT_DELAY_OFFSET = 0x20DB48;
+    __try {
+        return *(int*)(gameBase + SPECT_DELAY_OFFSET);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 void DelayManager::AddDelayedAction(const DelayedAction& action) {
     // Pokud je zpoždění 6 sekund nebo méně, spusť akci okamžitě
     if (currentDelay <= 6000) {
@@ -130,10 +146,12 @@ void DelayManager::AddDelayedAction(const DelayedAction& action) {
         return;
     }
 
+    std::lock_guard<std::mutex> lock(g_actionsMutex);
     actions.push(action);
 }
 
 void DelayManager::ProcessActions() {
+    std::lock_guard<std::mutex> lock(g_actionsMutex);
     auto now = std::chrono::system_clock::now();
 
     while (!actions.empty()) {

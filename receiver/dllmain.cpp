@@ -2,14 +2,15 @@
 #include <iostream>
 #include <thread>
 #include <string>
-#include "nlohmann/json.hpp"
 #include "SpectatorController.h"
 #include "GameMemoryReader.h"
 #include "DelayManager.h"
 #include "FirstPersonCamera.h"
 #include "AutoSpectator.h"
-
-using json = nlohmann::json;
+#include "RealtimeHook.h"
+#include "FlagMonitor.h"
+#include "TickDelayBuffer.h"
+#include "dsound_proxy.h"
 
 // ---------------------------
 // Získání base adresy modulu
@@ -20,96 +21,18 @@ uintptr_t GetModuleBase(const wchar_t* moduleName) {
 }
 
 // ---------------------------
-// PIPE Listener
+// Main loop: scoreboard polling + delayed action processing
 // ---------------------------
-void PipeListener() {
-    HANDLE hPipe = CreateNamedPipeW(
-        L"\\\\.\\pipe\\GameDataPipe",
-        PIPE_ACCESS_INBOUND,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 0, 0, 0, NULL
-    );
-
-    if (hPipe == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    ConnectNamedPipe(hPipe, NULL);
-
-    char buffer[4096];
-    DWORD bytesRead;
-
-    while (ReadFile(hPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL)) {
-        buffer[bytesRead] = 0;
-
-        try {
-            auto j = json::parse(buffer);
-            std::string type = j["type"];
-
-            // ---------------------------
-            // SCOREBOARD EVENT
-            // ---------------------------
-            if (type == "scoreboard") {
-                std::vector<PlayerInfo> players;
-
-                for (auto& p : j["players"]) {
-                    players.push_back({
-                        p["id"],
-                        p["name"],
-                        p["kills"],
-                        p["deaths"],
-                        p["score"]
-                        });
-                }
-
-                UpdateScoreboard(players);
-            }
-
-            // ---------------------------
-            // KILL EVENT (kameru na KILLERA)
-            // ---------------------------
-            else if (type == "kill") {
-                int killer = j["killer"];
-                int victim = j["victim"];
-
-                // Pro zpoždění > 6s odečteme 5s, pro menší zpoždění se akce spustí hned
-                int currentDelay = DelayManager::GetCurrentDelay();
-                int executeDelay = (currentDelay > 6000) ? (currentDelay - 5000) : 0;
-
-                auto action = DelayedAction::CreateKillAction(killer, victim, executeDelay);
-                DelayManager::AddDelayedAction(action);
-            }
-
-            // ---------------------------
-            // FLAG EVENT (vlajky)
-            // ---------------------------
-            else if (type == "flag") {
-                int usCarrier = j["US"];
-                int vcCarrier = j["VC"];
-
-                // Pro zpoždění > 6s odečteme 5s, pro menší zpoždění se akce spustí hned
-                int currentDelay = DelayManager::GetCurrentDelay();
-                int executeDelay = (currentDelay > 6000) ? (currentDelay - 5000) : 0;
-
-                auto action = DelayedAction::CreateFlagAction(usCarrier, vcCarrier, executeDelay);
-                DelayManager::AddDelayedAction(action);
-            }
-        }
-        catch (...) {
-            // Ignore parse errors silently
-        }
-    }
-
-    CloseHandle(hPipe);
-}
-
-// ---------------------------
-// DLL Main Thread
-// ---------------------------
-void ScoreboardMonitor() {
+void MainLoop() {
     while (true) {
         // Process scheduled actions (kills/flags with delay timing)
         DelayManager::ProcessActions();
+
+        // Read scoreboard from game memory and update SpectatorController
+        auto players = GameMemoryReader::ReadPlayerList();
+        if (!players.empty()) {
+            UpdateScoreboard(players);
+        }
 
         // Update camera orientation to match current player view
         UpdateCameraOrientation();
@@ -139,27 +62,25 @@ DWORD WINAPI MainThread(LPVOID) {
 
     std::cout << "[VCStreamer] game.dll found at 0x" << std::hex << base << std::dec << "\n";
 
-    // Wait additional time for game.dll to fully initialize
+    // Wait for game.dll to fully initialize.
+    // Proxy DLL loads earlier than the old injection method, so we need a longer wait.
     std::cout << "[VCStreamer] Waiting for game initialization...\n";
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::this_thread::sleep_for(std::chrono::seconds(8));
 
     InitSpectatorController(base);
     GameMemoryReader::Init(base);
+    DelayManager::SetGameBase(base);
     DelayManager::Init();
 
-    // Initialize first-person camera hook
+    InitTickDelayBuffer(base);
     InitFirstPersonCamera(base);
-
-    // Start auto-spectator (polls game state and auto-joins spectator)
+    InitRealtimeHook(base);
+    InitFlagMonitor(base);
     InitAutoSpectator(base);
+    SetHookReady();
 
-    // Spusť monitoring scoreboardu
-    std::thread scoreboardThread(ScoreboardMonitor);
-    scoreboardThread.detach();
-
-    // Spusť PIPE listener
-    std::thread pipeThread(PipeListener);
-    pipeThread.detach();
+    std::thread mainThread(MainLoop);
+    mainThread.detach();
 
     return 0;
 }
@@ -170,6 +91,7 @@ DWORD WINAPI MainThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        LoadRealDsound();
         CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
     }
     return TRUE;

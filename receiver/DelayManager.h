@@ -41,6 +41,8 @@ public:
     static void AddDelayedAction(const DelayedAction& action);
     static void ProcessActions();
     static int GetCurrentDelay() { return currentDelay; }
+    static int GetGameDelaySeconds();
+    static void SetGameBase(uintptr_t base) { gameBase = base; }
 
     // FPV camera offsets (loaded from INI)
     static float GetFpvOffsetBack() { return fpvOffsetBack; }
@@ -69,5 +71,6 @@ private:
     static DWORD lastConfigReload;
     static const DWORD CONFIG_RELOAD_INTERVAL = 5000;  // 5 seconds
 
+    static uintptr_t gameBase;
     static int LoadDelayFromINI();
 };
