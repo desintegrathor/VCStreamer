@@ -164,6 +164,7 @@
     <ClInclude Include="RealtimeHook.h" />
     <ClInclude Include="FlagMonitor.h" />
     <ClInclude Include="TickDelayBuffer.h" />
+    <ClInclude Include="WorldCameraTracker.h" />
     <ClInclude Include="dsound_proxy.h" />
     <ClInclude Include="minhook\MinHook.h" />
     <ClInclude Include="minhook\buffer.h" />
@@ -200,6 +201,10 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="TickDelayBuffer.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="WorldCameraTracker.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>

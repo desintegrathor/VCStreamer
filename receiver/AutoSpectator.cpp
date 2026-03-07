@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "AutoSpectator.h"
+#include "WorldCameraTracker.h"
 #include "minhook/MinHook.h"
 #include <iostream>
 #include <fstream>
@@ -125,6 +126,7 @@ int __fastcall Hooked_SpectInput(float* thisPtr, void* /*edx*/, float deltaTime)
             }
         }
     }
+    WorldCameraTracker_Update((int*)thisPtr, g_baseGame);
     return g_OrigSpectInput(thisPtr, deltaTime);
 }
 

@@ -1,4 +1,5 @@
 #include "SpectatorController.h"
+#include "WorldCameraTracker.h"
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -91,6 +92,7 @@ void ProcessKillEvent(int killerId, int victimId) {
     }
 
     std::cout << "[Kill] " << killerName << " killed " << victimName << " -> switching to " << killerName << "\n";
+    WorldCameraTracker_SetTarget(killerId);
     SetSpectatorToPlayerId(killerId);
 
     // Nastav cooldown
@@ -137,17 +139,20 @@ static void FlagWatcherThread() {
         // Používáme aktuální vlajkonoše, pokud existují
         if (localUS != 0 && localVC == 0) {
             std::cout << "[Flag] Following US flag carrier: " << usName << "\n";
+            WorldCameraTracker_SetTarget(localUS);
             SetSpectatorToPlayerId(localUS);
         }
         else if (localVC != 0 && localUS == 0) {
             std::cout << "[Flag] Following VC flag carrier: " << vcName << "\n";
+            WorldCameraTracker_SetTarget(localVC);
             SetSpectatorToPlayerId(localVC);
         }
         else if (localUS != 0 && localVC != 0) {
-            // Obě vlajky neseny - přepínej mezi nimi každých 5s
             std::cout << "[Flag] Both flags taken - alternating between " << usName << " (US) and " << vcName << " (VC)\n";
+            WorldCameraTracker_SetTarget(localUS);
             SetSpectatorToPlayerId(localUS);
             std::this_thread::sleep_for(std::chrono::seconds(5));
+            WorldCameraTracker_SetTarget(localVC);
             SetSpectatorToPlayerId(localVC);
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
@@ -155,9 +160,11 @@ static void FlagWatcherThread() {
         // Pokud nikdo nenese vlajku, ale jsme v časovém okně po ztrátě vlajky
         else if (flagPriorityTimer && (lastUS != 0 || lastVC != 0)) {
             if (lastUS != 0) {
+                WorldCameraTracker_SetTarget(lastUS);
                 SetSpectatorToPlayerId(lastUS);
             }
             else if (lastVC != 0) {
+                WorldCameraTracker_SetTarget(lastVC);
                 SetSpectatorToPlayerId(lastVC);
             }
         }
@@ -208,6 +215,7 @@ void ProcessFlagEvent(int usCarrier, int vcCarrier) {
                     lastFlagCarrierUS = 0;
                     lastFlagCarrierVC = 0;
                     flagPriorityTimer = false;
+                    WorldCameraTracker_ClearTarget();
                     std::cout << "[Flag] Timer expired - returning control to kills.\n";
                 }
             }).detach();

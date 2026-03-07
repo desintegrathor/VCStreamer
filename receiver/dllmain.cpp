@@ -7,6 +7,7 @@
 #include "DelayManager.h"
 #include "FirstPersonCamera.h"
 #include "AutoSpectator.h"
+#include "WorldCameraTracker.h"
 #include "RealtimeHook.h"
 #include "FlagMonitor.h"
 #include "TickDelayBuffer.h"
@@ -77,6 +78,7 @@ DWORD WINAPI MainThread(LPVOID) {
     InitRealtimeHook(base);
     InitFlagMonitor(base);
     InitAutoSpectator(base);
+    InitWorldCameraTracker(base);
     SetHookReady();
 
     std::thread mainThread(MainLoop);
