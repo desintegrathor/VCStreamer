@@ -40,7 +40,6 @@ public:
     static void Init();
     static void AddDelayedAction(const DelayedAction& action);
     static void ProcessActions();
-    static int GetCurrentDelay() { return currentDelay; }
     static int GetGameDelaySeconds();
     static void SetGameBase(uintptr_t base) { gameBase = base; }
 
@@ -57,8 +56,6 @@ public:
 
 private:
     static std::queue<DelayedAction> actions;
-    static int currentDelay;  // v milisekundách (loaded from INI)
-
     // FPV camera offsets
     static float fpvOffsetBack;
     static float fpvOffsetLeft;

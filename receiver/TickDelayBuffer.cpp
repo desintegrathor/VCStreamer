@@ -3,8 +3,6 @@
 #include "DelayManager.h"
 #include "RealtimeHook.h"
 #include <iostream>
-#include <fstream>
-#include <string>
 #include <cstring>
 #include <mutex>
 #include <cstdarg>
@@ -51,7 +49,7 @@ static void TickLog(const char* fmt, ...) {
 // Configuration
 // ============================================================================
 
-static int g_tickDelayMs = 5000;  // Default 5 seconds, read from INI "tick_delay"
+static const int g_tickDelayMs = 5000;  // Fixed 5-second safety buffer
 
 // ============================================================================
 // Original function pointer
@@ -223,67 +221,13 @@ static unsigned int __cdecl Hooked_NET_ReadMessages(
 }
 
 // ============================================================================
-// INI loading
-// ============================================================================
-
-static int LoadTickDelayFromINI() {
-    char dllPath[MAX_PATH];
-    HMODULE hModule = NULL;
-
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          (LPCSTR)&LoadTickDelayFromINI,
-                          &hModule)) {
-        GetModuleFileNameA(hModule, dllPath, MAX_PATH);
-        std::string fullPath(dllPath);
-        size_t lastSlash = fullPath.find_last_of("\\/");
-        std::string iniPath = fullPath.substr(0, lastSlash + 1) + "vcstreamer.ini";
-
-        char buf[32];
-        GetPrivateProfileStringA("vcstreamer", "tick_delay", "",
-                                 buf, sizeof(buf), iniPath.c_str());
-        if (buf[0] != '\0') {
-            int val = atoi(buf);
-            if (val > 0) return val * 1000;
-        }
-
-        // Also try flat key format (no section)
-        std::ifstream iniFile(iniPath);
-        if (iniFile.is_open()) {
-            std::string line;
-            while (std::getline(iniFile, line)) {
-                if (line.empty() || line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
-                size_t eq = line.find('=');
-                if (eq == std::string::npos) continue;
-                std::string key = line.substr(0, eq);
-                std::string value = line.substr(eq + 1);
-                // Trim
-                key.erase(0, key.find_first_not_of(" \t"));
-                key.erase(key.find_last_not_of(" \t") + 1);
-                value.erase(0, value.find_first_not_of(" \t\r\n"));
-                value.erase(value.find_last_not_of(" \t\r\n") + 1);
-
-                if (key == "tick_delay") {
-                    int val = atoi(value.c_str());
-                    if (val > 0) return val * 1000;
-                }
-            }
-        }
-    }
-
-    return 5000;  // Default 5 seconds
-}
-
-// ============================================================================
 // Public API
 // ============================================================================
 
 void InitTickDelayBuffer(uintptr_t gameBase) {
     g_gameBase = gameBase;
 
-    // Load config
-    g_tickDelayMs = LoadTickDelayFromINI();
-    TickLog("[TickDelay] Packet delay: %dms (%ds)\n", g_tickDelayMs, g_tickDelayMs / 1000);
+    TickLog("[TickDelay] Fixed buffer delay: %dms (%ds)\n", g_tickDelayMs, g_tickDelayMs / 1000);
 
     // Allocate ring buffer
     g_ring = new BufferedChunk[RING_SIZE];

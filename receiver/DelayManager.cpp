@@ -1,4 +1,5 @@
 #include "DelayManager.h"
+#include "TickDelayBuffer.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -9,7 +10,6 @@
 static std::mutex g_actionsMutex;
 
 std::queue<DelayedAction> DelayManager::actions;
-int DelayManager::currentDelay = 0;
 uintptr_t DelayManager::gameBase = 0;
 float DelayManager::fpvOffsetBack = 0.8f;
 float DelayManager::fpvOffsetLeft = 0.3f;
@@ -59,14 +59,7 @@ int DelayManager::LoadDelayFromINI() {
                     value.erase(0, value.find_first_not_of(" \t\r\n"));
                     value.erase(value.find_last_not_of(" \t\r\n") + 1);
 
-                    if (key == "delay") {
-                        try {
-                            int delaySeconds = std::stoi(value);
-                            currentDelay = delaySeconds * 1000; // Convert to milliseconds
-                        } catch (...) {
-                            // Invalid value, use default
-                        }
-                    } else if (key == "fpv_offset_back") {
+                    if (key == "fpv_offset_back") {
                         try { fpvOffsetBack = std::stof(value); } catch (...) {}
                     } else if (key == "fpv_offset_left") {
                         try { fpvOffsetLeft = std::stof(value); } catch (...) {}
@@ -82,15 +75,12 @@ int DelayManager::LoadDelayFromINI() {
                 }
             }
             iniFile.close();
-            return currentDelay != 0 ? currentDelay : 10000;
+            return 0;
         } else {
             // Create default INI file
             std::ofstream outFile(iniPath);
             if (outFile.is_open()) {
                 outFile << "; VCStreamer Configuration File\n";
-                outFile << "\n";
-                outFile << "; Spectator delay in seconds (time between scraper and streamer)\n";
-                outFile << "delay=10\n";
                 outFile << "\n";
                 outFile << "; FPV camera offsets (in meters, relative to player direction)\n";
                 outFile << "fpv_offset_back=0.8\n";
@@ -106,17 +96,17 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "; Debug mode (0=normal, 1=reload config periodically for live tuning)\n";
                 outFile << "debug_mode=0\n";
                 outFile.close();
-                return 10000; // Default 10 seconds
+                return 0;
             }
         }
     }
 
     // Default fallback
-    return 10000;
+    return 0;
 }
 
 void DelayManager::Init() {
-    currentDelay = LoadDelayFromINI();
+    LoadDelayFromINI();
 }
 
 int DelayManager::GetGameDelaySeconds() {
@@ -132,8 +122,9 @@ int DelayManager::GetGameDelaySeconds() {
 }
 
 void DelayManager::AddDelayedAction(const DelayedAction& action) {
-    // Pokud je zpoždění 6 sekund nebo méně, spusť akci okamžitě
-    if (currentDelay <= 6000) {
+    // If total delay (game + buffer) is 6s or less, execute immediately
+    int totalDelayMs = GetGameDelaySeconds() * 1000 + GetTickDelayMs();
+    if (totalDelayMs <= 6000) {
         switch (action.type) {
             case DelayedAction::Type::KILL:
                 ProcessKillEvent(action.killerId, action.victimId);

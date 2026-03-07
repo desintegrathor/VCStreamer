@@ -1,14 +1,11 @@
 #include "SpectatorController.h"
 #include <iostream>
 #include <thread>
-#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include "GameMemoryReader.h"
 
 static uintptr_t baseGame = 0;
 static std::vector<PlayerInfo> currentPlayers;
-static std::map<int, int> alphabeticalIndex; // playerId -> pořadí
 static std::mutex dataMutex;
 
 // Spectator control
@@ -35,64 +32,27 @@ void InitSpectatorController(uintptr_t baseGameAddr) {
     PatchCameraDistance(3.0f, 1.5f);
 }
 
-// ---------------------------
-// Seřazení podle jména (duplicitní jména -> podle ID)
-// ---------------------------
-static void UpdateAlphabeticalOrder() {
-    std::vector<std::pair<std::string, int>> sorted;
-    for (auto& p : currentPlayers)
-        sorted.push_back({ p.name, p.id });
-
-    std::sort(sorted.begin(), sorted.end(),
-        [](auto& a, auto& b) {
-            if (a.first == b.first) return a.second < b.second;
-            return a.first < b.first;
-        });
-
-    alphabeticalIndex.clear();
-    for (size_t i = 0; i < sorted.size(); ++i)
-        alphabeticalIndex[sorted[i].second] = static_cast<int>(i);
-}
 
 // ---------------------------
 // Nastavení spectatoru na konkrétního hráče
 // ---------------------------
 static void SetSpectatorToPlayerId(int playerId) {
-    // Resolve ID -> order using our local scoreboard (read from game memory) right before switching.
-    auto localPlayers = GameMemoryReader::ReadPlayerList();
+    uintptr_t spectObj = baseGame + 0x7AE320;
+    int playerCount = *(int*)(spectObj + 0x24);
 
-    std::vector<std::pair<std::string, int>> sorted;
-    for (const auto& p : localPlayers) {
-        sorted.emplace_back(p.name, p.id);
-    }
+    if (playerCount <= 0 || playerCount > 64) return;
 
-    // Sort alphabetically by name; for duplicate names, sort by ID ascending
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-        if (a.first == b.first) return a.second < b.second;
-        return a.first < b.first;
-    });
-
-    int index = -1;
-    for (size_t i = 0; i < sorted.size(); ++i) {
-        if (sorted[i].second == playerId) {
-            index = static_cast<int>(i);
-            break;
+    uintptr_t listBase = spectObj + 0x2C;
+    for (int i = 0; i < playerCount; i++) {
+        int handle = *(int*)(listBase + i * 20);
+        if (handle == playerId) {
+            *(int*)(spectObj + 0x28) = i;
+            currentSpectatorIndex = i;
+            currentSpectatorPlayerId = playerId;
+            return;
         }
     }
-
-    if (index == -1) {
-        std::cout << "[Spectator] ID " << playerId << " was not found in local scoreboard.\n";
-        return;
-    }
-
-    uintptr_t addr = baseGame + 0x7AE348;
-    *(int*)addr = index;
-    currentSpectatorIndex = index;
-    currentSpectatorPlayerId = playerId;  // Remember which player we're watching
-
-    // Find player name for logging
-    std::string name = "Unknown";
-    for (const auto& p : localPlayers) if (p.id == playerId) { name = p.name; break; }
+    std::cout << "[Spectator] Handle " << playerId << " not in spectator list\n";
 }
 
 // ---------------------------
@@ -108,7 +68,6 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
         currentPlayers.push_back(p);
     }
 
-    UpdateAlphabeticalOrder();
 }
 
 // ---------------------------
