@@ -5,11 +5,11 @@
 #include "SpectatorController.h"
 #include "GameMemoryReader.h"
 #include "DelayManager.h"
+#include "CameraDirector.h"
 #include "FirstPersonCamera.h"
 #include "AutoSpectator.h"
 #include "WorldCameraTracker.h"
 #include "RealtimeHook.h"
-#include "FlagMonitor.h"
 #include "TickDelayBuffer.h"
 #include "dsound_proxy.h"
 
@@ -22,21 +22,21 @@ uintptr_t GetModuleBase(const wchar_t* moduleName) {
 }
 
 // ---------------------------
-// Main loop: scoreboard polling + delayed action processing
+// Main loop: scoreboard polling + delayed action processing + camera director update
 // ---------------------------
 void MainLoop() {
     while (true) {
         // Process scheduled actions (kills/flags with delay timing)
         DelayManager::ProcessActions();
 
+        // Update camera director state machine
+        CameraDirector_Update();
+
         // Read scoreboard from game memory and update SpectatorController
         auto players = GameMemoryReader::ReadPlayerList();
         if (!players.empty()) {
             UpdateScoreboard(players);
         }
-
-        // Update camera orientation to match current player view
-        UpdateCameraOrientation();
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10x za sekundu
     }
@@ -73,10 +73,10 @@ DWORD WINAPI MainThread(LPVOID) {
     DelayManager::SetGameBase(base);
     DelayManager::Init();
 
+    InitCameraDirector(base);
     InitTickDelayBuffer(base);
     InitFirstPersonCamera(base);
     InitRealtimeHook(base);
-    InitFlagMonitor(base);
     InitAutoSpectator(base);
     InitWorldCameraTracker(base);
     SetHookReady();

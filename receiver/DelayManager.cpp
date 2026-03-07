@@ -1,4 +1,5 @@
 #include "DelayManager.h"
+#include "CameraDirector.h"
 #include "TickDelayBuffer.h"
 #include <iostream>
 #include <fstream>
@@ -127,11 +128,11 @@ void DelayManager::AddDelayedAction(const DelayedAction& action) {
     if (totalDelayMs <= 6000) {
         switch (action.type) {
             case DelayedAction::Type::KILL:
-                ProcessKillEvent(action.killerId, action.victimId);
+                CameraDirector_OnKill(action.killerId, action.victimId);
                 break;
 
             case DelayedAction::Type::FLAG:
-                ProcessFlagEvent(action.usCarrier, action.vcCarrier);
+                CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier);
                 break;
         }
         return;
@@ -151,11 +152,11 @@ void DelayManager::ProcessActions() {
         if (action.executeTime <= now) {
             switch (action.type) {
                 case DelayedAction::Type::KILL:
-                    ProcessKillEvent(action.killerId, action.victimId);
+                    CameraDirector_OnKill(action.killerId, action.victimId);
                     break;
 
                 case DelayedAction::Type::FLAG:
-                    ProcessFlagEvent(action.usCarrier, action.vcCarrier);
+                    CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier);
                     break;
             }
             actions.pop();
@@ -179,4 +180,69 @@ void DelayManager::ReloadConfigIfNeeded() {
 
     // Re-read config (LoadDelayFromINI also loads FPV config)
     LoadDelayFromINI();
+}
+
+// ============================================================================
+// CameraDirector config loading (follows same INI pattern)
+// ============================================================================
+
+static std::string GetIniPath() {
+    char dllPath[MAX_PATH];
+    HMODULE hModule = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          (LPCSTR)&GetIniPath,
+                          &hModule)) {
+        GetModuleFileNameA(hModule, dllPath, MAX_PATH);
+        std::string fullPath(dllPath);
+        size_t lastSlash = fullPath.find_last_of("\\/");
+        return fullPath.substr(0, lastSlash + 1) + "vcstreamer.ini";
+    }
+    return "vcstreamer.ini";
+}
+
+static float ReadIniFloat(const std::string& iniPath, const char* key, float defaultVal) {
+    char buf[64];
+    GetPrivateProfileStringA("CameraDirector", key, "", buf, sizeof(buf), iniPath.c_str());
+    if (buf[0] == '\0') return defaultVal;
+    try { return std::stof(buf); } catch (...) { return defaultVal; }
+}
+
+static int ReadIniInt(const std::string& iniPath, const char* key, int defaultVal) {
+    char buf[64];
+    GetPrivateProfileStringA("CameraDirector", key, "", buf, sizeof(buf), iniPath.c_str());
+    if (buf[0] == '\0') return defaultVal;
+    try { return std::stoi(buf); } catch (...) { return defaultVal; }
+}
+
+void LoadCameraDirectorConfig(CameraConfig& cfg) {
+    std::string iniPath = GetIniPath();
+
+    cfg.cinematicMinDistance       = ReadIniFloat(iniPath, "cinematic_min_distance", 25.0f);
+    cfg.cinematicMaxDistance       = ReadIniFloat(iniPath, "cinematic_max_distance", 50.0f);
+    cfg.cinematicMinChance        = ReadIniFloat(iniPath, "cinematic_min_chance", 0.30f);
+    cfg.cinematicMaxChance        = ReadIniFloat(iniPath, "cinematic_max_chance", 0.70f);
+
+    cfg.killCamWaitDuration       = ReadIniFloat(iniPath, "killcam_wait_duration", 3.5f);
+    cfg.killCamTransitionDuration = ReadIniFloat(iniPath, "killcam_transition_duration", 1.5f);
+    cfg.killCamAttachedDuration   = ReadIniFloat(iniPath, "killcam_attached_duration", 4.0f);
+    cfg.killCamSlideHeight        = ReadIniFloat(iniPath, "killcam_slide_height", 0.8f);
+
+    cfg.killCooldown              = ReadIniFloat(iniPath, "kill_cooldown", 5.0f);
+    cfg.flagLostGracePeriod       = ReadIniFloat(iniPath, "flag_lost_grace_period", 3.0f);
+
+    cfg.worldCamMaxDistance       = ReadIniFloat(iniPath, "worldcam_max_distance", 18.0f);
+    cfg.worldCamSwitchCooldown    = ReadIniFloat(iniPath, "worldcam_switch_cooldown", 4.0f);
+    cfg.worldCamMaxHold           = ReadIniFloat(iniPath, "worldcam_max_hold", 10.0f);
+    cfg.worldCamLOSPenalty        = ReadIniFloat(iniPath, "worldcam_los_penalty", 60.0f);
+    cfg.worldCamStickiness        = ReadIniFloat(iniPath, "worldcam_stickiness", 5.0f);
+
+    cfg.tpvMaxDistance            = ReadIniFloat(iniPath, "tpv_max_distance", 2.5f);
+    cfg.tpvYawSmoothFactor       = ReadIniFloat(iniPath, "tpv_yaw_smooth_factor", 0.01f);
+    cfg.tpvZoomInFactor           = ReadIniFloat(iniPath, "tpv_zoom_in_factor", 0.3f);
+    cfg.tpvZoomOutFactor          = ReadIniFloat(iniPath, "tpv_zoom_out_factor", 0.005f);
+
+    cfg.debugMode                 = (ReadIniInt(iniPath, "debug_mode", 0) != 0);
+
+    std::cout << "[CameraDirector] Config loaded from " << iniPath << "\n";
 }

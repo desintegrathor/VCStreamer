@@ -1,7 +1,7 @@
 #pragma once
 #include <queue>
 #include <chrono>
-#include "SpectatorController.h"
+#include <Windows.h>
 
 struct DelayedAction {
     enum class Type {

@@ -1,89 +1,50 @@
 #include "FirstPersonCamera.h"
+#include "CameraDirector.h"
 #include "DelayManager.h"
+#include "WorldCameraTracker.h"
 #include "minhook/MinHook.h"
 #include <iostream>
 #include <cmath>
-#include <cstdlib>
-#include <ctime>
+#include <cstring>
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-constexpr float EYE_OFFSET_STANDING = 0.55f;   // Eye height above chest when standing
-constexpr float EYE_OFFSET_CROUCHING = 0.35f;  // Eye height above chest when crouching
-constexpr int SPECTATOR_MODE_FREE = 2;         // Mode 2 = follow player
-
-// Camera view modes
-enum class CameraMode {
-    ThirdPerson,    // 3PV - camera behind player
-    FirstPerson     // FPV - camera at eye level (TODO: implement)
-};
-
-// Configuration
-constexpr bool FPV_ENABLED = true;             // Enable random FPV/3PV selection
-constexpr int FPV_CHANCE_PERCENT = 50;         // Chance of FPV when switching players (0-100)
-
-// 3PV distance smoothing
-constexpr float MAX_CAMERA_DISTANCE = 2.5f;    // Max distance from player
-constexpr float ZOOM_IN_FACTOR = 0.3f;         // Fast zoom in (collision)
-constexpr float ZOOM_OUT_FACTOR = 0.005f;      // Very slow zoom out
+constexpr int SPECTATOR_MODE_FREE = 2;
 
 // Game.dll offsets (IDA addresses minus IDA base 0xD40000)
-constexpr uintptr_t OFFSET_FILL_CAMERA = 0x147650;           // IDA: 0xE87650
-constexpr uintptr_t OFFSET_GET_CHEST_POS = 0x18BCB0;         // IDA: 0xECBCB0
-constexpr uintptr_t OFFSET_SET_CAM_ROTATION_IMPORT = 0x1E7718; // IDA: 0xF27718
-constexpr uintptr_t OFFSET_GET_BONE_LOC_IMPORT = 0x1E7E14;   // IDA: 0xF27E14 - SKE_GetBoneEndLoc
-constexpr uintptr_t OFFSET_GET_EYE_POS_IMPORT = 0x1E7B04;    // IDA: 0xF27B04 - COM_MSHDEF_GetEyeWorldPos
-constexpr uintptr_t OFFSET_GET_HAND_FIRE_IMPORT = 0x1E7B0C;  // IDA: 0xF27B0C - COM_MSHDEF_GetHandFireZone
-constexpr uintptr_t OFFSET_CALC_FOLLOW_CAM = 0x12E570;       // IDA: 0xE6E570 - GPLAYER_CalculateFollowCameraPosition
+constexpr uintptr_t OFFSET_FILL_CAMERA = 0x147650;
+constexpr uintptr_t OFFSET_GET_CHEST_POS = 0x18BCB0;
+constexpr uintptr_t OFFSET_SET_CAM_ROTATION_IMPORT = 0x1E7718;
+constexpr uintptr_t OFFSET_GET_BONE_LOC_IMPORT = 0x1E7E14;
+constexpr uintptr_t OFFSET_GET_EYE_POS_IMPORT = 0x1E7B04;
+constexpr uintptr_t OFFSET_GET_HAND_FIRE_IMPORT = 0x1E7B0C;
+constexpr uintptr_t OFFSET_CALC_FOLLOW_CAM = 0x12E570;
 
 // Structure offsets
 constexpr int SPECTATOR_CTRL_MODE = 0x00;
 constexpr int SPECTATOR_CTRL_CLIENT = 0x52C;
 constexpr int CLIENT_PLAYER_ENTITY = 0xF4;
-constexpr int PLAYER_STANCE_FLAG = 0x14;
-constexpr int PLAYER_PITCH = 0xF4;
-constexpr int PLAYER_YAW = 0xFC;
-constexpr int PLAYER_SKELETON_PTR = 0x378;  // Pointer to skeleton array
+constexpr int PLAYER_SKELETON_PTR = 0x378;
 
 // Bone IDs
-constexpr unsigned int BONE_CHEST = 0x0B;        // 11 - Chest/Spine
-constexpr unsigned int BONE_LEFT_SHOULDER = 0x0D;  // 13 - Left Shoulder
-constexpr unsigned int BONE_RIGHT_SHOULDER = 0x12; // 18 - Right Shoulder
-constexpr unsigned int BONE_HEAD = 0x17;         // 23 - Head (for camera position)
-constexpr unsigned int BONE_WEAPON = 0x19;       // 25 - Weapon (for aim direction)
+constexpr unsigned int BONE_HEAD = 0x17;
 
 // ============================================================================
 // Function types
 // ============================================================================
 
-// Original FillCamera function: int __thiscall GNET_SpectatorCtrl_FillCamera(void* this, void* cameraProp)
 typedef int (__thiscall *FillCamera_t)(void* thisPtr, void* cameraProp);
-
-// COM_I3DCamera_DirUp_From_RXYZ: void __cdecl (void* cameraProp, float pitch, float roll, float yaw)
 typedef void (__cdecl *SetCameraRotation_t)(void* cameraProp, float pitch, float roll, float yaw);
-
-// GPLAYER_GetChestPosition: float* __thiscall (void* playerEntity, float* outPos)
 typedef float* (__thiscall *GetChestPosition_t)(void* playerEntity, float* outPos);
-
-// SKE_GetBoneEndLoc: int __cdecl (void* skeleton, unsigned int boneId, float* outPos)
 typedef int (__cdecl *GetBoneEndLoc_t)(void* skeleton, unsigned int boneId, float* outPos);
-
-// COM_MSHDEF_GetEyeWorldPos: int __cdecl (void* skeleton, float* outPos)
-// Returns 1 on success, 0 on failure
 typedef int (__cdecl *GetEyeWorldPos_t)(void* skeleton, float* outPos);
-
-// COM_MSHDEF_GetHandFireZone: void __cdecl (void* skeleton, float* outData)
-// Returns 12 floats: [0-2] hand pos, [3-5] muzzle pos, [6-8] other hand, [9-11] other muzzle
 typedef void (__cdecl *GetHandFireZone_t)(void* skeleton, float* outData);
-
-// GPLAYER_CalculateFollowCameraPosition: int __cdecl (playerEntity, rotMatrix, outCamPos, outLookAt, distance)
-// Calculates camera position with collision detection
 typedef int (__cdecl *CalcFollowCameraPos_t)(void* playerEntity, float* rotMatrix, float* outCamPos, float* outLookAt, float distance);
 
 // ============================================================================
-// Global state
+// Global state (render-side only)
 // ============================================================================
 
 static uintptr_t g_gameBase = 0;
@@ -96,115 +57,75 @@ static GetHandFireZone_t g_GetHandFireZone = nullptr;
 static CalcFollowCameraPos_t g_CalcFollowCamPos = nullptr;
 static bool g_hookInstalled = false;
 
-// Camera mode state
-static CameraMode g_currentCameraMode = CameraMode::ThirdPerson;
+// Render-side state (not decision state — that's in CameraDirector)
 static void* g_lastPlayerEntity = nullptr;
-static bool g_randomInitialized = false;
 
-// 3PV Yaw smoothing state
+// 3PV Yaw smoothing
 static float g_smoothedYaw = 0.0f;
 static bool g_yawInitialized = false;
 
-// FPV smoothing state
-static float g_fpvSmoothedYaw = 0.0f;
-static float g_fpvSmoothedPitch = 0.0f;
-static bool g_fpvInitialized = false;
-
-// 3PV distance smoothing state
+// 3PV distance smoothing
 static float g_smoothedDistance = 2.5f;
 static bool g_distanceInitialized = false;
+
+// KillCam render-side position tracking for slide interpolation
+static float g_killCamKillerLastPos[3] = {};
+static bool g_killCamKillerPosLocked = false;
+static float g_killCamVictimLastPos[3] = {};
+static bool g_killCamVictimPosLocked = false;
+static bool g_killCamPhase2Entered = false;
+
+// Track last director state for detecting KillCam entry
+static CameraState g_lastDirState = CameraState::Idle;
 
 // ============================================================================
 // Helper functions
 // ============================================================================
 
-// Normalize angle to [-PI, PI]
-float NormalizeAngle(float angle) {
+static float NormalizeAngle(float angle) {
     while (angle > 3.14159265f) angle -= 6.28318530f;
     while (angle < -3.14159265f) angle += 6.28318530f;
     return angle;
 }
 
-// Lerp with angle wrapping
-float LerpAngle(float from, float to, float t) {
+static float LerpAngle(float from, float to, float t) {
     float diff = NormalizeAngle(to - from);
     return from + diff * t;
 }
 
-// Initialize random number generator
-void InitRandom() {
-    if (!g_randomInitialized) {
-        srand(static_cast<unsigned int>(time(nullptr)));
-        g_randomInitialized = true;
-    }
+static float SmoothStep(float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t * t * (3.0f - 2.0f * t);
 }
 
-// Select camera mode when player changes
-void OnPlayerChanged(void* newPlayerEntity) {
-    InitRandom();
-
-    if (FPV_ENABLED) {
-        // Random chance for FPV vs 3PV (from config)
-        int roll = rand() % 100;
-        if (roll < DelayManager::GetFpvChance()) {
-            g_currentCameraMode = CameraMode::FirstPerson;
-            g_fpvInitialized = false;  // Reset FPV smoothing
-            std::cout << "[Camera] Switched to FPV mode\n";
-        } else {
-            g_currentCameraMode = CameraMode::ThirdPerson;
-            g_yawInitialized = false;  // Reset 3PV smoothing
-            g_distanceInitialized = false;  // Reset distance smoothing
-            std::cout << "[Camera] Switched to 3PV mode\n";
+static void* FindEntityByHandle(int handle) {
+    void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
+    for (int i = 0; i < 64; i++) {
+        if (!playerTable[i]) continue;
+        if (*(int*)playerTable[i] == handle) {
+            uintptr_t entity = *(uintptr_t*)((uintptr_t)playerTable[i] + 244);
+            return entity ? (void*)entity : nullptr;
         }
-    } else {
-        g_currentCameraMode = CameraMode::ThirdPerson;
-        g_yawInitialized = false;
-        g_distanceInitialized = false;
     }
-
-    g_lastPlayerEntity = newPlayerEntity;
+    return nullptr;
 }
 
-// Build 4x4 rotation matrix from yaw angle (rotation around Z axis)
-void BuildRotationMatrix(float* m, float yaw) {
-    float cy = cosf(yaw);
-    float sy = sinf(yaw);
-
-    // Row 0: X axis
-    m[0] = cy;   m[1] = -sy;  m[2] = 0.0f;  m[3] = 0.0f;
-    // Row 1: Y axis
-    m[4] = sy;   m[5] = cy;   m[6] = 0.0f;  m[7] = 0.0f;
-    // Row 2: Z axis
-    m[8] = 0.0f; m[9] = 0.0f; m[10] = 1.0f; m[11] = 0.0f;
-    // Row 3: Position/W
-    m[12] = 0.0f; m[13] = 0.0f; m[14] = 0.0f; m[15] = 1.0f;
+static void GetEntityPos(void* entity, float* out) {
+    out[0] = *(float*)((uintptr_t)entity + 0xD0);
+    out[1] = *(float*)((uintptr_t)entity + 0xD4);
+    out[2] = *(float*)((uintptr_t)entity + 0xD8);
 }
 
-// Get bone rotation from skeleton
-// Returns true if successful, fills outYaw and outPitch with Euler angles
-bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, float* outPitch) {
-    // Skeleton structure:
-    // +0x18 (+24) = bone count
-    // +0x1C (+28) = bone array (pointer to array of bone pointers)
-
+static bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, float* outPitch) {
     unsigned int boneCount = *(unsigned int*)((char*)skeleton + 0x18);
-    if (boneId >= boneCount) {
-        return false;
-    }
+    if (boneId >= boneCount) return false;
 
     void** boneArray = *(void***)((char*)skeleton + 0x1C);
-    if (!boneArray) {
-        return false;
-    }
+    if (!boneArray) return false;
 
     void* bone = boneArray[boneId];
-    if (!bone) {
-        return false;
-    }
-
-    // Bone structure:
-    // +0x1C (+28) = local transform matrix (4x4, 64 bytes)
-    // +0x88 (+136) = world transform pointer (if not null, matrix is at worldTransform + 28)
+    if (!bone) return false;
 
     void* worldTransform = *(void**)((char*)bone + 0x88);
     float* matrix;
@@ -214,22 +135,11 @@ bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, float* 
         matrix = (float*)((char*)bone + 0x1C);
     }
 
-    // Matrix layout (row-major, 16 floats):
-    // [0]  [1]  [2]  [3]   - X axis (right vector in bone space)
-    // [4]  [5]  [6]  [7]   - Y axis (forward vector in bone space)
-    // [8]  [9]  [10] [11]  - Z axis (up vector in bone space)
-    // [12] [13] [14] [15]  - Position + w
-
-    // For hips bone, Y axis (row 1) points forward in character space
     float fwdX = matrix[4];
     float fwdY = matrix[5];
     float fwdZ = matrix[6];
 
-    // Yaw = rotation around world Z (up) axis
-    // Returns raw yaw - caller adds offsets as needed
     *outYaw = atan2f(fwdX, fwdY);
-
-    // Pitch from forward vector Z component (raw, no clamping)
     *outPitch = asinf(fwdZ);
 
     return true;
@@ -239,200 +149,202 @@ bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, float* 
 // Hook function
 // ============================================================================
 
-// Using __fastcall to handle __thiscall convention (thisPtr in ECX, ignore EDX)
 int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraProp) {
-    // Periodically reload config from INI file
     DelayManager::ReloadConfigIfNeeded();
 
-    // Check spectator mode - only modify Mode 2 (follow player)
     int mode = *(int*)((char*)thisPtr + SPECTATOR_CTRL_MODE);
 
-    if (mode == SPECTATOR_MODE_FREE) {
-        // Get camera entry index: this[10] = *(this + 0x28)
-        int cameraIndex = *(int*)((char*)thisPtr + 0x28);
+    if (mode != SPECTATOR_MODE_FREE) {
+        return g_OriginalFillCamera(thisPtr, cameraProp);
+    }
 
-        // Get camera entry pointer: this + 44 + 20*index
-        // Camera entry structure (20 bytes):
-        //   +0: unknown
-        //   +4: unknown
-        //   +8: pitch (mouse Y input)
-        //   +12: yaw (mouse X input)
-        //   +16: unknown
-        char* cameraEntry = (char*)thisPtr + 44 + 20 * cameraIndex;
+    CameraState dirState = CameraDirector_GetState();
+    KillCamPhase kcPhase = CameraDirector_GetKillCamPhase();
+    const CameraConfig& cfg = CameraDirector_GetConfig();
 
-        // Get client and player entity
-        void* client = *(void**)((char*)thisPtr + SPECTATOR_CTRL_CLIENT);
-        if (client) {
-            void* playerEntity = *(void**)((char*)client + CLIENT_PLAYER_ENTITY);
-            if (playerEntity) {
-                // Detect player change
-                if (playerEntity != g_lastPlayerEntity) {
-                    OnPlayerChanged(playerEntity);
+    // Detect player change and reset render state
+    void* client = *(void**)((char*)thisPtr + SPECTATOR_CTRL_CLIENT);
+    void* playerEntity = nullptr;
+    if (client) {
+        playerEntity = *(void**)((char*)client + CLIENT_PLAYER_ENTITY);
+    }
+
+    if (playerEntity && playerEntity != g_lastPlayerEntity) {
+        g_yawInitialized = false;
+        g_distanceInitialized = false;
+        g_lastPlayerEntity = playerEntity;
+    }
+
+    // Detect KillCam start (transition from non-KillCam to KillCam)
+    if (dirState == CameraState::KillCam && g_lastDirState != CameraState::KillCam) {
+        // New KillCam started — snapshot positions
+        int killerHandle = CameraDirector_GetKillCamKillerHandle();
+        int victimHandle = CameraDirector_GetKillCamVictimHandle();
+
+        void* ke = FindEntityByHandle(killerHandle);
+        if (ke) GetEntityPos(ke, g_killCamKillerLastPos);
+        else memset(g_killCamKillerLastPos, 0, sizeof(g_killCamKillerLastPos));
+
+        void* ve = FindEntityByHandle(victimHandle);
+        if (ve) GetEntityPos(ve, g_killCamVictimLastPos);
+        else memset(g_killCamVictimLastPos, 0, sizeof(g_killCamVictimLastPos));
+
+        g_killCamKillerPosLocked = false;
+        g_killCamVictimPosLocked = false;
+        g_killCamPhase2Entered = false;
+    }
+
+    // 3PV pre-processing: run for all states except KillCam Transition
+    bool do3pvPreprocess = !(dirState == CameraState::KillCam && kcPhase == KillCamPhase::Transition);
+
+    if (do3pvPreprocess && playerEntity) {
+        void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
+        if (skeletonPtrPtr && *skeletonPtrPtr) {
+            void* skeleton = *skeletonPtrPtr;
+            float yaw = 0.0f;
+            float pitch = 0.0f;
+
+            if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
+                constexpr float YAW_OFFSET_3PV = 3.14159265f - 0.35f;
+                yaw += YAW_OFFSET_3PV;
+
+                constexpr float MAX_PITCH_3PV = 0.175f;
+                if (pitch > MAX_PITCH_3PV) pitch = MAX_PITCH_3PV;
+                if (pitch < -MAX_PITCH_3PV) pitch = -MAX_PITCH_3PV;
+
+                if (!g_yawInitialized) {
+                    g_smoothedYaw = yaw;
+                    g_yawInitialized = true;
                 }
 
-                // Get skeleton
-                void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
-                if (skeletonPtrPtr && *skeletonPtrPtr) {
-                    void* skeleton = *skeletonPtrPtr;
+                g_smoothedYaw = LerpAngle(g_smoothedYaw, yaw, cfg.tpvYawSmoothFactor);
 
-                    float yaw = 0.0f;
-                    float pitch = 0.0f;
-
-                    if (g_currentCameraMode == CameraMode::ThirdPerson) {
-                        // =============================================================
-                        // 3PV MODE (Third Person View)
-                        // =============================================================
-                        // Override camera entry yaw/pitch BEFORE original call
-                        // This makes camera orbit to position behind player
-                        // Original function handles collision detection with our rotation
-
-                        if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
-                            // 3PV offset: camera BEHIND player (+PI), minus 20° correction
-                            constexpr float YAW_OFFSET_3PV = 3.14159265f - 0.35f;
-                            yaw += YAW_OFFSET_3PV;
-
-                            // Clamp pitch to ±10° for 3PV
-                            constexpr float MAX_PITCH_3PV = 0.175f;
-                            if (pitch > MAX_PITCH_3PV) pitch = MAX_PITCH_3PV;
-                            if (pitch < -MAX_PITCH_3PV) pitch = -MAX_PITCH_3PV;
-
-                            // Initialize smoothed yaw on first use or player change
-                            if (!g_yawInitialized || playerEntity != g_lastPlayerEntity) {
-                                g_smoothedYaw = yaw;
-                                g_yawInitialized = true;
-                            }
-
-                            // Smooth yaw interpolation (lower = slower/smoother)
-                            constexpr float SMOOTH_FACTOR = 0.01f;
-                            g_smoothedYaw = LerpAngle(g_smoothedYaw, yaw, SMOOTH_FACTOR);
-
-                            // Override input values - original will use these for positioning
-                            *(float*)(cameraEntry + 8) = pitch;         // clamped pitch
-                            *(float*)(cameraEntry + 12) = g_smoothedYaw; // smoothed yaw with offset
-                        }
-                    } else if (g_currentCameraMode == CameraMode::FirstPerson) {
-                        // =============================================================
-                        // FPV MODE (First Person View)
-                        // =============================================================
-                        // Will be handled after original call
-                    }
-                }
+                int cameraIndex = *(int*)((char*)thisPtr + 0x28);
+                char* cameraEntry = (char*)thisPtr + 44 + 20 * cameraIndex;
+                *(float*)(cameraEntry + 8) = pitch;
+                *(float*)(cameraEntry + 12) = g_smoothedYaw;
             }
         }
     }
 
-    // Call original function - it will use our overwritten yaw/pitch values
+    // Call original function
     int result = g_OriginalFillCamera(thisPtr, cameraProp);
 
-    // Post-processing for 3PV mode - distance smoothing
-    if (mode == SPECTATOR_MODE_FREE && result && g_currentCameraMode == CameraMode::ThirdPerson) {
-        void* client = *(void**)((char*)thisPtr + SPECTATOR_CTRL_CLIENT);
-        if (client) {
-            void* playerEntity = *(void**)((char*)client + CLIENT_PLAYER_ENTITY);
-            if (playerEntity && g_GetChestPosition) {
-                // Get player chest position
-                float playerPos[3];
-                g_GetChestPosition(playerEntity, playerPos);
+    // Post-processing: distance smoothing (skip during KillCam Transition)
+    if (do3pvPreprocess && result && playerEntity && g_GetChestPosition) {
+        float playerPos[3];
+        g_GetChestPosition(playerEntity, playerPos);
 
-                // Get current camera position
-                float* camPos = (float*)cameraProp;
+        float* camPos = (float*)cameraProp;
 
-                // Calculate direction and actual distance
-                float dx = camPos[0] - playerPos[0];
-                float dy = camPos[1] - playerPos[1];
-                float dz = camPos[2] - playerPos[2];
-                float originalDistance = sqrtf(dx*dx + dy*dy + dz*dz);
+        float dx = camPos[0] - playerPos[0];
+        float dy = camPos[1] - playerPos[1];
+        float dz = camPos[2] - playerPos[2];
+        float originalDistance = sqrtf(dx * dx + dy * dy + dz * dz);
 
-                // Target distance is clamped to max
-                float targetDistance = originalDistance;
-                if (targetDistance > MAX_CAMERA_DISTANCE)
-                    targetDistance = MAX_CAMERA_DISTANCE;
+        float targetDistance = originalDistance;
+        if (targetDistance > cfg.tpvMaxDistance)
+            targetDistance = cfg.tpvMaxDistance;
 
-                // Initialize or smooth distance
-                if (!g_distanceInitialized) {
-                    g_smoothedDistance = targetDistance;
-                    g_distanceInitialized = true;
-                } else {
-                    // Asymmetric smoothing: fast zoom in, slow zoom out
-                    float factor = (targetDistance < g_smoothedDistance)
-                        ? ZOOM_IN_FACTOR   // Moving closer (collision) - fast
-                        : ZOOM_OUT_FACTOR; // Moving farther - slow
-                    g_smoothedDistance += (targetDistance - g_smoothedDistance) * factor;
-                }
+        if (!g_distanceInitialized) {
+            g_smoothedDistance = targetDistance;
+            g_distanceInitialized = true;
+        } else {
+            float factor = (targetDistance < g_smoothedDistance)
+                ? cfg.tpvZoomInFactor
+                : cfg.tpvZoomOutFactor;
+            g_smoothedDistance += (targetDistance - g_smoothedDistance) * factor;
+        }
 
-                // Clamp smoothed distance too
-                if (g_smoothedDistance > MAX_CAMERA_DISTANCE)
-                    g_smoothedDistance = MAX_CAMERA_DISTANCE;
+        if (g_smoothedDistance > cfg.tpvMaxDistance)
+            g_smoothedDistance = cfg.tpvMaxDistance;
 
-                // Apply smoothed distance - use ORIGINAL distance for scale!
-                if (originalDistance > 0.01f) {
-                    float scale = g_smoothedDistance / originalDistance;
-                    camPos[0] = playerPos[0] + dx * scale;
-                    camPos[1] = playerPos[1] + dy * scale;
-                    camPos[2] = playerPos[2] + dz * scale + 0.5f;  // +0.5m up
-                }
-            }
+        if (originalDistance > 0.01f) {
+            float scale = g_smoothedDistance / originalDistance;
+            camPos[0] = playerPos[0] + dx * scale;
+            camPos[1] = playerPos[1] + dy * scale;
+            camPos[2] = playerPos[2] + dz * scale + 0.5f;
         }
     }
 
-    // Post-processing for FPV mode (needs to override position after original)
-    if (mode == SPECTATOR_MODE_FREE && result && g_currentCameraMode == CameraMode::FirstPerson) {
-        void* client = *(void**)((char*)thisPtr + SPECTATOR_CTRL_CLIENT);
-        if (client) {
-            void* playerEntity = *(void**)((char*)client + CLIENT_PLAYER_ENTITY);
-            if (playerEntity) {
-                void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
-                if (skeletonPtrPtr && *skeletonPtrPtr) {
-                    void* skeleton = *skeletonPtrPtr;
+    // KillCam phased logic
+    if (dirState == CameraState::KillCam && result) {
+        float elapsed = CameraDirector_GetKillCamElapsed();
+        int killerHandle = CameraDirector_GetKillCamKillerHandle();
+        int victimHandle = CameraDirector_GetKillCamVictimHandle();
 
-                    // Get eye position
-                    float eyePos[3];
-                    if (g_GetEyeWorldPos && g_GetEyeWorldPos(skeleton, eyePos)) {
-                        // Use bone rotation (same as 3PV) but inverted axes for FPV
-                        float yaw = 0.0f, pitch = 0.0f;
-                        GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch);
-                        yaw = -yaw + 3.14159265f;  // Invert yaw and add PI to look forward
-                        pitch = -pitch + DelayManager::GetFpvPitchOffset();  // Invert pitch and offset from config
+        // Look up entities, snapshot positions
+        void* killerEntity = FindEntityByHandle(killerHandle);
+        void* victimEntity = FindEntityByHandle(victimHandle);
 
-                        // Initialize FPV smoothing on first use or player change
-                        if (!g_fpvInitialized || playerEntity != g_lastPlayerEntity) {
-                            g_fpvSmoothedYaw = yaw;
-                            g_fpvSmoothedPitch = pitch;
-                            g_fpvInitialized = true;
-                        }
+        float killerPos[3], victimPos[3];
 
-                        // FPV smoothing (0.03 = smooth, 3PV uses 0.01)
-                        constexpr float FPV_SMOOTH_FACTOR = 0.03f;
-                        g_fpvSmoothedYaw = LerpAngle(g_fpvSmoothedYaw, yaw, FPV_SMOOTH_FACTOR);
-                        g_fpvSmoothedPitch = g_fpvSmoothedPitch + (pitch - g_fpvSmoothedPitch) * FPV_SMOOTH_FACTOR;
+        if (killerEntity) {
+            GetEntityPos(killerEntity, killerPos);
+            memcpy(g_killCamKillerLastPos, killerPos, sizeof(killerPos));
+        } else {
+            if (!g_killCamKillerPosLocked) g_killCamKillerPosLocked = true;
+            memcpy(killerPos, g_killCamKillerLastPos, sizeof(killerPos));
+        }
 
-                        // Set camera at eye position with offset
-                        // Use raw yaw (before transform) for direction vectors
-                        float rawYaw = 0.0f, rawPitch = 0.0f;
-                        GetBoneRotation(skeleton, BONE_HEAD, &rawYaw, &rawPitch);
+        if (victimEntity) {
+            GetEntityPos(victimEntity, victimPos);
+            memcpy(g_killCamVictimLastPos, victimPos, sizeof(victimPos));
+        } else {
+            if (!g_killCamVictimPosLocked) g_killCamVictimPosLocked = true;
+            memcpy(victimPos, g_killCamVictimLastPos, sizeof(victimPos));
+        }
 
-                        // Direction vectors: forward=(sin,cos), back=(-sin,-cos), left=(-cos,sin)
-                        float sinY = sinf(rawYaw);
-                        float cosY = cosf(rawYaw);
+        float waitEnd = cfg.killCamWaitDuration;
+        float transEnd = waitEnd + cfg.killCamTransitionDuration;
 
-                        // Offset from config
-                        float offBack = DelayManager::GetFpvOffsetBack();
-                        float offLeft = DelayManager::GetFpvOffsetLeft();
-                        float offUp = DelayManager::GetFpvOffsetUp();
+        // Phase 1 (transition): slide camera from killer to victim
+        if (kcPhase == KillCamPhase::Transition) {
+            float t = SmoothStep((elapsed - waitEnd) / (transEnd - waitEnd));
+            float* camPos = (float*)cameraProp;
 
-                        float* camPos = (float*)cameraProp;
-                        camPos[0] = eyePos[0] + sinY * offBack + cosY * offLeft;  // back + left
-                        camPos[1] = eyePos[1] + cosY * offBack - sinY * offLeft;  // back + left
-                        camPos[2] = eyePos[2] + offUp;                             // up
+            camPos[0] = killerPos[0] + (victimPos[0] - killerPos[0]) * t;
+            camPos[1] = killerPos[1] + (victimPos[1] - killerPos[1]) * t;
+            camPos[2] = killerPos[2] + (victimPos[2] - killerPos[2]) * t + cfg.killCamSlideHeight;
 
-                        if (g_SetCameraRotation) {
-                            g_SetCameraRotation(cameraProp, g_fpvSmoothedPitch, 0.0f, g_fpvSmoothedYaw);
-                        }
-                    }
-                }
+            // Look forward: killer -> victim direction
+            float ddx = victimPos[0] - killerPos[0];
+            float ddy = victimPos[1] - killerPos[1];
+            float ddz = victimPos[2] - killerPos[2];
+            float horizDist = sqrtf(ddx * ddx + ddy * ddy);
+
+            float yaw = (horizDist > 0.01f) ? atan2f(-ddx, ddy) : 0.0f;
+            float pitch = (horizDist > 0.01f) ? -atan2f(ddz, horizDist) : 0.0f;
+
+            if (g_SetCameraRotation) {
+                g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
             }
         }
+
+        // Phase 2 (attached): switch to victim on first frame
+        if (kcPhase == KillCamPhase::Attached && !g_killCamPhase2Entered) {
+            g_killCamPhase2Entered = true;
+
+            // Switch spectator target to victim
+            uintptr_t spectObj = g_gameBase + 0x7AE320;
+            int playerCount = *(int*)(spectObj + 0x24);
+            uintptr_t listBase = spectObj + 0x2C;
+            for (int i = 0; i < playerCount && i < 64; i++) {
+                if (*(int*)(listBase + i * 20) == victimHandle) {
+                    *(int*)(spectObj + 0x28) = i;
+                    break;
+                }
+            }
+
+            // Reset smoothing for fresh 3PV on victim
+            g_yawInitialized = false;
+            g_distanceInitialized = false;
+
+            std::cout << "[Camera] KillCam phase 2: attached to victim\n";
+        }
     }
+
+    g_lastDirState = dirState;
 
     return result;
 }
@@ -444,34 +356,27 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 bool InitFirstPersonCamera(uintptr_t gameBase) {
     g_gameBase = gameBase;
 
-    std::cout << "[FirstPerson] Initializing first-person camera hook...\n";
+    std::cout << "[FirstPerson] Initializing camera hook...\n";
     std::cout << "[FirstPerson] game.dll base: 0x" << std::hex << gameBase << std::dec << "\n";
 
-    // Initialize MinHook
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
         std::cout << "[FirstPerson] Failed to initialize MinHook: " << MH_StatusToString(status) << "\n";
         return false;
     }
 
-    // Resolve function addresses
     uintptr_t fillCameraAddr = gameBase + OFFSET_FILL_CAMERA;
     g_GetChestPosition = (GetChestPosition_t)(gameBase + OFFSET_GET_CHEST_POS);
     g_CalcFollowCamPos = (CalcFollowCameraPos_t)(gameBase + OFFSET_CALC_FOLLOW_CAM);
 
-    // Read imported functions from import table (they are pointers to functions)
     g_SetCameraRotation = *(SetCameraRotation_t*)(gameBase + OFFSET_SET_CAM_ROTATION_IMPORT);
     g_GetBoneEndLoc = *(GetBoneEndLoc_t*)(gameBase + OFFSET_GET_BONE_LOC_IMPORT);
     g_GetEyeWorldPos = *(GetEyeWorldPos_t*)(gameBase + OFFSET_GET_EYE_POS_IMPORT);
     g_GetHandFireZone = *(GetHandFireZone_t*)(gameBase + OFFSET_GET_HAND_FIRE_IMPORT);
 
     std::cout << "[FirstPerson] FillCamera addr: 0x" << std::hex << fillCameraAddr << "\n";
-    std::cout << "[FirstPerson] CalcFollowCamPos addr: 0x" << (uintptr_t)g_CalcFollowCamPos << "\n";
-    std::cout << "[FirstPerson] GetBoneEndLoc addr: 0x" << (uintptr_t)g_GetBoneEndLoc << "\n";
-    std::cout << "[FirstPerson] GetEyeWorldPos addr: 0x" << (uintptr_t)g_GetEyeWorldPos << "\n";
     std::cout << "[FirstPerson] SetCamRotation addr: 0x" << (uintptr_t)g_SetCameraRotation << std::dec << "\n";
 
-    // Create hook
     status = MH_CreateHook(
         (LPVOID)fillCameraAddr,
         (LPVOID)&Hooked_FillCamera,
@@ -483,7 +388,6 @@ bool InitFirstPersonCamera(uintptr_t gameBase) {
         return false;
     }
 
-    // Enable hook
     status = MH_EnableHook((LPVOID)fillCameraAddr);
     if (status != MH_OK) {
         std::cout << "[FirstPerson] Failed to enable hook: " << MH_StatusToString(status) << "\n";
@@ -493,7 +397,6 @@ bool InitFirstPersonCamera(uintptr_t gameBase) {
 
     g_hookInstalled = true;
     std::cout << "[FirstPerson] Camera hook installed successfully!\n";
-    std::cout << "[FirstPerson] First-person mode is now active in spectator Mode 2\n";
 
     return true;
 }

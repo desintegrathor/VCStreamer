@@ -18,12 +18,9 @@ struct PlayerInfo {
 
 void InitSpectatorController(uintptr_t baseGameAddr);
 void UpdateScoreboard(const std::vector<PlayerInfo>& players);
-void ProcessKillEvent(int killerId, int victimId);
-void ProcessFlagEvent(int usCarrier, int vcCarrier);
 
-// Camera orientation control
-void SetCameraOrientation(float pitch, float yaw, float roll);
-void UpdateCameraOrientation();  // Called continuously to sync with current player
+// Switch spectator to a specific player handle
+void SetSpectatorToPlayerId(int playerId);
 
 // Camera distance patch
 void PatchCameraDistance(float normalDistance, float crouchedDistance);
