@@ -75,7 +75,7 @@ enum class AutoState {
     SELECTING_SPECTATOR,
     WAITING_FOR_CONFIRMATION,
     SWITCHING_CAMERA,
-    DONE
+    MONITORING
 };
 
 static uintptr_t g_baseGame = 0;
@@ -138,7 +138,7 @@ static void AutoSpectatorLoop() {
 
     LogDebug("[AutoSpectator] Waiting for connection...\n");
 
-    while (g_running && state != AutoState::DONE) {
+    while (g_running) {
         switch (state) {
 
         case AutoState::WAITING_FOR_CONNECTION: {
@@ -270,12 +270,25 @@ static void AutoSpectatorLoop() {
             // Set the flag — the hook on sub_EB88B0 (main thread) will do the actual switch
             g_wantCameraSwitch = true;
             LogDebug("[AutoSpectator] Requested camera switch via hook\n");
-            state = AutoState::DONE;
+            state = AutoState::MONITORING;
             break;
         }
 
-        case AutoState::DONE:
+        case AutoState::MONITORING: {
+            int mpSubState = *(int*)(g_baseGame + MP_SUBSTATE_OFFSET);
+            uintptr_t connPtr = *(uintptr_t*)(g_baseGame + CONN_PTR_OFFSET);
+
+            if (connPtr == 0) {
+                LogDebug("[AutoSpectator] Connection lost during monitoring\n");
+                state = AutoState::WAITING_FOR_CONNECTION;
+                retryCount = 0;
+            } else if (mpSubState != 10) {
+                LogDebug("[AutoSpectator] Map change detected (mpSubState=%d), re-selecting spectator...\n", mpSubState);
+                state = AutoState::WAITING_FOR_TEAM_MENU;
+                retryCount = 0;
+            }
             break;
+        }
         }
 
         Sleep(200);
