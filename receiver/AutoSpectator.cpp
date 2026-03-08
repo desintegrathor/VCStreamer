@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "AutoSpectator.h"
+#include "OctCollision.h"
 #include "WorldCameraTracker.h"
 #include "minhook/MinHook.h"
 #include <iostream>
@@ -22,7 +23,7 @@ static bool SafeReadDword(uintptr_t addr, uintptr_t* outVal) {
     }
 }
 
-static void LogDebug(const char* fmt, ...) {
+void LogDebug(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     if (g_logFile) {
@@ -235,6 +236,7 @@ static void AutoSpectatorLoop() {
             if (mpSubState == 10) {
                 LogDebug("[AutoSpectator] Spectator spawned! mpSubState=%d, spectCtrl=%d\n",
                          mpSubState, spectCtrl);
+                OctCollision_LoadCurrentMap();
                 state = AutoState::SWITCHING_CAMERA;
                 retryCount = 0;
             } else {
@@ -320,6 +322,8 @@ void InitAutoSpectator(uintptr_t baseGame) {
     LogDebug("[AutoSpectator] Spect view obj addr:0x%08X (offset 0x%X)\n", baseGame + SPECT_VIEW_OBJ_OFFSET, SPECT_VIEW_OBJ_OFFSET);
     LogDebug("[AutoSpectator] CamInit func addr:  0x%08X (offset 0x%X)\n", baseGame + SPECT_CAM_INIT_OFFSET, SPECT_CAM_INIT_OFFSET);
     LogDebug("[AutoSpectator] CamUpdate func addr:0x%08X (offset 0x%X)\n", baseGame + SPECT_CAM_UPDATE_OFFSET, SPECT_CAM_UPDATE_OFFSET);
+
+    OctCollision_Init(baseGame);
 
     // Install hook on sub_EB88B0 (spectator input handler) for main-thread camera switching.
     // MinHook is already initialized by FirstPersonCamera.

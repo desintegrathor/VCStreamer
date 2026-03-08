@@ -3,9 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <atomic>
-
-typedef int (__cdecl *COL_GetLineCollisionFunc)(float* origin, float* direction, int, void*, int);
-static COL_GetLineCollisionFunc g_COL_GetLineCollision = nullptr;
+#include "OctCollision.h"
 
 typedef void (__thiscall *SpectCamUpdateFunc)(int* thisPtr);
 
@@ -86,56 +84,15 @@ static void LogWC(const char* fmt, ...) {
     }
 }
 
-static bool ResolveCOL() {
-    if (g_COL_GetLineCollision) return true;
-
-    // Try pdcs.dll first (has native export)
-    HMODULE hPdcs = GetModuleHandleA("pdcs.dll");
-    if (hPdcs) {
-        LogWC("[WorldCam] pdcs.dll found at 0x%08X\n", (uintptr_t)hPdcs);
-        g_COL_GetLineCollision = (COL_GetLineCollisionFunc)GetProcAddress(
-            hPdcs, "?COL_GetLineCollision@@YAHPAVc_Vector3@@0HPAVc_PHS_do@@H@Z");
-        if (g_COL_GetLineCollision) {
-            LogWC("[WorldCam] COL_GetLineCollision from pdcs.dll at 0x%08X\n", (uintptr_t)g_COL_GetLineCollision);
-            return true;
-        }
-    }
-
-    // Fallback: logs.dll (known RVA 0x34FD0 from vcguardupgrade)
-    HMODULE hLogs = GetModuleHandleA("logs.dll");
-    if (hLogs) {
-        LogWC("[WorldCam] logs.dll found at 0x%08X\n", (uintptr_t)hLogs);
-        // Try mangled name first
-        g_COL_GetLineCollision = (COL_GetLineCollisionFunc)GetProcAddress(
-            hLogs, "?COL_GetLineCollision@@YAHPAVc_Vector3@@0HPAVc_PHS_do@@H@Z");
-        if (g_COL_GetLineCollision) {
-            LogWC("[WorldCam] COL_GetLineCollision from logs.dll export at 0x%08X\n", (uintptr_t)g_COL_GetLineCollision);
-            return true;
-        }
-        // Use known offset
-        g_COL_GetLineCollision = (COL_GetLineCollisionFunc)((uintptr_t)hLogs + 0x34FD0);
-        LogWC("[WorldCam] COL_GetLineCollision via logs.dll+0x34FD0 = 0x%08X\n", (uintptr_t)g_COL_GetLineCollision);
-        return true;
-    }
-
-    static bool loggedMissing = false;
-    if (!loggedMissing) {
-        loggedMissing = true;
-        LogWC("[WorldCam] Neither pdcs.dll nor logs.dll loaded\n");
-    }
-    return false;
-}
-
 static bool HasLineOfSight(float* camPos, float* playerPos) {
-    if (!g_COL_GetLineCollision) return true;
-    // Offset player position up to eye height (~1.5m) to avoid ground clipping
+    if (!OctCollision_IsLoaded()) return true;
+    // Offset player position up to eye height to avoid ground clipping
     float targetPos[3] = { playerPos[0], playerPos[1], playerPos[2] + 0.5f };
-    // COL_GetLineCollision takes two POINTS (start, end), not origin+direction
-    int result = g_COL_GetLineCollision(camPos, targetPos, 1, nullptr, 0);
-    LogWC("[WorldCam] LOS check: cam(%.1f,%.1f,%.1f)->player(%.1f,%.1f,%.1f) result=%d (%s)\n",
+    bool clear = OctCollision_LineOfSight(camPos, targetPos);
+    LogWC("[WorldCam] LOS check: cam(%.1f,%.1f,%.1f)->player(%.1f,%.1f,%.1f) %s\n",
           camPos[0], camPos[1], camPos[2], targetPos[0], targetPos[1], targetPos[2],
-          result, result == 0 ? "CLEAR" : "BLOCKED");
-    return (result == 0);
+          clear ? "CLEAR" : "BLOCKED");
+    return clear;
 }
 
 static float DistanceSq(float* a, float* b) {
@@ -258,7 +215,6 @@ void InitWorldCameraTracker(uintptr_t baseGame) {
     g_CAM_Spline_Evaluate = (CAM_Spline_EvaluateFunc)(baseGame + CAM_SPLINE_EVALUATE_OFFSET);
     g_initialized = true;
     LogWC("[WorldCam] Initialized. CAM_Spline_Evaluate at 0x%08X\n", (uintptr_t)g_CAM_Spline_Evaluate);
-    ResolveCOL();
 }
 
 void WorldCameraTracker_SetTarget(int playerHandle) {
@@ -326,8 +282,6 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
     int staticCount = spectObj[3];
     int dynamicCount = spectObj[6];
     if (staticCount <= 0 && dynamicCount <= 0) return;
-
-    if (!g_COL_GetLineCollision) ResolveCOL();
 
     void* playerStruct = FindPlayerByHandle(baseGame, targetHandle);
     if (!playerStruct) {
