@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "AutoSpectator.h"
+#include "DroneCamera.h"
 #include "OctCollision.h"
 #include "WorldCameraTracker.h"
 #include "minhook/MinHook.h"
@@ -128,12 +129,16 @@ int __fastcall Hooked_SpectInput(float* thisPtr, void* /*edx*/, float deltaTime)
         }
     }
     WorldCameraTracker_Update((int*)thisPtr, g_baseGame);
+    if (DroneCamera_IsActive()) {
+        DroneCamera_Update(deltaTime);
+    }
     return g_OrigSpectInput(thisPtr, deltaTime);
 }
 
 static void AutoSpectatorLoop() {
     AutoState state = AutoState::WAITING_FOR_CONNECTION;
     int retryCount = 0;
+    bool hasConnectedOnce = false;  // once true, never restart on connection loss
     constexpr int MAX_MENU_WAIT_RETRIES = 50; // 50 * 200ms = 10 seconds
     constexpr int MAX_CONFIRM_RETRIES = 100;  // 100 * 200ms = 20 seconds
 
@@ -147,7 +152,35 @@ static void AutoSpectatorLoop() {
             uintptr_t connPtr = *(uintptr_t*)(connPtrAddr);
             if (connPtr != 0) {
                 LogDebug("[AutoSpectator] Connected! connPtr=0x%08X (at 0x%08X)\n", connPtr, connPtrAddr);
+                hasConnectedOnce = true;
                 state = AutoState::WAITING_FOR_GAME_LOAD;
+                retryCount = 0;
+            } else {
+                retryCount++;
+                // The -ip flag triggers connect immediately on startup.
+                // If connPtr is still 0 after 30 seconds (150 * 200ms), connection failed.
+                // The error dialog is shown but we can't dismiss it programmatically,
+                // so restart the whole process.
+                if (retryCount >= 150 && !hasConnectedOnce) {
+                    LogDebug("[AutoSpectator] No connection after 30s (never connected), restarting game...\n");
+                    char exePath[MAX_PATH];
+                    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+                    // Read command line from vcstreamer.ini or use hardcoded default
+                    char cmdLine[1024];
+                    snprintf(cmdLine, sizeof(cmdLine), "\"%s\" -ip 46.13.190.168 5425 -addon fistalpha", exePath);
+                    STARTUPINFOA si = { sizeof(si) };
+                    PROCESS_INFORMATION pi;
+                    if (CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        LogDebug("[AutoSpectator] New process started, exiting current...\n");
+                        if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+                        ExitProcess(0);
+                    } else {
+                        LogDebug("[AutoSpectator] Failed to restart (err=%d), retrying...\n", GetLastError());
+                        retryCount = 0;
+                    }
+                }
             }
             break;
         }

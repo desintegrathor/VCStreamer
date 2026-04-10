@@ -158,6 +158,8 @@
     <ClInclude Include="framework.h" />
     <ClInclude Include="SpectatorController.h" />
     <ClInclude Include="GameMemoryReader.h" />
+    <ClInclude Include="SpectatedPlayerData.h" />
+    <ClInclude Include="FpvViewmodel.h" />
     <ClInclude Include="DelayManager.h" />
     <ClInclude Include="FirstPersonCamera.h" />
     <ClInclude Include="AutoSpectator.h" />
@@ -167,7 +169,9 @@
     <ClInclude Include="WorldCameraTracker.h" />
     <ClInclude Include="dsound_proxy.h" />
     <ClInclude Include="OctParser.h" />
+    <ClInclude Include="DroneCamera.h" />
     <ClInclude Include="OctCollision.h" />
+    <ClInclude Include="PathGrid.h" />
     <ClInclude Include="minhook\MinHook.h" />
     <ClInclude Include="minhook\buffer.h" />
     <ClInclude Include="minhook\trampoline.h" />
@@ -181,6 +185,12 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="GameMemoryReader.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="SpectatedPlayerData.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="FpvViewmodel.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="DelayManager.cpp">
@@ -218,7 +228,15 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="DroneCamera.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="OctCollision.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="PathGrid.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
     </ClCompile>

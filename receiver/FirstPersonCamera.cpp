@@ -1,11 +1,16 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include "FirstPersonCamera.h"
 #include "CameraDirector.h"
+#include "DroneCamera.h"
 #include "DelayManager.h"
 #include "WorldCameraTracker.h"
+#include "SpectatedPlayerData.h"
+#include "FpvViewmodel.h"
 #include "minhook/MinHook.h"
 #include <iostream>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 
 // ============================================================================
 // Constants
@@ -78,6 +83,23 @@ static bool g_killCamPhase2Entered = false;
 // Track last director state for detecting KillCam entry
 static CameraState g_lastDirState = CameraState::Idle;
 
+// Spectated player combat state
+static SpectatedPlayerState g_spectatedState;
+static int g_fpvLogCounter = 0;
+static FILE* g_fpvLog = nullptr;
+
+static void FpvLog(const char* fmt, ...) {
+    if (!g_fpvLog) {
+        g_fpvLog = fopen("autospectator_debug.log", "a");
+        if (!g_fpvLog) return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_fpvLog, fmt, args);
+    fflush(g_fpvLog);
+    va_end(args);
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -107,6 +129,19 @@ static void* FindEntityByHandle(int handle) {
             uintptr_t entity = *(uintptr_t*)((uintptr_t)playerTable[i] + 244);
             return entity ? (void*)entity : nullptr;
         }
+    }
+    return nullptr;
+}
+
+// Find playerTable entry whose entity pointer matches the given entity.
+// Returns the playerTable[i] entry (client struct with ntm offsets), or nullptr.
+static void* FindClientStructByEntity(void* entity) {
+    if (!entity) return nullptr;
+    void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
+    for (int i = 0; i < 64; i++) {
+        if (!playerTable[i]) continue;
+        uintptr_t ent = *(uintptr_t*)((uintptr_t)playerTable[i] + 244);
+        if (ent == (uintptr_t)entity) return playerTable[i];
     }
     return nullptr;
 }
@@ -173,6 +208,35 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         g_yawInitialized = false;
         g_distanceInitialized = false;
         g_lastPlayerEntity = playerEntity;
+        g_fpvLogCounter = 0; // force immediate log on target switch
+
+        // Log addresses for CE inspection
+        void* ptEntry = FindClientStructByEntity(playerEntity);
+        FpvLog("[FPV-ADDR] thisPtr=0x%08X client=0x%08X entity=0x%08X ptEntry=0x%08X\n",
+            (uintptr_t)thisPtr, (uintptr_t)client, (uintptr_t)playerEntity, (uintptr_t)ptEntry);
+    }
+
+    // Read spectated player combat state
+    if (playerEntity) {
+        // Find the playerTable entry for this entity (has ntm offsets for stance/anim/fire)
+        void* playerTableEntry = FindClientStructByEntity(playerEntity);
+        g_spectatedState = ReadPlayerCombatState(playerTableEntry, playerEntity, g_gameBase);
+        if (g_spectatedState.valid) {
+            g_spectatedState.playerHandle = playerTableEntry ? *(int*)((char*)playerTableEntry + 0x00) : 0;
+
+            // Log every ~120 frames (~2 seconds at 60fps)
+            if (++g_fpvLogCounter >= 120) {
+                g_fpvLogCounter = 0;
+                const char* stanceName = "STAND";
+                if (g_spectatedState.stance == STANCE_CROUCH) stanceName = "CROUCH";
+                else if (g_spectatedState.stance == STANCE_PRONE) stanceName = "PRONE";
+
+                FpvLog("[FPV] weapon=%s(%d) slot=%d stance=%s anim=%d stanceFlag=0x%X\n",
+                    g_spectatedState.weaponName, g_spectatedState.weaponId,
+                    g_spectatedState.activeSlotIndex, stanceName,
+                    g_spectatedState.animId, g_spectatedState.weaponState);
+            }
+        }
     }
 
     // Detect KillCam start (transition from non-KillCam to KillCam)
@@ -229,6 +293,19 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
     // Call original function
     int result = g_OriginalFillCamera(thisPtr, cameraProp);
+
+    // Drone camera: override position/rotation entirely, skip all post-processing
+    if (dirState == CameraState::Drone && result) {
+        float pos[3], pitch, yaw;
+        DroneCamera_GetCameraState(pos, &pitch, &yaw);
+        float* camPos = (float*)cameraProp;
+        camPos[0] = pos[0]; camPos[1] = pos[1]; camPos[2] = pos[2];
+        if (g_SetCameraRotation) {
+            g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
+        }
+        g_lastDirState = dirState;
+        return result;
+    }
 
     // Post-processing: distance smoothing (skip during KillCam Transition)
     if (do3pvPreprocess && result && playerEntity && g_GetChestPosition) {
@@ -387,6 +464,11 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
     g_lastDirState = dirState;
 
+    // FPV viewmodel: render the spectated player's first-person weapon
+    if (result && playerEntity && dirState != CameraState::Drone) {
+        FpvViewmodel_RenderFrame(playerEntity);
+    }
+
     return result;
 }
 
@@ -449,4 +531,12 @@ void ShutdownFirstPersonCamera() {
         MH_Uninitialize();
         g_hookInstalled = false;
     }
+    if (g_fpvLog) {
+        fclose(g_fpvLog);
+        g_fpvLog = nullptr;
+    }
+}
+
+const SpectatedPlayerState& GetSpectatedPlayerState() {
+    return g_spectatedState;
 }
