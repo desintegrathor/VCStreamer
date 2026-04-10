@@ -8,6 +8,7 @@ bool InitFpvViewmodel(uintptr_t gameBase);
 void ShutdownFpvViewmodel();
 
 // Call each frame during render to draw the spectated player's FPV weapon.
-// playerEntity = the spectated player's entity pointer.
-// Returns true if FPV was rendered this frame.
 bool FpvViewmodel_RenderFrame(void* playerEntity);
+
+// Get our FPV hands skeleton pointer (for positioning from camera hook)
+void* FpvViewmodel_GetSkeleton();

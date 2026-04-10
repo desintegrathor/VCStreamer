@@ -133,6 +133,7 @@ DWORD WINAPI MainThread(LPVOID) {
     InitRealtimeHook(base);
     InitAutoSpectator(base);
     InitWorldCameraTracker(base);
+    WorldCameraTracker_SetPreference(2);  // Force player camera, no world cams
     SetHookReady();
 
     std::thread mainThread(MainLoop);

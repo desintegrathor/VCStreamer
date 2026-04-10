@@ -307,7 +307,53 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         return result;
     }
 
-    // Post-processing: distance smoothing (skip during KillCam Transition)
+    // FPV camera: position at player's eye, rotate with head bone
+    if (result && playerEntity && dirState != CameraState::KillCam && dirState != CameraState::Drone) {
+        void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
+        if (skeletonPtrPtr && *skeletonPtrPtr) {
+            void* skeleton = *skeletonPtrPtr;
+            float eyePos[3];
+
+            // Get eye position from skeleton
+            if (g_GetEyeWorldPos && g_GetEyeWorldPos(skeleton, eyePos)) {
+                float* camPos = (float*)cameraProp;
+
+                // Position camera at eye
+                camPos[0] = eyePos[0];
+                camPos[1] = eyePos[1];
+                camPos[2] = eyePos[2];
+
+                // Get head bone rotation for camera direction
+                float yaw = 0.0f, pitch = 0.0f;
+                if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
+                    yaw = -yaw + 3.14159265f;
+
+                    if (g_SetCameraRotation) {
+                        g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
+                    }
+
+                    // Position our FPV hands skeleton at camera
+                    uintptr_t fpvSkel = (uintptr_t)FpvViewmodel_GetSkeleton();
+                    if (fpvSkel) {
+                        *(float*)(fpvSkel + 16) = eyePos[0];
+                        *(float*)(fpvSkel + 20) = eyePos[1];
+                        *(float*)(fpvSkel + 24) = eyePos[2] - 0.15f; // slightly below eye
+                        *(float*)(fpvSkel + 28) = yaw;  // same as camera yaw
+                        *(float*)(fpvSkel + 32) = 0.0f;
+                        *(float*)(fpvSkel + 36) = pitch;
+                    }
+                }
+
+                // Render FPV hands
+                FpvViewmodel_RenderFrame(playerEntity);
+            }
+        }
+
+        g_lastDirState = dirState;
+        return result;
+    }
+
+    // 3PV Post-processing: distance smoothing (skip during KillCam Transition)
     if (do3pvPreprocess && result && playerEntity && g_GetChestPosition) {
         float playerPos[3];
         g_GetChestPosition(playerEntity, playerPos);

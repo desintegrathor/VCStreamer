@@ -128,10 +128,11 @@ int __fastcall Hooked_SpectInput(float* thisPtr, void* /*edx*/, float deltaTime)
             }
         }
     }
-    WorldCameraTracker_Update((int*)thisPtr, g_baseGame);
-    if (DroneCamera_IsActive()) {
-        DroneCamera_Update(deltaTime);
-    }
+    // FPV dev: disable world camera tracker and drone entirely
+    // WorldCameraTracker_Update((int*)thisPtr, g_baseGame);
+    // if (DroneCamera_IsActive()) {
+    //     DroneCamera_Update(deltaTime);
+    // }
     return g_OrigSpectInput(thisPtr, deltaTime);
 }
 
