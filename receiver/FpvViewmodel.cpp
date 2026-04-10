@@ -47,6 +47,10 @@ constexpr uintptr_t RVA_ACTIVE_WEAPON_OBJ  = 0x830114;  // g_activeWeaponObj (ID
 constexpr uintptr_t RVA_RENDER_WEAPON      = 0x1AEBA0;  // GAM_FPV_RenderWeapon (IDA 0xF1EBA0)
 constexpr uintptr_t RVA_START_ANIM         = 0x1AC350;  // FPV_StartAnim (IDA 0xF1C350)
 
+// IAT import pointers
+constexpr uintptr_t RVA_REN_RENDER_IAT     = 0x1E7B10;  // REN_Render_Nod_Iske
+constexpr uintptr_t RVA_XBES_ADD_SCENE_IAT = 0x1E7D3C;  // XBES_Add_Scene
+
 // ============================================================================
 // Function types
 // ============================================================================
@@ -56,6 +60,13 @@ typedef void (__cdecl *FpvRenderWeapon_t)(int is_mirror_setup, int is_mirror_ren
 // FPV_StartAnim is __thiscall: double FPV_StartAnim(void* this, unsigned int anim_type, DWORD* out_anim_id)
 // We use a raw call via inline asm or cast to __thiscall
 typedef double (__thiscall *FpvStartAnim_t)(void* thisPtr, unsigned int anim_type, DWORD* out_anim_id);
+
+// REN_Render_Nod_Iske(s_RenderBuffer_nod_iske* buf, unsigned int flags)
+typedef void (__cdecl *RenRenderNodIske_t)(void* renderBuf, unsigned int flags);
+
+// XBES_Add_Scene(s_NOD* node) — adds a BES node to the render scene graph
+typedef unsigned long (__cdecl *XbesAddScene_t)(void* node);
+
 
 // ============================================================================
 // Resolved pointers
@@ -78,8 +89,11 @@ static FpvRenderWeapon_t g_pfnRenderWeapon = nullptr;
 static FpvRenderWeapon_t g_origRenderWeapon = nullptr;
 static FpvStartAnim_t g_pfnStartAnim = nullptr;
 static void* g_pFpvStateObj = nullptr;
-static DWORD* g_pActiveWeaponObj = nullptr;    // ptr to g_activeWeaponObj global
+static DWORD* g_pActiveWeaponObj = nullptr;
+static RenRenderNodIske_t g_pfnRenRender = nullptr;
+static XbesAddScene_t g_pfnAddScene = nullptr;
 static bool g_hookInstalledOnRender = false;
+static bool g_handsAddedToScene = false;
 static void* g_currentSpectEntity = nullptr;
 
 // ============================================================================
@@ -99,6 +113,7 @@ static BYTE g_stub414[3080];
 static void*  g_lastSpectatedEntity = nullptr;
 static DWORD  g_lastWeaponPtr = 0;
 static DWORD  g_mainThreadId = 0;
+static int    g_skipFrames = 0;  // skip N frames after target switch
 
 // ============================================================================
 // Thread suspension for safe g_localPlayer swap
@@ -187,6 +202,10 @@ bool InitFpvViewmodel(uintptr_t gameBase) {
     g_pFpvStateObj    = (void*)(gameBase + RVA_FPV_STATE_OBJ);
     g_pActiveWeaponObj = (DWORD*)(gameBase + RVA_ACTIVE_WEAPON_OBJ);
 
+    // Resolve imports from IAT
+    g_pfnRenRender = *(RenRenderNodIske_t*)(gameBase + RVA_REN_RENDER_IAT);
+    g_pfnAddScene  = *(XbesAddScene_t*)(gameBase + RVA_XBES_ADD_SCENE_IAT);
+
     memset(g_healthStub, 0, sizeof(g_healthStub));
     *(float*)(g_healthStub + 8) = 100.0f;
 
@@ -235,8 +254,8 @@ void ShutdownFpvViewmodel() {
 // ============================================================================
 
 static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_render) {
-    // If no spectated entity, call original (which early-exits on NULL g_localPlayer)
-    if (!g_initialized || !g_currentSpectEntity) {
+    // Only intercept the (0,1) call from GAM_DoTick — skip scene callback (0,0) which uses SPO_Walker
+    if (!g_initialized || !g_currentSpectEntity || !is_mirror_render) {
         g_origRenderWeapon(is_mirror_setup, is_mirror_render);
         return;
     }
@@ -258,10 +277,17 @@ static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_rende
         FpvmLog("[FpvViewmodel] Target switch: entity=0x%08X\n", (uintptr_t)g_currentSpectEntity);
         g_lastSpectatedEntity = g_currentSpectEntity;
         g_lastWeaponPtr = 0;
+        g_skipFrames = 2;  // skip 2 frames to let state settle
         *g_pFpvAnimLayerCount = 0;
         *g_pFpvExtraAnimCount = 0;
         *g_pFpvWeaponAlpha = 1.0f;
         *g_pFpvAnimMode = 0;
+    }
+
+    if (g_skipFrames > 0) {
+        g_skipFrames--;
+        g_origRenderWeapon(is_mirror_setup, is_mirror_render);
+        return;
     }
 
     // --- Populate shadow entity ---
@@ -269,16 +295,29 @@ static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_rende
     g_shadowEntity[1]   = 3;
     g_shadowEntity[5]   = 0;
     g_shadowEntity[24]  = 1;
-    g_shadowEntity[29]  = spectEnt[29];
-    g_shadowEntity[30]  = spectEnt[30];
+    // Yaw/pitch: FPV renderer uses player[30] as yaw, player[29] as pitch
+    // Remote entity yaw is inverted vs local player convention — add PI to flip
+    {
+        float yaw = *(float*)&spectEnt[30];
+        float pitch = *(float*)&spectEnt[29];
+        yaw += 3.14159265f;
+        *(float*)&g_shadowEntity[30] = yaw;
+        *(float*)&g_shadowEntity[29] = pitch;
+    }
     g_shadowEntity[50]  = 0;
-    g_shadowEntity[61]  = spectEnt[61];
-    g_shadowEntity[63]  = spectEnt[63];
+    // Look direction: same PI offset for yaw
+    {
+        float lookYaw = *(float*)&spectEnt[63];
+        float lookPitch = *(float*)&spectEnt[61];
+        lookYaw += 3.14159265f;
+        *(float*)&g_shadowEntity[63] = lookYaw;
+        *(float*)&g_shadowEntity[61] = lookPitch;
+    }
     g_shadowEntity[180] = (DWORD)g_healthStub;
     g_shadowEntity[274] = activeWeapPtr;
     g_shadowEntity[414] = (DWORD)g_stub414;
     g_shadowEntity[707] = 0;
-    g_shadowEntity[792] = spectEnt[792];
+    // shadow[792] (SPO_Walker) left as 0 — not needed for mirror render path
 
     // --- Swap globals (no thread suspend needed — we're on the main game thread) ---
     DWORD* savedLocalPlayer = *g_ppLocalPlayer;
@@ -288,6 +327,17 @@ static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_rende
     *g_ppLocalPlayer = g_shadowEntity;
     *g_pThirdPerson = 1;
     *g_pActiveWeaponObj = activeWeapPtr;  // point to spectated player's weapon
+
+    // --- Re-add hands node to scene if needed ---
+    if (!g_handsAddedToScene && g_pfnAddScene && *g_pFpvHandsNode) {
+        __try {
+            g_pfnAddScene((void*)*g_pFpvHandsNode);
+            g_handsAddedToScene = true;
+            FpvmLog("[FpvViewmodel] Re-added hands node 0x%08X to scene\n", *g_pFpvHandsNode);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            FpvmLog("[FpvViewmodel] CRASH adding hands to scene\n");
+        }
+    }
 
     // --- Init animation on weapon change ---
     if (activeWeapPtr != g_lastWeaponPtr) {
@@ -302,17 +352,18 @@ static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_rende
         }
     }
 
-    // --- Call original render with normal mode (0,0) ---
-    // The game calls us with (0,1) = mirror, but we want normal render (0,0)
+    // --- Call original render (sets up projection, positions skeleton, etc.) ---
     __try {
-        g_origRenderWeapon(0, 0);
+        g_origRenderWeapon(is_mirror_setup, is_mirror_render);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        static int s_crashCount = 0;
-        if (++s_crashCount >= 5) {
-            FpvmLog("[FpvViewmodel] Too many render crashes, disabling\n");
-            g_initialized = false;
+        static int s_crashLog = 0;
+        if (s_crashLog < 3) {
+            FpvmLog("[FpvViewmodel] Render crash (args=%d,%d)\n", is_mirror_setup, is_mirror_render);
+            s_crashLog++;
         }
     }
+
+    // Direct REN_Render removed — game's own RenderWeapon path works
 
     // --- Restore ---
     *g_ppLocalPlayer = savedLocalPlayer;
@@ -320,8 +371,9 @@ static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_rende
     *g_pActiveWeaponObj = savedActiveWeapon;
 
     static int s_okCount = 0;
-    if (s_okCount < 3) {
-        FpvmLog("[FpvViewmodel] Render OK! alpha=%.2f layers=%d\n",
+    if (s_okCount < 10) {
+        FpvmLog("[FpvViewmodel] Render OK! args=(%d,%d) alpha=%.2f layers=%d\n",
+            is_mirror_setup, is_mirror_render,
             *g_pFpvWeaponAlpha, *g_pFpvAnimLayerCount);
         s_okCount++;
     }
