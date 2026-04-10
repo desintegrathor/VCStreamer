@@ -332,15 +332,27 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                         g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
                     }
 
-                    // Position our FPV hands skeleton at camera
+                    // Position FPV hands skeleton using entity data directly
                     uintptr_t fpvSkel = (uintptr_t)FpvViewmodel_GetSkeleton();
                     if (fpvSkel) {
-                        *(float*)(fpvSkel + 16) = eyePos[0];
-                        *(float*)(fpvSkel + 20) = eyePos[1];
-                        *(float*)(fpvSkel + 24) = eyePos[2] - 0.15f; // slightly below eye
-                        *(float*)(fpvSkel + 28) = yaw;  // same as camera yaw
+                        // Position from entity torso (+0xD0, +0xD4, +0xD8)
+                        float* entF = (float*)playerEntity;
+                        float ex = *(float*)((char*)playerEntity + 0xD0);
+                        float ey = *(float*)((char*)playerEntity + 0xD4);
+                        float ez = *(float*)((char*)playerEntity + 0xD8);
+
+                        // Rotation from entity fields
+                        // player[61] = pitch (byte offset 0xF4)
+                        // player[63] = yaw (byte offset 0xFC)
+                        float entPitch = *((float*)playerEntity + 61);
+                        float entYaw   = *((float*)playerEntity + 63);
+
+                        *(float*)(fpvSkel + 16) = ex;
+                        *(float*)(fpvSkel + 20) = ey;
+                        *(float*)(fpvSkel + 24) = ez;
+                        *(float*)(fpvSkel + 28) = entYaw;
                         *(float*)(fpvSkel + 32) = 0.0f;
-                        *(float*)(fpvSkel + 36) = pitch;
+                        *(float*)(fpvSkel + 36) = entPitch;
                     }
                 }
 
