@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "CameraDirector.h"
+#include "DelayManager.h"
 #include "DroneCamera.h"
 #include "PathGrid.h"
 #include "SpectatorController.h"
@@ -9,6 +10,8 @@
 #include <cmath>
 #include <ctime>
 #include <mutex>
+#include <vector>
+#include <cstring>
 
 // ============================================================================
 // Internal State
@@ -21,6 +24,13 @@ static std::mutex g_directorMutex;
 
 // Current target
 static int g_currentTargetHandle = 0;
+static DWORD g_shotHoldUntil = 0;
+static bool g_currentShotUseFpv = false;
+
+static constexpr float NORMAL_SHOT_MIN_HOLD_SEC = 20.0f;
+static constexpr float NORMAL_SHOT_MAX_HOLD_SEC = 25.0f;
+static constexpr float FLAG_ALTERNATE_MIN_SEC = 8.0f;
+static constexpr float FLAG_ALTERNATE_MAX_SEC = 12.0f;
 
 // KillCam state
 static KillCamPhase g_killCamPhase = KillCamPhase::Wait;
@@ -32,6 +42,7 @@ static DWORD g_kcStartTick = 0;
 static int g_flagCarrierUS = 0;
 static int g_flagCarrierVC = 0;
 static DWORD g_flagAlternateTimer = 0;
+static float g_flagAlternateDelay = 10.0f;
 
 // Cooldowns
 static DWORD g_lastKillSwitch = 0;
@@ -52,26 +63,166 @@ static DWORD g_lastScreenTimeLog = 0;
 // Camera type enum for deficit scheduler
 enum CamBudgetType { CAM_PLAYER = 0, CAM_WORLD = 1, CAM_DRONE = 2 };
 
+enum class ShotKind {
+    None,
+    FollowPlayer,
+    KillCam,
+    FlagWatch,
+    Drone
+};
+
+struct ShotRequest {
+    ShotKind kind;
+    int targetHandle;
+    int victimHandle;
+    CamBudgetType preference;
+    float holdSeconds;
+    bool force;
+    const char* reason;
+};
+
+static ShotKind g_committedShotKind = ShotKind::None;
+static CamBudgetType g_committedPreference = CAM_WORLD;
+
 // ============================================================================
 // Entity helpers (same logic as FirstPersonCamera.cpp)
 // ============================================================================
 
-static void* CD_FindEntityByHandle(int handle) {
+static void* CD_FindPlayerEntryByHandle(int handle) {
+    if (!g_gameBase || handle == 0) return nullptr;
+
     void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
     for (int i = 0; i < 64; i++) {
         if (!playerTable[i]) continue;
         if (*(int*)playerTable[i] == handle) {
-            uintptr_t entity = *(uintptr_t*)((uintptr_t)playerTable[i] + 244);
-            return entity ? (void*)entity : nullptr;
+            return playerTable[i];
         }
     }
     return nullptr;
+}
+
+static void* CD_FindEntityByHandle(int handle) {
+    void* entry = CD_FindPlayerEntryByHandle(handle);
+    if (!entry) return nullptr;
+
+    uintptr_t entity = *(uintptr_t*)((uintptr_t)entry + 244);
+    return entity ? (void*)entity : nullptr;
 }
 
 static void CD_GetEntityPos(void* entity, float* out) {
     out[0] = *(float*)((uintptr_t)entity + 0xD0);
     out[1] = *(float*)((uintptr_t)entity + 0xD4);
     out[2] = *(float*)((uintptr_t)entity + 0xD8);
+}
+
+static bool CD_NameContainsSpectator(const char* name) {
+    if (!name) return true;
+    for (int i = 0; i < 64 && name[i] != '\0'; ++i) {
+        if (strncmp(name + i, "Spectator", 9) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool CD_IsUsablePlayerEntry(void* entry) {
+    if (!entry) return false;
+
+    __try {
+        if (*(int*)entry == 0) return false;
+        if (CD_NameContainsSpectator((const char*)entry + 40)) return false;
+
+        uintptr_t entity = *(uintptr_t*)((uintptr_t)entry + 244);
+        if (!entity) return false;
+
+        float pos[3] = {
+            *(float*)(entity + 0xD0),
+            *(float*)(entity + 0xD4),
+            *(float*)(entity + 0xD8)
+        };
+        return !(pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool CD_IsUsablePlayerHandle(int handle) {
+    return CD_IsUsablePlayerEntry(CD_FindPlayerEntryByHandle(handle));
+}
+
+static int PickRandomActivePlayer(int avoidHandle) {
+    if (!g_gameBase) return 0;
+
+    std::vector<int> handles;
+    handles.reserve(64);
+
+    void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
+    for (int i = 0; i < 64; ++i) {
+        void* entry = playerTable[i];
+        if (!CD_IsUsablePlayerEntry(entry)) continue;
+
+        int handle = *(int*)entry;
+        if (handle != avoidHandle) {
+            handles.push_back(handle);
+        }
+    }
+
+    if (handles.empty() && avoidHandle != 0 && CD_IsUsablePlayerHandle(avoidHandle)) {
+        return avoidHandle;
+    }
+    if (handles.empty()) return 0;
+
+    return handles[(size_t)(rand() % (int)handles.size())];
+}
+
+static float RandomRange(float minValue, float maxValue) {
+    float t = (float)(rand() % 10000) / 10000.0f;
+    return minValue + (maxValue - minValue) * t;
+}
+
+static DWORD HoldUntil(DWORD now, float holdSeconds) {
+    if (holdSeconds < 0.1f) holdSeconds = 0.1f;
+    return now + (DWORD)(holdSeconds * 1000.0f);
+}
+
+static float MinHoldForPreference(CamBudgetType preference) {
+    if (preference == CAM_PLAYER) return g_config.camMinHoldPlayer;
+    if (preference == CAM_DRONE) return g_config.camMinHoldDrone;
+    return g_config.camMinHoldWorld;
+}
+
+static float NormalFollowHoldSeconds(CamBudgetType preference) {
+    float holdSeconds = RandomRange(NORMAL_SHOT_MIN_HOLD_SEC, NORMAL_SHOT_MAX_HOLD_SEC);
+    float minHold = MinHoldForPreference(preference);
+    return holdSeconds > minHold ? holdSeconds : minHold;
+}
+
+static bool IsShotHoldActive(DWORD now) {
+    return g_shotHoldUntil != 0 && now < g_shotHoldUntil;
+}
+
+static bool RollFpvForShot() {
+    int chance = DelayManager::GetFpvChance();
+    if (chance <= 0) return false;
+    if (chance >= 100) return true;
+    return (rand() % 100) < chance;
+}
+
+static bool CurrentViewUsable() {
+    if (!CD_IsUsablePlayerHandle(g_currentTargetHandle)) return false;
+
+    int wcType = WorldCameraTracker_GetCurrentCamType();
+    if (wcType == 0 || wcType == 1) {
+        return WorldCameraTracker_HasUsableWorldCamera();
+    }
+
+    return true;
+}
+
+static bool CurrentHasGoodWorldView() {
+    int wcType = WorldCameraTracker_GetCurrentCamType();
+    return (wcType == 0 || wcType == 1) && WorldCameraTracker_HasUsableWorldCamera();
 }
 
 // ============================================================================
@@ -136,67 +287,6 @@ static bool IsKillCamInterruptible() {
 // State Transitions
 // ============================================================================
 
-static void EnterFollowPlayer(int targetHandle) {
-    g_state = CameraState::FollowPlayer;
-    g_currentTargetHandle = targetHandle;
-    g_currentHoldStart = GetTickCount();
-    SetSpectatorToPlayerId(targetHandle);
-    WorldCameraTracker_SetTarget(targetHandle);
-}
-
-static void EnterKillCam(int killerHandle, int victimHandle) {
-    g_state = CameraState::KillCam;
-    g_killCamPhase = KillCamPhase::Wait;
-    g_kcKillerHandle = killerHandle;
-    g_kcVictimHandle = victimHandle;
-    g_kcStartTick = GetTickCount();
-    g_currentTargetHandle = killerHandle;
-
-    SetSpectatorToPlayerId(killerHandle);
-    WorldCameraTracker_SetTarget(killerHandle);
-
-    std::cout << "[CameraDirector] KillCam started (killer=" << killerHandle
-              << " victim=" << victimHandle << ")\n";
-}
-
-static void EnterFlagWatch(int carrierHandle) {
-    g_state = CameraState::FlagWatch;
-    g_currentTargetHandle = carrierHandle;
-    SetSpectatorToPlayerId(carrierHandle);
-    WorldCameraTracker_SetTarget(carrierHandle);
-}
-
-static void ExitKillCam() {
-    g_state = CameraState::FollowPlayer;
-    g_kcKillerHandle = 0;
-    g_kcVictimHandle = 0;
-    WorldCameraTracker_ClearTarget();
-    g_lastEventTick = GetTickCount();
-    std::cout << "[CameraDirector] KillCam ended\n";
-}
-
-static void EnterDrone() {
-    // Get current camera position from followed player as starting point
-    float startPos[3] = { 0.0f, 0.0f, 0.0f };
-    void* entity = CD_FindEntityByHandle(g_currentTargetHandle);
-    if (entity) {
-        CD_GetEntityPos(entity, startPos);
-        startPos[2] += 2.0f; // start slightly above player
-    }
-    DroneCamera_Activate(startPos);
-    g_state = CameraState::Drone;
-    g_currentHoldStart = GetTickCount();
-    std::cout << "[CameraDirector] Drone mode activated (deficit scheduler)\n";
-}
-
-static void ExitDrone() {
-    DroneCamera_Deactivate();
-    g_state = CameraState::FollowPlayer;
-    g_lastEventTick = GetTickCount();
-    g_currentHoldStart = GetTickCount();
-    std::cout << "[CameraDirector] Drone mode deactivated (deficit scheduler)\n";
-}
-
 // Check if drone is suitable at target player's position
 static bool IsDroneSuitable() {
     if (!PathGrid_IsReady()) return true; // no grid data — allow drone
@@ -208,10 +298,364 @@ static bool IsDroneSuitable() {
     return clearance >= g_config.droneMinAreaClearance;
 }
 
+static bool IsDroneSuitableForTarget(int targetHandle) {
+    if (!PathGrid_IsReady()) return true;
+    void* entity = CD_FindEntityByHandle(targetHandle);
+    if (!entity) return false;
+    float pos[3];
+    CD_GetEntityPos(entity, pos);
+    float clearance = PathGrid_GetAreaClearance(pos[0], pos[1], pos[2], 5.0f);
+    return clearance >= g_config.droneMinAreaClearance;
+}
+
+static const char* BudgetName(CamBudgetType preference) {
+    if (preference == CAM_PLAYER) return "player";
+    if (preference == CAM_DRONE) return "drone";
+    return "world";
+}
+
+static const char* ShotKindName(ShotKind kind) {
+    switch (kind) {
+        case ShotKind::FollowPlayer: return "follow";
+        case ShotKind::KillCam: return "killcam";
+        case ShotKind::FlagWatch: return "flag";
+        case ShotKind::Drone: return "drone";
+        default: return "none";
+    }
+}
+
+static bool CurrentCommittedShotUsable() {
+    switch (g_state) {
+        case CameraState::FollowPlayer:
+            return CD_IsUsablePlayerHandle(g_currentTargetHandle);
+        case CameraState::FlagWatch:
+            return g_currentTargetHandle != 0 && CD_IsUsablePlayerHandle(g_currentTargetHandle);
+        case CameraState::Drone:
+            return DroneCamera_IsActive() && CD_IsUsablePlayerHandle(g_currentTargetHandle);
+        case CameraState::KillCam:
+            return g_kcKillerHandle != 0;
+        default:
+            return false;
+    }
+}
+
+static bool IsCommittedShotLocked(DWORD now) {
+    if (g_state == CameraState::FlagWatch) return CurrentCommittedShotUsable();
+    return IsShotHoldActive(now) && CurrentCommittedShotUsable();
+}
+
+static void ClearCommittedShot(DWORD now, const char* reason) {
+    if (DroneCamera_IsActive()) {
+        DroneCamera_Deactivate();
+    }
+
+    g_state = CameraState::Idle;
+    g_committedShotKind = ShotKind::None;
+    g_committedPreference = CAM_WORLD;
+    g_currentTargetHandle = 0;
+    g_currentHoldStart = now;
+    g_shotHoldUntil = 0;
+    g_currentShotUseFpv = false;
+    g_kcKillerHandle = 0;
+    g_kcVictimHandle = 0;
+    WorldCameraTracker_ClearTarget();
+
+    std::cout << "[CameraDirector] Shot cleared: " << (reason ? reason : "none") << "\n";
+}
+
+static bool CommitShot(const ShotRequest& request, DWORD now) {
+    if (request.kind != ShotKind::Drone && DroneCamera_IsActive()) {
+        DroneCamera_Deactivate();
+    }
+
+    switch (request.kind) {
+        case ShotKind::FollowPlayer: {
+            if (!CD_IsUsablePlayerHandle(request.targetHandle)) return false;
+
+            g_state = CameraState::FollowPlayer;
+            g_committedShotKind = ShotKind::FollowPlayer;
+            g_committedPreference = request.preference;
+            g_currentTargetHandle = request.targetHandle;
+            g_currentHoldStart = now;
+            g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
+            g_currentShotUseFpv = RollFpvForShot();
+            g_kcKillerHandle = 0;
+            g_kcVictimHandle = 0;
+
+            SetSpectatorToPlayerId(request.targetHandle);
+            WorldCameraTracker_SetTarget(request.targetHandle);
+            WorldCameraTracker_SetPreference(request.preference == CAM_PLAYER ? 2 : 0);
+
+            std::cout << "[CameraDirector] Commit follow target=" << request.targetHandle
+                      << " pref=" << BudgetName(request.preference)
+                      << " hold=" << (int)((g_shotHoldUntil - now) / 1000)
+                      << "s fpv=" << (g_currentShotUseFpv ? "yes" : "no")
+                      << " reason=" << (request.reason ? request.reason : "none") << "\n";
+            return true;
+        }
+
+        case ShotKind::KillCam: {
+            if (!CD_IsUsablePlayerHandle(request.targetHandle)) return false;
+
+            g_state = CameraState::KillCam;
+            g_committedShotKind = ShotKind::KillCam;
+            g_committedPreference = CAM_WORLD;
+            g_killCamPhase = KillCamPhase::Wait;
+            g_kcKillerHandle = request.targetHandle;
+            g_kcVictimHandle = request.victimHandle;
+            g_kcStartTick = now;
+            g_currentTargetHandle = request.targetHandle;
+            g_currentHoldStart = now;
+            g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
+            g_currentShotUseFpv = false;
+
+            SetSpectatorToPlayerId(request.targetHandle);
+            WorldCameraTracker_SetTarget(request.targetHandle);
+            WorldCameraTracker_SetPreference(0);
+
+            std::cout << "[CameraDirector] Commit killcam killer=" << request.targetHandle
+                      << " victim=" << request.victimHandle
+                      << " reason=" << (request.reason ? request.reason : "none") << "\n";
+            return true;
+        }
+
+        case ShotKind::FlagWatch: {
+            if (request.targetHandle == 0) return false;
+
+            g_state = CameraState::FlagWatch;
+            g_committedShotKind = ShotKind::FlagWatch;
+            g_committedPreference = CAM_WORLD;
+            g_currentTargetHandle = request.targetHandle;
+            g_currentHoldStart = now;
+            g_shotHoldUntil = 0;
+            g_currentShotUseFpv = RollFpvForShot();
+            g_kcKillerHandle = 0;
+            g_kcVictimHandle = 0;
+
+            SetSpectatorToPlayerId(request.targetHandle);
+            WorldCameraTracker_SetTarget(request.targetHandle);
+            WorldCameraTracker_SetPreference(0);
+
+            std::cout << "[CameraDirector] Commit flag target=" << request.targetHandle
+                      << " fpv=" << (g_currentShotUseFpv ? "yes" : "no")
+                      << " reason=" << (request.reason ? request.reason : "none") << "\n";
+            return true;
+        }
+
+        case ShotKind::Drone: {
+            if (!CD_IsUsablePlayerHandle(request.targetHandle)) return false;
+            if (!IsDroneSuitableForTarget(request.targetHandle)) return false;
+
+            if (DroneCamera_IsActive()) {
+                DroneCamera_Deactivate();
+            }
+
+            float startPos[3] = { 0.0f, 0.0f, 0.0f };
+            void* entity = CD_FindEntityByHandle(request.targetHandle);
+            if (entity) {
+                CD_GetEntityPos(entity, startPos);
+                startPos[2] += 2.0f;
+            }
+
+            DroneCamera_Activate(startPos);
+            DroneCamera_SetTarget(request.targetHandle);
+
+            g_state = CameraState::Drone;
+            g_committedShotKind = ShotKind::Drone;
+            g_committedPreference = CAM_DRONE;
+            g_currentTargetHandle = request.targetHandle;
+            g_currentHoldStart = now;
+            g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
+            g_currentShotUseFpv = false;
+            g_kcKillerHandle = 0;
+            g_kcVictimHandle = 0;
+
+            WorldCameraTracker_SetTarget(request.targetHandle);
+            WorldCameraTracker_SetPreference(-1);
+
+            std::cout << "[CameraDirector] Commit drone target=" << request.targetHandle
+                      << " hold=" << (int)((g_shotHoldUntil - now) / 1000)
+                      << "s reason=" << (request.reason ? request.reason : "none") << "\n";
+            return true;
+        }
+
+        default:
+            return false;
+    }
+}
+
+static bool RequestShot(const ShotRequest& request, DWORD now) {
+    if (!request.force) {
+        if (g_state == CameraState::FlagWatch) {
+            std::cout << "[CameraDirector] Shot request ignored during flag watch: "
+                      << ShotKindName(request.kind) << "\n";
+            return false;
+        }
+
+        if (IsCommittedShotLocked(now)) {
+            std::cout << "[CameraDirector] Shot request ignored: locked "
+                      << ShotKindName(g_committedShotKind)
+                      << " remaining=" << (int)((g_shotHoldUntil - now) / 1000)
+                      << "s request=" << ShotKindName(request.kind) << "\n";
+            return false;
+        }
+
+        if (g_state == CameraState::KillCam && !IsKillCamInterruptible()) {
+            return false;
+        }
+    }
+
+    return CommitShot(request, now);
+}
+
+static bool RequestFollowPlayerShot(int targetHandle,
+                                    CamBudgetType preference,
+                                    bool force,
+                                    const char* reason,
+                                    DWORD now) {
+    ShotRequest request = {
+        ShotKind::FollowPlayer,
+        targetHandle,
+        0,
+        preference,
+        NormalFollowHoldSeconds(preference),
+        force,
+        reason
+    };
+    return RequestShot(request, now);
+}
+
+static bool RequestKillCamShot(int killerHandle,
+                               int victimHandle,
+                               bool force,
+                               const char* reason,
+                               DWORD now) {
+    ShotRequest request = {
+        ShotKind::KillCam,
+        killerHandle,
+        victimHandle,
+        CAM_WORLD,
+        GetKillCamTotalDuration(),
+        force,
+        reason
+    };
+    return RequestShot(request, now);
+}
+
+static bool RequestFlagWatchShot(int carrierHandle,
+                                 const char* reason,
+                                 DWORD now) {
+    ShotRequest request = {
+        ShotKind::FlagWatch,
+        carrierHandle,
+        0,
+        CAM_WORLD,
+        0.0f,
+        true,
+        reason
+    };
+    return RequestShot(request, now);
+}
+
+static bool RequestDroneShot(int targetHandle,
+                             bool force,
+                             const char* reason,
+                             DWORD now) {
+    ShotRequest request = {
+        ShotKind::Drone,
+        targetHandle,
+        0,
+        CAM_DRONE,
+        g_config.camMinHoldDrone,
+        force,
+        reason
+    };
+    return RequestShot(request, now);
+}
+
+static void CompleteKillCam(DWORD now) {
+    int nextTarget = g_kcKillerHandle;
+    g_kcKillerHandle = 0;
+    g_kcVictimHandle = 0;
+    g_lastEventTick = now;
+    g_shotHoldUntil = 0;
+
+    std::cout << "[CameraDirector] KillCam ended\n";
+
+    if (CD_IsUsablePlayerHandle(nextTarget)) {
+        RequestFollowPlayerShot(nextTarget, CAM_WORLD, true, "killcam complete", now);
+    } else {
+        ClearCommittedShot(now, "killcam target lost");
+    }
+}
+
+static float ValidShare(float value) {
+    return std::isfinite(value) && value > 0.0f ? value : 0.0f;
+}
+
 // Compute deficit for each camera type and return the one with highest deficit
 static CamBudgetType GetHighestDeficitType() {
-    // FPV development: always use player camera
-    return CAM_PLAYER;
+    float playerShare = ValidShare(g_config.camSharePlayer);
+    float worldShare = ValidShare(g_config.camShareWorld);
+    float droneShare = ValidShare(g_config.camShareDrone);
+
+    if (droneShare > 0.0f && !IsDroneSuitable()) {
+        droneShare = 0.0f;
+    }
+
+    float shareTotal = playerShare + worldShare + droneShare;
+    if (shareTotal <= 0.001f) {
+        return CAM_WORLD;
+    }
+
+    playerShare /= shareTotal;
+    worldShare /= shareTotal;
+    droneShare /= shareTotal;
+
+    float totalTime = g_playerCamTime + g_worldCamTime + g_droneCamTime;
+    if (totalTime <= 1.0f) {
+        float roll = (float)(rand() % 10000) / 10000.0f;
+        if (roll < playerShare) return CAM_PLAYER;
+        if (roll < playerShare + worldShare) return CAM_WORLD;
+        return CAM_DRONE;
+    }
+
+    float playerDeficit = playerShare * totalTime - g_playerCamTime;
+    float worldDeficit = worldShare * totalTime - g_worldCamTime;
+    float droneDeficit = droneShare > 0.0f
+        ? droneShare * totalTime - g_droneCamTime
+        : -1.0e30f;
+
+    if (playerDeficit >= worldDeficit && playerDeficit >= droneDeficit) {
+        return CAM_PLAYER;
+    }
+    if (worldDeficit >= droneDeficit) {
+        return CAM_WORLD;
+    }
+    return CAM_DRONE;
+}
+
+static bool StartNextScheduledShot(DWORD now, const char* reason) {
+    CamBudgetType needed = GetHighestDeficitType();
+    int currentTarget = CD_IsUsablePlayerHandle(g_currentTargetHandle) ? g_currentTargetHandle : 0;
+
+    if (needed == CAM_DRONE) {
+        int droneTarget = currentTarget != 0 ? currentTarget : PickRandomActivePlayer(0);
+        if (droneTarget != 0 && IsDroneSuitableForTarget(droneTarget)) {
+            return RequestDroneShot(droneTarget, false, reason, now);
+        }
+        needed = CAM_WORLD;
+    }
+
+    int picked = PickRandomActivePlayer(g_currentTargetHandle);
+    if (picked == 0) picked = currentTarget;
+    if (picked == 0) {
+        ClearCommittedShot(now, "no active players");
+        return false;
+    }
+
+    CamBudgetType preference = (needed == CAM_PLAYER) ? CAM_PLAYER : CAM_WORLD;
+    return RequestFollowPlayerShot(picked, preference, false, reason, now);
 }
 
 static void UpdateKillCamPhase() {
@@ -227,7 +671,7 @@ static void UpdateKillCamPhase() {
     } else if (elapsed < totalEnd) {
         g_killCamPhase = KillCamPhase::Attached;
     } else {
-        ExitKillCam();
+        CompleteKillCam(GetTickCount());
     }
 }
 
@@ -241,21 +685,18 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle) {
     DWORD now = GetTickCount();
     g_lastEventTick = now;
 
-    // In drone mode: feed kill target to drone for dual-player framing
-    if (g_state == CameraState::Drone) {
-        DroneCamera_SetKillTarget(killerHandle, victimHandle);
-        std::cout << "[CameraDirector] Drone: kill event -> framing killer=" << killerHandle
-                  << " victim=" << victimHandle << "\n";
+    if (g_state == CameraState::FlagWatch) {
+        std::cout << "[CameraDirector] Kill ignored: flag shot committed\n";
+        return;
+    }
+
+    if (IsCommittedShotLocked(now)) {
+        std::cout << "[CameraDirector] Kill ignored: committed shot hold active\n";
         return;
     }
 
     // Respect cooldown
     if (now - g_lastKillSwitch < (DWORD)(g_config.killCooldown * 1000)) {
-        return;
-    }
-
-    // Don't interrupt flag watching
-    if (g_state == CameraState::FlagWatch) {
         return;
     }
 
@@ -277,12 +718,14 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle) {
               << " cinematicChance=" << (int)(chance * 100) << "%"
               << " result=" << (cinematic ? "CINEMATIC" : "NORMAL") << "\n";
 
-    g_lastKillSwitch = now;
-
     if (cinematic) {
-        EnterKillCam(killerHandle, victimHandle);
-    } else {
-        EnterFollowPlayer(killerHandle);
+        if (RequestKillCamShot(killerHandle, victimHandle, false, "cinematic kill", now)) {
+            g_lastKillSwitch = now;
+        }
+    } else if (CD_IsUsablePlayerHandle(killerHandle)) {
+        if (RequestFollowPlayerShot(killerHandle, CAM_WORLD, false, "normal kill", now)) {
+            g_lastKillSwitch = now;
+        }
     }
 }
 
@@ -297,17 +740,15 @@ void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier) {
 
     if (anyFlag) {
         g_flagLostGraceActive = false;
-
-        // In drone mode: feed flag carrier to drone
-        if (g_state == CameraState::Drone) {
+        /*
             int target = 0;
             if (usCarrier != 0 && vcCarrier == 0) target = usCarrier;
             else if (vcCarrier != 0 && usCarrier == 0) target = vcCarrier;
             else target = usCarrier; // both — pick one
-            DroneCamera_SetTarget(target);
+            // Legacy drone flag handoff removed.
             std::cout << "[CameraDirector] Drone: flag event -> tracking carrier=" << target << "\n";
             return;
-        }
+        */
 
         // Pick which carrier to watch
         int target = 0;
@@ -317,14 +758,10 @@ void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier) {
             // Both flags taken — watch the one we're not currently on
             target = (g_currentTargetHandle == usCarrier) ? vcCarrier : usCarrier;
             g_flagAlternateTimer = GetTickCount();
+            g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
         }
 
-        // Only interrupt KillCam if it's interruptible
-        if (g_state == CameraState::KillCam && !IsKillCamInterruptible()) {
-            return;
-        }
-
-        EnterFlagWatch(target);
+        RequestFlagWatchShot(target, "flag carrier", GetTickCount());
     } else {
         // No flags — start grace period
         if (g_state == CameraState::FlagWatch && !g_flagLostGraceActive) {
@@ -340,12 +777,6 @@ void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier) {
 // ============================================================================
 
 void CameraDirector_Update() {
-    // FPV dev: force player follow, no mode switching
-    if (g_state != CameraState::FollowPlayer && g_state != CameraState::Idle) {
-        if (g_state == CameraState::Drone) ExitDrone();
-        g_state = CameraState::FollowPlayer;
-    }
-    return;  // skip all update logic
     std::lock_guard<std::mutex> lock(g_directorMutex);
 
     DWORD now = GetTickCount();
@@ -393,77 +824,64 @@ void CameraDirector_Update() {
                 float elapsed = (now - g_flagLostTimestamp) / 1000.0f;
                 if (elapsed > g_config.flagLostGracePeriod) {
                     g_flagLostGraceActive = false;
-                    g_state = CameraState::FollowPlayer;
-                    g_currentHoldStart = now;
-                    WorldCameraTracker_ClearTarget();
+                    ClearCommittedShot(now, "flag grace expired");
+                    StartNextScheduledShot(now, "flag grace expired");
                     std::cout << "[CameraDirector] Flag grace expired, returning to kills\n";
                     break;
                 }
             }
 
-            // Handle dual-flag alternation (5s toggle)
+            // Handle dual-flag alternation.
             if (g_flagCarrierUS != 0 && g_flagCarrierVC != 0) {
                 float elapsed = (now - g_flagAlternateTimer) / 1000.0f;
-                if (elapsed > 5.0f) {
+                if (elapsed > g_flagAlternateDelay) {
                     int nextTarget = (g_currentTargetHandle == g_flagCarrierUS)
                                    ? g_flagCarrierVC : g_flagCarrierUS;
-                    g_currentTargetHandle = nextTarget;
-                    SetSpectatorToPlayerId(nextTarget);
-                    WorldCameraTracker_SetTarget(nextTarget);
+                    RequestFlagWatchShot(nextTarget, "dual flag alternate", now);
                     g_flagAlternateTimer = now;
+                    g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
                 }
             }
             break;
         }
 
         case CameraState::Drone: {
-            float holdSec = (now - g_currentHoldStart) / 1000.0f;
-
-            // While in drone, periodically re-check area clearance
-            if (holdSec >= g_config.camMinHoldDrone && !IsDroneSuitable()) {
-                std::cout << "[CameraDirector] Drone exiting early: player moved indoors\n";
-                ExitDrone();
+            if (!CD_IsUsablePlayerHandle(g_currentTargetHandle)) {
+                ClearCommittedShot(now, "drone target lost");
+                StartNextScheduledShot(now, "drone target lost");
                 break;
             }
 
-            // Deficit check: if drone has met its share and hold expired, switch
-            if (holdSec >= g_config.camMinHoldDrone) {
-                CamBudgetType needed = GetHighestDeficitType();
-                if (needed != CAM_DRONE) {
-                    ExitDrone();
-                    if (needed == CAM_WORLD) {
-                        WorldCameraTracker_SetPreference(0);
-                    } else {
-                        WorldCameraTracker_SetPreference(2);
-                    }
-                }
+            if (!IsShotHoldActive(now)) {
+                StartNextScheduledShot(now, "drone hold expired");
             }
             break;
         }
 
         case CameraState::FollowPlayer:
         case CameraState::Idle: {
-            float holdSec = (now - g_currentHoldStart) / 1000.0f;
-            int wcType = WorldCameraTracker_GetCurrentCamType();
-            bool onWorldCam = (wcType == 0 || wcType == 1);
-            bool onPlayerCam = (wcType == 2 || wcType == -1);
+            bool noFlagPriority = (g_flagCarrierUS == 0 && g_flagCarrierVC == 0);
+            bool currentTargetUsable = CD_IsUsablePlayerHandle(g_currentTargetHandle);
 
-            float minHold = onWorldCam ? g_config.camMinHoldWorld : g_config.camMinHoldPlayer;
-
-            if (holdSec >= minHold) {
-                CamBudgetType needed = GetHighestDeficitType();
-
-                if (needed == CAM_DRONE && IsDroneSuitable()) {
-                    EnterDrone();
-                } else if (needed == CAM_WORLD && onPlayerCam) {
-                    WorldCameraTracker_SetPreference(0);
-                    g_currentHoldStart = now;
-                } else if (needed == CAM_PLAYER && onWorldCam) {
-                    WorldCameraTracker_SetPreference(2);
-                    g_currentHoldStart = now;
+            if (noFlagPriority && !currentTargetUsable) {
+                int picked = PickRandomActivePlayer(0);
+                if (picked != 0) {
+                    RequestFollowPlayerShot(picked, CAM_WORLD, true, "target lost", now);
+                } else {
+                    ClearCommittedShot(now, "target lost and no active players");
                 }
-                // If already on the needed type, keep going — hold resets on actual switch
+                break;
             }
+
+            if (noFlagPriority && !IsShotHoldActive(now)) {
+                if (StartNextScheduledShot(now, "shot hold expired")) {
+                    break;
+                }
+            }
+
+            /*
+                // If already on the needed type, keep going — hold resets on actual switch
+            */
             break;
         }
     }
@@ -480,6 +898,7 @@ int CameraDirector_GetKillCamKillerHandle() { return g_kcKillerHandle; }
 int CameraDirector_GetKillCamVictimHandle() { return g_kcVictimHandle; }
 float CameraDirector_GetKillCamElapsed() { return GetKillCamElapsedInternal(); }
 const CameraConfig& CameraDirector_GetConfig() { return g_config; }
+bool CameraDirector_ShouldUseFpv() { return g_currentShotUseFpv; }
 
 // ============================================================================
 // Lifecycle
@@ -491,9 +910,19 @@ void InitCameraDirector(uintptr_t gameBase) {
 
     DroneCamera_Init(gameBase);
     LoadCameraDirectorConfig(g_config);
+    WorldCameraTracker_SetTuning(g_config.worldCamMaxDistance,
+                                 g_config.worldCamSwitchCooldown,
+                                 g_config.worldCamMaxHold,
+                                 g_config.worldCamLOSPenalty,
+                                 g_config.worldCamStickiness);
     g_lastEventTick = GetTickCount();
     g_lastUpdateTick = GetTickCount();
     g_currentHoldStart = GetTickCount();
+    g_shotHoldUntil = 0;
+    g_committedShotKind = ShotKind::None;
+    g_committedPreference = CAM_WORLD;
+    g_currentShotUseFpv = false;
+    g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
     g_lastScreenTimeLog = GetTickCount();
     g_playerCamTime = 0.0f;
     g_worldCamTime = 0.0f;

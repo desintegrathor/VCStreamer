@@ -200,3 +200,15 @@ bool OctCollision_IsLoaded()
 {
     return g_loaded;
 }
+
+bool OctCollision_GetBounds(float* outMin, float* outMax)
+{
+    if (!g_loaded) return false;
+    outMin[0] = g_octTree.boundsMin.x;
+    outMin[1] = g_octTree.boundsMin.y;
+    outMin[2] = g_octTree.boundsMin.z;
+    outMax[0] = g_octTree.boundsMax.x;
+    outMax[1] = g_octTree.boundsMax.y;
+    outMax[2] = g_octTree.boundsMax.z;
+    return true;
+}

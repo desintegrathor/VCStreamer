@@ -1,4 +1,4 @@
-LIBRARY dsound
+LIBRARY vcstreamer
 EXPORTS
     DirectSoundCreate=proxy_DirectSoundCreate @1
     DirectSoundEnumerateA=proxy_DirectSoundEnumerateA @2

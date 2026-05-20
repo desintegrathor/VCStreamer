@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <vector>
 
 // ============================================================================
 // Constants
@@ -33,8 +34,24 @@ constexpr int SPECTATOR_CTRL_CLIENT = 0x52C;
 constexpr int CLIENT_PLAYER_ENTITY = 0xF4;
 constexpr int PLAYER_SKELETON_PTR = 0x378;
 
-// Bone IDs
-constexpr unsigned int BONE_HEAD = 0x17;
+// Bone IDs (runtime ISKE bone-array indices). BONE_HEAD=23 is canonical;
+// ISKE hierarchy (Hips > Chest > Neck > Head) has bones ordered parent-first,
+// so Neck=22 and Chest=21 (torso).
+constexpr unsigned int BONE_HEAD  = 0x17;
+constexpr unsigned int BONE_NECK  = 0x16;
+constexpr unsigned int BONE_CHEST = 0x15;
+
+// NOD struct offsets — verified from NOD_FindByNameAndType @ 0xf429b0:
+//   +8  name[], +0x58 flags (bit 0 = hidden, bit 3 = has_children),
+//   +0x68 child_count (DWORD), +0x6C children[] (void** array).
+// Note: Blender_vietcong docs claim count is float @ +0x6C; that's outdated.
+constexpr int NOD_NAME_OFF        = 0x08;
+constexpr int NOD_FLAGS_OFF       = 0x58;
+constexpr int NOD_CHILD_COUNT_OFF = 0x68;
+constexpr int NOD_CHILDREN_OFF    = 0x6C;
+// Player inner-struct offset to character NOD root (from GAM_PL_RenderSkeleton
+// @ 0xefa305: v5 = *(NOD**)(this + 876)).
+constexpr int PLAYER_CHAR_NOD     = 0x36C;
 
 // ============================================================================
 // Function types
@@ -184,12 +201,115 @@ static bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, 
 // Hook function
 // ============================================================================
 
+// ============================================================================
+// Hide spectated player's head NODs while in FPV (so face/skull doesn't clip
+// into the eye camera). BES character submeshes follow naming
+// {LOD}{DAMAGE}_{BODYPART}, so head meshes are 0A_head..2C_head.
+// ============================================================================
+
+struct HiddenNod { void* nod; uint32_t origFlags; };
+static std::vector<HiddenNod> g_hiddenHeadNods;
+static void* g_lastHeadHideEntity = nullptr;
+
+// SEH-wrapped raw memory ops — kept in their own functions because /EHsc + std::vector
+// in caller would trigger C2712 if __try were inline.
+static bool SafeReadPtr(void* addr, void** out) {
+    __try { *out = *(void**)addr; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeReadDword(void* addr, uint32_t* out) {
+    __try { *out = *(uint32_t*)addr; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeWriteDword(void* addr, uint32_t val) {
+    __try { *(uint32_t*)addr = val; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// First-run diagnostic dump of traversed NOD names, so we can spot the real naming.
+static bool g_headDumpOnce = false;
+static int  g_headDumpLines = 0;
+
+static void NodFindByName(void* nod, const char* name, std::vector<void*>& out, int depth) {
+    if (!nod || depth > 32) return;
+    char nameBuf[64];
+    uint32_t nkidsRaw = 0;
+    void* kidsPtr = nullptr;
+    // Read name in 4-byte chunks
+    for (int off = 0; off < 64; off += 4) {
+        if (!SafeReadDword((char*)nod + NOD_NAME_OFF + off, (uint32_t*)(nameBuf + off))) {
+            nameBuf[off] = 0; break;
+        }
+    }
+    nameBuf[63] = 0;
+
+    if (g_headDumpOnce && g_headDumpLines < 200 && nameBuf[0]) {
+        FpvLog("[NodDump] d=%d nod=0x%08X name='%s'\n",
+            depth, (unsigned)(uintptr_t)nod, nameBuf);
+        g_headDumpLines++;
+    }
+
+    if (strncmp(nameBuf, name, 63) == 0) out.push_back(nod);
+
+    if (!SafeReadDword((char*)nod + NOD_CHILD_COUNT_OFF, &nkidsRaw)) return;
+    if (!SafeReadPtr((char*)nod + NOD_CHILDREN_OFF, &kidsPtr)) return;
+    int nkids = (int)nkidsRaw;
+    if (!kidsPtr || nkids <= 0 || nkids > 4096) return;
+    for (int i = 0; i < nkids; ++i) {
+        void* child = nullptr;
+        if (SafeReadPtr((char*)kidsPtr + 4 * i, &child)) {
+            NodFindByName(child, name, out, depth + 1);
+        }
+    }
+}
+
+static void RestoreHiddenHead() {
+    for (auto& h : g_hiddenHeadNods) {
+        if (h.nod) SafeWriteDword((char*)h.nod + NOD_FLAGS_OFF, h.origFlags);
+    }
+    g_hiddenHeadNods.clear();
+    g_lastHeadHideEntity = nullptr;
+}
+
+static void HideHeadFor(void* playerEntity) {
+    if (!playerEntity) { RestoreHiddenHead(); return; }
+    if (playerEntity == g_lastHeadHideEntity) return;
+
+    RestoreHiddenHead();
+    void* charNod = nullptr;
+    if (!SafeReadPtr((char*)playerEntity + PLAYER_CHAR_NOD, &charNod) || !charNod) return;
+
+    static const char* kHeadNames[] = {
+        "0A_head", "0B_head", "0C_head",
+        "1A_head", "1B_head", "1C_head",
+        "2A_head", "2B_head", "2C_head",
+    };
+    std::vector<void*> hits;
+    // First call also dumps every name in the tree to the log so we can see the real layout.
+    g_headDumpOnce = (g_headDumpLines < 200);
+    g_headDumpLines = 0;
+    for (const char* nm : kHeadNames) NodFindByName(charNod, nm, hits, 0);
+    g_headDumpOnce = false;
+
+    for (void* nod : hits) {
+        uint32_t orig = 0;
+        if (SafeReadDword((char*)nod + NOD_FLAGS_OFF, &orig)) {
+            g_hiddenHeadNods.push_back({nod, orig});
+            SafeWriteDword((char*)nod + NOD_FLAGS_OFF, orig | 1u);
+        }
+    }
+    g_lastHeadHideEntity = playerEntity;
+    FpvLog("[HeadHide] entity=0x%08X charNod=0x%08X hidden=%d\n",
+        (unsigned)(uintptr_t)playerEntity, (unsigned)(uintptr_t)charNod, (int)g_hiddenHeadNods.size());
+}
+
 int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraProp) {
     DelayManager::ReloadConfigIfNeeded();
 
     int mode = *(int*)((char*)thisPtr + SPECTATOR_CTRL_MODE);
 
     if (mode != SPECTATOR_MODE_FREE) {
+        RestoreHiddenHead();
         return g_OriginalFillCamera(thisPtr, cameraProp);
     }
 
@@ -296,6 +416,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
     // Drone camera: override position/rotation entirely, skip all post-processing
     if (dirState == CameraState::Drone && result) {
+        RestoreHiddenHead();
         float pos[3], pitch, yaw;
         DroneCamera_GetCameraState(pos, &pitch, &yaw);
         float* camPos = (float*)cameraProp;
@@ -307,30 +428,59 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         return result;
     }
 
+    int directorCamType = WorldCameraTracker_GetCurrentCamType();
+    bool useFpvCamera = result && playerEntity
+        && dirState != CameraState::KillCam
+        && dirState != CameraState::Drone
+        && directorCamType == 2
+        && CameraDirector_ShouldUseFpv();
+
+    if (!useFpvCamera) {
+        RestoreHiddenHead();
+    }
+
     // FPV camera: position at player's eye, rotate with head bone
-    if (result && playerEntity && dirState != CameraState::KillCam && dirState != CameraState::Drone) {
+    if (useFpvCamera) {
+        HideHeadFor(playerEntity);
         void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
         if (skeletonPtrPtr && *skeletonPtrPtr) {
             void* skeleton = *skeletonPtrPtr;
             float eyePos[3];
 
-            // Get eye position from skeleton
-            if (g_GetEyeWorldPos && g_GetEyeWorldPos(skeleton, eyePos)) {
+            // Anchor camera at the Neck bone rather than the eye so the head
+            // mesh doesn't clip into view. Falls back to eye position if the
+            // neck bone lookup fails.
+            bool havePos = false;
+            if (g_GetBoneEndLoc && g_GetBoneEndLoc(skeleton, BONE_NECK, eyePos)) {
+                havePos = true;
+            } else if (g_GetEyeWorldPos && g_GetEyeWorldPos(skeleton, eyePos)) {
+                havePos = true;
+            }
+            if (havePos) {
                 float* camPos = (float*)cameraProp;
 
-                // Position camera at eye
-                camPos[0] = eyePos[0];
-                camPos[1] = eyePos[1];
-                camPos[2] = eyePos[2];
+                // Yaw: player entity applied yaw at +0xFC (dword 63) — same field
+                // GAM_PL_GetRotation returns; the authoritative game yaw.
+                // Pitch: entity applied field (+0xF8) with a 10° down tilt.
+                constexpr float FPV_PITCH_OFFSET = -10.0f * 3.14159265f / 180.0f;
+                float entYaw = *(float*)((char*)playerEntity + 0xFC);
+                float yaw    = -entYaw;
+                float pitch  = *(float*)((char*)playerEntity + 0xF8) + FPV_PITCH_OFFSET;
 
-                // Get head bone rotation for camera direction
-                float yaw = 0.0f, pitch = 0.0f;
-                if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
-                    yaw = -yaw + 3.14159265f;
+                // Offset camera 10cm back (opposite to player facing) and 10cm down.
+                // Back = -forward. In VC's coord convention forward ~ (-sin(yaw), cos(yaw), 0).
+                const float BACK_OFFSET = 0.10f;
+                const float DOWN_OFFSET = 0.10f;
+                float fx = -sinf(entYaw);
+                float fy =  cosf(entYaw);
+                camPos[0] = eyePos[0] - fx * BACK_OFFSET;
+                camPos[1] = eyePos[1] - fy * BACK_OFFSET;
+                camPos[2] = eyePos[2] - DOWN_OFFSET;
 
-                    if (g_SetCameraRotation) {
-                        g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
-                    }
+                if (g_SetCameraRotation) {
+                    g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
+                }
+                {
 
                     // Position FPV hands skeleton using entity data directly
                     uintptr_t fpvSkel = (uintptr_t)FpvViewmodel_GetSkeleton();
@@ -356,7 +506,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                     }
                 }
 
-                // Render FPV hands
+                // Signal FPV viewmodel to render this frame (actual render happens in GAM_DoTick hook)
                 FpvViewmodel_RenderFrame(playerEntity);
             }
         }
@@ -522,11 +672,6 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
     g_lastDirState = dirState;
 
-    // FPV viewmodel: render the spectated player's first-person weapon
-    if (result && playerEntity && dirState != CameraState::Drone) {
-        FpvViewmodel_RenderFrame(playerEntity);
-    }
-
     return result;
 }
 
@@ -583,6 +728,7 @@ bool InitFirstPersonCamera(uintptr_t gameBase) {
 }
 
 void ShutdownFirstPersonCamera() {
+    RestoreHiddenHead();
     if (g_hookInstalled) {
         std::cout << "[FirstPerson] Shutting down...\n";
         MH_DisableHook(MH_ALL_HOOKS);

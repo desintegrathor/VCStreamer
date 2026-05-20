@@ -19,10 +19,12 @@ static int g_currentCamType = 0; // 0=static, 1=dynamic, 2=player camera
 static int g_frameCounter = 0;
 static int g_holdFrames = 0; // how long current camera has been active
 
-constexpr float MAX_CAM_DIST = 18.0f;
-constexpr float MAX_CAM_DIST_SQ = MAX_CAM_DIST * MAX_CAM_DIST;
-constexpr int SWITCH_COOLDOWN_FRAMES = 240; // ~4 seconds at 60fps
-constexpr int MAX_HOLD_FRAMES = 600; // ~10 seconds at 60fps
+static float g_maxCamDist = 22.0f;
+static float g_maxCamDistSq = 22.0f * 22.0f;
+static int g_switchCooldownFrameBudget = 720; // ~12 seconds at 60fps
+static int g_maxHoldFrameBudget = 1440; // ~24 seconds at 60fps
+static float g_losPenalty = 1000.0f;
+static float g_stickiness = 15.0f;
 static int g_switchCooldownFrames = 0;
 static bool g_initialized = false;
 
@@ -31,6 +33,13 @@ constexpr uintptr_t PLAYER_TABLE_OFFSET = 0x7AE9C8;
 constexpr uintptr_t CAM_SPLINE_EVALUATE_OFFSET = 0x32460; // 0xDA2460 - 0xD70000
 constexpr int CAM_REEVAL_INTERVAL = 30;
 constexpr float PLAYER_CAM_SCORE = 20.0f;
+static int g_preference = -1; // -1=neutral, 0/1=prefer world cam, 2=prefer player cam
+static float g_effectivePlayerCamScore = 20.0f; // adjusted by preference
+
+static int SecondsToFrames(float seconds) {
+    if (seconds < 0.1f) seconds = 0.1f;
+    return (int)(seconds * 60.0f + 0.5f);
+}
 
 // Spectator object layout:
 // [0] = mode (0=fixed, 1=spline, 2=player, 3=replay)
@@ -162,15 +171,22 @@ static CamSearchResult FindBestCamera(int* spectObj, float* playerPos) {
             }
 
             float distSq = DistanceSq(camPos, playerPos);
-            if (distSq > MAX_CAM_DIST_SQ) continue;
+            if (distSq > g_maxCamDistSq) continue;
 
             float dist = sqrtf(distSq);
-            float score = 100.0f - (dist / MAX_CAM_DIST) * 80.0f;
+            float score = 100.0f - (dist / g_maxCamDist) * 80.0f;
 
-            if (!HasLineOfSight(camPos, playerPos)) score -= 60.0f;
+            bool hasLos = HasLineOfSight(camPos, playerPos);
+            if (!hasLos) {
+                LogWC("[WorldCam]   %s[%d] d=%.1f rejected: blocked LOS\n",
+                      type == 0 ? "static" : "dyncam", i, dist);
+                continue;
+            }
 
-            // Slight stickiness bonus for current camera
-            if (i == g_currentCamIndex && type == g_currentCamType) score += 5.0f;
+            // Keep a good current world camera stable while it can still see the target.
+            if (i == g_currentCamIndex && type == g_currentCamType) {
+                score += g_stickiness;
+            }
 
             LogWC("[WorldCam]   %s[%d] d=%.1f score=%.1f\n",
                   type == 0 ? "static" : "dyncam", i, dist, score);
@@ -237,6 +253,20 @@ void WorldCameraTracker_ClearTarget() {
     g_switchCooldownFrames = 0;
 }
 
+void WorldCameraTracker_SetPreference(int preferType) {
+    g_preference = preferType;
+    if (preferType == 0 || preferType == 1) {
+        // Bias toward world cam, but require a clearly useful view.
+        g_effectivePlayerCamScore = 20.0f;
+    } else if (preferType == 2) {
+        // Bias toward player cam: raise threshold so world cams need higher score
+        g_effectivePlayerCamScore = 40.0f;
+    } else {
+        // Neutral: default threshold
+        g_effectivePlayerCamScore = PLAYER_CAM_SCORE;
+    }
+}
+
 int WorldCameraTracker_GetCurrentCamType() {
     if (g_targetHandle.load() == 0) return -1;
     return g_currentCamType;
@@ -266,6 +296,80 @@ bool WorldCameraTracker_GetCurrentCamPos(float* outPos) {
     }
 
     return false;
+}
+
+static void SwitchToPlayerCamera(int* spectObj, const char* reason) {
+    g_currentCamIndex = -1;
+    g_currentCamType = 2;
+    g_switchCooldownFrames = g_switchCooldownFrameBudget;
+    g_holdFrames = 0;
+
+    spectObj[0] = 2;
+    SpectCamUpdateFunc camUpdate = (SpectCamUpdateFunc)(g_baseGame + SPECT_CAM_UPDATE_OFFSET);
+    camUpdate(spectObj);
+
+    LogWC("[WorldCam] Switching to player camera: %s\n", reason ? reason : "fallback");
+}
+
+static bool CurrentWorldCameraUsable(float* playerPos) {
+    if (g_currentCamType != 0 && g_currentCamType != 1) return false;
+    if (g_currentCamIndex < 0) return false;
+
+    float camPos[3];
+    if (!WorldCameraTracker_GetCurrentCamPos(camPos)) return false;
+    if (DistanceSq(camPos, playerPos) > g_maxCamDistSq) return false;
+
+    return HasLineOfSight(camPos, playerPos);
+}
+
+void WorldCameraTracker_SetTuning(float maxDistance,
+                                  float switchCooldownSeconds,
+                                  float maxHoldSeconds,
+                                  float losPenalty,
+                                  float stickiness) {
+    if (maxDistance < 1.0f) maxDistance = 1.0f;
+    g_maxCamDist = maxDistance;
+    g_maxCamDistSq = g_maxCamDist * g_maxCamDist;
+    g_switchCooldownFrameBudget = SecondsToFrames(switchCooldownSeconds);
+    g_maxHoldFrameBudget = SecondsToFrames(maxHoldSeconds);
+    g_losPenalty = losPenalty;
+    g_stickiness = stickiness;
+
+    LogWC("[WorldCam] Tuning: maxDist=%.1f cooldown=%d frames maxHold=%d frames losPenalty=%.1f stickiness=%.1f\n",
+          g_maxCamDist,
+          g_switchCooldownFrameBudget,
+          g_maxHoldFrameBudget,
+          g_losPenalty,
+          g_stickiness);
+}
+
+bool WorldCameraTracker_HasUsableWorldCamera() {
+    if (!g_initialized || g_currentCamIndex < 0) return false;
+    if (g_currentCamType != 0 && g_currentCamType != 1) return false;
+
+    int targetHandle = g_targetHandle.load();
+    if (targetHandle == 0 || !g_baseGame) return false;
+
+    void* playerStruct = FindPlayerByHandle(g_baseGame, targetHandle);
+    if (!playerStruct) return false;
+
+    uintptr_t entityPtr = *(uintptr_t*)((uintptr_t)playerStruct + 244);
+    if (entityPtr == 0) return false;
+
+    float playerPos[3] = {
+        *(float*)(entityPtr + 0xD0),
+        *(float*)(entityPtr + 0xD4),
+        *(float*)(entityPtr + 0xD8)
+    };
+    if (playerPos[0] == 0.0f && playerPos[1] == 0.0f && playerPos[2] == 0.0f) {
+        return false;
+    }
+
+    float camPos[3];
+    if (!WorldCameraTracker_GetCurrentCamPos(camPos)) return false;
+    if (DistanceSq(camPos, playerPos) > g_maxCamDistSq) return false;
+
+    return HasLineOfSight(camPos, playerPos);
 }
 
 void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
@@ -305,21 +409,28 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
     g_holdFrames++;
     if (g_switchCooldownFrames > 0) g_switchCooldownFrames--;
 
+    bool shouldValidateCurrentWorldCam = (g_currentCamType == 0 || g_currentCamType == 1)
+                                      && ((g_frameCounter % CAM_REEVAL_INTERVAL) == 0);
+    if (shouldValidateCurrentWorldCam && !CurrentWorldCameraUsable(playerPos)) {
+        SwitchToPlayerCamera(spectObj, "current world cam lost distance/LOS");
+        return;
+    }
+
     bool needEval = (g_currentCamIndex == -1 && g_currentCamType != 2)
-                  || (g_holdFrames >= MAX_HOLD_FRAMES)
+                  || (g_holdFrames >= g_maxHoldFrameBudget)
                   || (g_switchCooldownFrames == 0 && (g_frameCounter % CAM_REEVAL_INTERVAL) == 0);
 
     if (needEval) {
-        bool forceSwitch = (g_holdFrames >= MAX_HOLD_FRAMES);
+        bool forceSwitch = (g_holdFrames >= g_maxHoldFrameBudget);
         CamSearchResult result = FindBestCamera(spectObj, playerPos);
 
-        if (result.index >= 0 && result.score > PLAYER_CAM_SCORE) {
+        if (result.index >= 0 && result.score > g_effectivePlayerCamScore) {
             // World cam is good
             bool isNewCam = (result.index != g_currentCamIndex || result.type != g_currentCamType);
             if (isNewCam && (g_currentCamIndex == -1 || g_currentCamType == 2 || g_switchCooldownFrames == 0)) {
                 g_currentCamIndex = result.index;
                 g_currentCamType = result.type;
-                g_switchCooldownFrames = SWITCH_COOLDOWN_FRAMES;
+                g_switchCooldownFrames = g_switchCooldownFrameBudget;
                 g_holdFrames = 0;
                 LogWC("[WorldCam] Selected %s cam %d score=%.1f (static=%d, dynamic=%d)\n",
                       g_currentCamType == 0 ? "static" : "dynamic",
@@ -328,7 +439,7 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
                 // Max hold reached but same cam is still best — fall back to player cam for variety
                 g_currentCamIndex = -1;
                 g_currentCamType = 2;
-                g_switchCooldownFrames = SWITCH_COOLDOWN_FRAMES;
+                g_switchCooldownFrames = g_switchCooldownFrameBudget;
                 g_holdFrames = 0;
                 spectObj[0] = 2;
                 SpectCamUpdateFunc camUpdate = (SpectCamUpdateFunc)(g_baseGame + SPECT_CAM_UPDATE_OFFSET);
@@ -340,7 +451,7 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
             if (g_currentCamType != 2) {
                 g_currentCamIndex = -1;
                 g_currentCamType = 2;
-                g_switchCooldownFrames = SWITCH_COOLDOWN_FRAMES;
+                g_switchCooldownFrames = g_switchCooldownFrameBudget;
                 g_holdFrames = 0;
                 spectObj[0] = 2;
                 SpectCamUpdateFunc camUpdate = (SpectCamUpdateFunc)(g_baseGame + SPECT_CAM_UPDATE_OFFSET);

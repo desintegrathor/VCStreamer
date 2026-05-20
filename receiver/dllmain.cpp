@@ -12,6 +12,7 @@
 #include "RealtimeHook.h"
 #include "TickDelayBuffer.h"
 #include "FpvViewmodel.h"
+#include "LowPlayerOverlay.h"
 #include "dsound_proxy.h"
 #include "minhook/MinHook.h"
 
@@ -36,6 +37,7 @@ void MainLoop() {
 
         // Read scoreboard from game memory and update SpectatorController
         auto players = GameMemoryReader::ReadPlayerList();
+        LowPlayerOverlay_SetActivePlayerCount((int)players.size());
         if (!players.empty()) {
             UpdateScoreboard(players);
         }
@@ -48,6 +50,8 @@ DWORD WINAPI MainThread(LPVOID) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
+
+    InitLowPlayerOverlay();
 
     // Wait for game.dll to be loaded
     std::cout << "[VCStreamer] Waiting for game.dll...\n";
@@ -133,7 +137,6 @@ DWORD WINAPI MainThread(LPVOID) {
     InitRealtimeHook(base);
     InitAutoSpectator(base);
     InitWorldCameraTracker(base);
-    WorldCameraTracker_SetPreference(2);  // Force player camera, no world cams
     SetHookReady();
 
     std::thread mainThread(MainLoop);

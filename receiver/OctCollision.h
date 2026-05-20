@@ -15,3 +15,6 @@ bool OctCollision_LineOfSight(const float* from, const float* to);
 
 // Check if collision data is loaded
 bool OctCollision_IsLoaded();
+
+// Get map bounding box (for RRT sampling). Returns false if not loaded.
+bool OctCollision_GetBounds(float* outMin, float* outMax);

@@ -20,3 +20,17 @@ int WorldCameraTracker_GetCurrentCamType();
 
 // Returns current camera position (only valid when type is 0 or 1).
 bool WorldCameraTracker_GetCurrentCamPos(float* outPos);
+
+// Set camera type preference for deficit-based scheduling.
+// preferType: 0 or 1 = bias toward world cameras, 2 = bias toward player cam, -1 = neutral
+void WorldCameraTracker_SetPreference(int preferType);
+
+// Apply CameraDirector tuning values loaded from vcstreamer.ini.
+void WorldCameraTracker_SetTuning(float maxDistance,
+                                  float switchCooldownSeconds,
+                                  float maxHoldSeconds,
+                                  float losPenalty,
+                                  float stickiness);
+
+// True when the current static/dynamic camera can still see the target well enough.
+bool WorldCameraTracker_HasUsableWorldCamera();

@@ -10,6 +10,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdarg>
+#include <string>
+#include <algorithm>
+#include <cctype>
 #include <windows.h>
 
 // Debug log file - written next to game exe
@@ -84,6 +87,102 @@ static uintptr_t g_baseGame = 0;
 static std::atomic<bool> g_running{ false };
 static std::thread g_autoThread;
 
+static bool g_autoConnectEnabled = true;
+static std::string g_autoConnectIp = "46.13.190.168";
+static int g_autoConnectPort = 5425;
+static std::string g_autoConnectAddon = "fistalpha";
+static int g_autoConnectRetrySeconds = 30;
+
+static std::string Trim(std::string value) {
+    const char* ws = " \t\r\n";
+    size_t first = value.find_first_not_of(ws);
+    if (first == std::string::npos) return std::string();
+    size_t last = value.find_last_not_of(ws);
+    return value.substr(first, last - first + 1);
+}
+
+static bool ParseBool(std::string value, bool defaultValue) {
+    value = Trim(value);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return (char)tolower(ch); });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    return defaultValue;
+}
+
+static std::string GetDllDirectoryPath() {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&InitAutoSpectator),
+                            &self)) {
+        return std::string();
+    }
+
+    char path[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(self, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return std::string();
+
+    std::string full(path, path + len);
+    size_t slash = full.find_last_of("\\/");
+    if (slash == std::string::npos) return std::string();
+    return full.substr(0, slash + 1);
+}
+
+static void LoadAutoConnectConfig() {
+    std::ifstream ini(GetDllDirectoryPath() + "vcstreamer.ini");
+    if (!ini.is_open()) return;
+
+    std::string line;
+    while (std::getline(ini, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+
+        size_t equals = line.find('=');
+        if (equals == std::string::npos) continue;
+
+        std::string key = Trim(line.substr(0, equals));
+        std::string value = Trim(line.substr(equals + 1));
+
+        try {
+            if (key == "auto_connect") {
+                g_autoConnectEnabled = ParseBool(value, g_autoConnectEnabled);
+            } else if (key == "server_ip") {
+                g_autoConnectIp = value;
+            } else if (key == "server_port") {
+                g_autoConnectPort = std::stoi(value);
+            } else if (key == "server_addon") {
+                g_autoConnectAddon = value;
+            } else if (key == "auto_connect_retry_seconds") {
+                g_autoConnectRetrySeconds = std::stoi(value);
+            }
+        } catch (...) {
+        }
+    }
+
+    if (g_autoConnectPort <= 0) g_autoConnectPort = 5425;
+    if (g_autoConnectRetrySeconds < 5) g_autoConnectRetrySeconds = 5;
+    if (g_autoConnectIp.empty()) g_autoConnectEnabled = false;
+}
+
+static std::string BuildAutoConnectCommandLine(const char* exePath) {
+    std::string cmdLine = "\"";
+    cmdLine += exePath;
+    cmdLine += "\"";
+
+    cmdLine += " -ip ";
+    cmdLine += g_autoConnectIp;
+    cmdLine += " ";
+    cmdLine += std::to_string(g_autoConnectPort);
+
+    if (!g_autoConnectAddon.empty()) {
+        cmdLine += " -addon ";
+        cmdLine += g_autoConnectAddon;
+    }
+
+    return cmdLine;
+}
+
 // Hook for sub_EB88B0 - runs on main game thread every frame during spectating.
 // Uses __fastcall to handle __thiscall on x86 (thisPtr in ECX, EDX unused).
 int __fastcall Hooked_SpectInput(float* thisPtr, void* /*edx*/, float deltaTime) {
@@ -128,11 +227,10 @@ int __fastcall Hooked_SpectInput(float* thisPtr, void* /*edx*/, float deltaTime)
             }
         }
     }
-    // FPV dev: disable world camera tracker and drone entirely
-    // WorldCameraTracker_Update((int*)thisPtr, g_baseGame);
-    // if (DroneCamera_IsActive()) {
-    //     DroneCamera_Update(deltaTime);
-    // }
+    WorldCameraTracker_Update((int*)thisPtr, g_baseGame);
+    if (DroneCamera_IsActive()) {
+        DroneCamera_Update(deltaTime);
+    }
     return g_OrigSpectInput(thisPtr, deltaTime);
 }
 
@@ -158,20 +256,30 @@ static void AutoSpectatorLoop() {
                 retryCount = 0;
             } else {
                 retryCount++;
-                // The -ip flag triggers connect immediately on startup.
-                // If connPtr is still 0 after 30 seconds (150 * 200ms), connection failed.
-                // The error dialog is shown but we can't dismiss it programmatically,
-                // so restart the whole process.
-                if (retryCount >= 150 && !hasConnectedOnce) {
-                    LogDebug("[AutoSpectator] No connection after 30s (never connected), restarting game...\n");
+                // The -ip flag triggers connect immediately on startup. If there
+                // is still no connection after the configured timeout, optionally
+                // restart Vietcong with the server from vcstreamer.ini.
+                int maxRetries = (g_autoConnectRetrySeconds * 1000) / 200;
+                if (maxRetries < 1) maxRetries = 1;
+                if (retryCount >= maxRetries && !hasConnectedOnce) {
+                    if (!g_autoConnectEnabled) {
+                        LogDebug("[AutoSpectator] No connection after %ds; auto_connect=0, waiting for manual connection\n",
+                                 g_autoConnectRetrySeconds);
+                        retryCount = 0;
+                        break;
+                    }
+
+                    LogDebug("[AutoSpectator] No connection after %ds, restarting game with server %s:%d addon=%s...\n",
+                             g_autoConnectRetrySeconds,
+                             g_autoConnectIp.c_str(),
+                             g_autoConnectPort,
+                             g_autoConnectAddon.c_str());
                     char exePath[MAX_PATH];
                     GetModuleFileNameA(NULL, exePath, MAX_PATH);
-                    // Read command line from vcstreamer.ini or use hardcoded default
-                    char cmdLine[1024];
-                    snprintf(cmdLine, sizeof(cmdLine), "\"%s\" -ip 46.13.190.168 5425 -addon fistalpha", exePath);
+                    std::string cmdLine = BuildAutoConnectCommandLine(exePath);
                     STARTUPINFOA si = { sizeof(si) };
                     PROCESS_INFORMATION pi;
-                    if (CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                    if (CreateProcessA(NULL, &cmdLine[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
                         CloseHandle(pi.hProcess);
                         CloseHandle(pi.hThread);
                         LogDebug("[AutoSpectator] New process started, exiting current...\n");
@@ -356,6 +464,14 @@ void InitAutoSpectator(uintptr_t baseGame) {
     LogDebug("[AutoSpectator] Spect view obj addr:0x%08X (offset 0x%X)\n", baseGame + SPECT_VIEW_OBJ_OFFSET, SPECT_VIEW_OBJ_OFFSET);
     LogDebug("[AutoSpectator] CamInit func addr:  0x%08X (offset 0x%X)\n", baseGame + SPECT_CAM_INIT_OFFSET, SPECT_CAM_INIT_OFFSET);
     LogDebug("[AutoSpectator] CamUpdate func addr:0x%08X (offset 0x%X)\n", baseGame + SPECT_CAM_UPDATE_OFFSET, SPECT_CAM_UPDATE_OFFSET);
+
+    LoadAutoConnectConfig();
+    LogDebug("[AutoSpectator] Auto-connect: enabled=%d server=%s:%d addon=%s retry=%ds\n",
+             g_autoConnectEnabled ? 1 : 0,
+             g_autoConnectIp.c_str(),
+             g_autoConnectPort,
+             g_autoConnectAddon.c_str(),
+             g_autoConnectRetrySeconds);
 
     OctCollision_Init(baseGame);
 

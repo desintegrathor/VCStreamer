@@ -68,6 +68,29 @@ static uintptr_t g_iatAddr = 0;
 static uintptr_t g_gameBase = 0;
 static bool g_hookInstalled = false;
 
+// g_playerArray (64 entity pointers) — RVA 0x7AE9C8 in game.dll
+static void** g_playerArray = nullptr;
+// g_localPlayer pointer-to-pointer — RVA 0x80D458
+static void*** g_ppLocalPlayer = nullptr;
+
+// Base game bug: GNET_CLN_PL_UpdateStatus writes decoded pitch to the OUTER
+// player struct at +0x1E4 (shadow state). The renderer (GAM_PL_RenderSkeleton)
+// and sender (GNET_PL_BuildMoveState) both read/write pitch on the INNER
+// struct at +0xF8, reached via outer[61] (+0xF4) which holds a pointer to it.
+// Nothing copies shadow (outer+0x1E4) -> applied (inner+0xF8) for remote
+// players, so their weapons stay horizontal. Mirror it ourselves.
+static void MirrorRemotePlayerPitch() {
+    if (!g_playerArray || !g_ppLocalPlayer) return;
+    void* localPlayer = *g_ppLocalPlayer;
+    for (int i = 0; i < 64; ++i) {
+        char* outer = (char*)g_playerArray[i];
+        if (!outer || outer == localPlayer) continue;
+        void* inner = *(void**)(outer + 0xF4);
+        if (!inner) continue;
+        *(float*)((char*)inner + 0xF8) = *(float*)(outer + 0x1E4);
+    }
+}
+
 // ============================================================================
 // Ring buffer for delayed packets
 // ============================================================================
@@ -104,6 +127,9 @@ static unsigned int __cdecl Hooked_NET_ReadMessages(
     void* buffer,
     unsigned long* outSize
 ) {
+    // Apply remote-player pitch fix every tick (game.dll never does this itself).
+    MirrorRemotePlayerPitch();
+
     // 1. Always drain the real DirectPlay queue
     unsigned int result = g_originalReadMessages(dpConnection, outData, outData2, buffer, outSize);
 
@@ -226,6 +252,10 @@ static unsigned int __cdecl Hooked_NET_ReadMessages(
 
 void InitTickDelayBuffer(uintptr_t gameBase) {
     g_gameBase = gameBase;
+
+    // Pointers used by MirrorRemotePlayerPitch — RVAs from game.dll v16.
+    g_playerArray   = (void**)(gameBase + 0x7AE9C8);
+    g_ppLocalPlayer = (void***)(gameBase + 0x80D458);
 
     TickLog("[TickDelay] Fixed buffer delay: %dms (%ds)\n", g_tickDelayMs, g_tickDelayMs / 1000);
 
