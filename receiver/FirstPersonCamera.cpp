@@ -6,6 +6,7 @@
 #include "WorldCameraTracker.h"
 #include "SpectatedPlayerData.h"
 #include "FpvViewmodel.h"
+#include "RealtimeHook.h"
 #include "minhook/MinHook.h"
 #include <iostream>
 #include <cmath>
@@ -40,6 +41,10 @@ constexpr int PLAYER_SKELETON_PTR = 0x378;
 constexpr unsigned int BONE_HEAD  = 0x17;
 constexpr unsigned int BONE_NECK  = 0x16;
 constexpr unsigned int BONE_CHEST = 0x15;
+
+constexpr float PI_F = 3.14159265f;
+constexpr float YAW_OFFSET_3PV = PI_F - 0.35f;
+constexpr float MAX_PITCH_3PV = 0.175f;
 
 // NOD struct offsets — verified from NOD_FindByNameAndType @ 0xf429b0:
 //   +8  name[], +0x58 flags (bit 0 = hidden, bit 3 = has_children),
@@ -89,6 +94,8 @@ static bool g_yawInitialized = false;
 // 3PV distance smoothing
 static float g_smoothedDistance = 2.5f;
 static bool g_distanceInitialized = false;
+static bool g_lookLockWasActive = false;
+static int g_lastLookLockTarget = 0;
 
 // KillCam render-side position tracking for slide interpolation
 static float g_killCamKillerLastPos[3] = {};
@@ -96,6 +103,9 @@ static bool g_killCamKillerPosLocked = false;
 static float g_killCamVictimLastPos[3] = {};
 static bool g_killCamVictimPosLocked = false;
 static bool g_killCamPhase2Entered = false;
+static float g_killCamHoldPos[3] = {};
+static bool g_killCamHoldPosValid = false;
+static KillCamStyle g_killCamStyle = KillCamStyle::BulletTravel;
 
 // Track last director state for detecting KillCam entry
 static CameraState g_lastDirState = CameraState::Idle;
@@ -167,6 +177,110 @@ static void GetEntityPos(void* entity, float* out) {
     out[0] = *(float*)((uintptr_t)entity + 0xD0);
     out[1] = *(float*)((uintptr_t)entity + 0xD4);
     out[2] = *(float*)((uintptr_t)entity + 0xD8);
+}
+
+static bool GetBestKillCamPosition(int handle, float out[3]) {
+    if (RealtimeHook_GetPredictedPlayerPosition(handle, out, 7000)) {
+        return true;
+    }
+
+    void* entity = FindEntityByHandle(handle);
+    if (!entity) return false;
+    GetEntityPos(entity, out);
+    return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);
+}
+
+static bool GetEntityBonePos(void* entity, unsigned int boneId, float out[3]) {
+    if (!entity || !g_GetBoneEndLoc) return false;
+
+    void** skeletonPtrPtr = *(void***)((char*)entity + PLAYER_SKELETON_PTR);
+    if (!skeletonPtrPtr || !*skeletonPtrPtr) return false;
+
+    return g_GetBoneEndLoc(*skeletonPtrPtr, boneId, out) != 0;
+}
+
+static bool GetPlayerAimPoint(int playerHandle, float out[3]) {
+    void* playerEntity = FindEntityByHandle(playerHandle);
+    if (GetEntityBonePos(playerEntity, BONE_NECK, out)) {
+        return true;
+    }
+
+    if (GetBestKillCamPosition(playerHandle, out)) {
+        out[2] += 1.25f;
+        return true;
+    }
+
+    if (playerEntity) {
+        GetEntityPos(playerEntity, out);
+        out[2] += 1.25f;
+        return true;
+    }
+
+    return false;
+}
+
+static bool IsCloseKillCamLookLockActive(const CameraConfig& cfg) {
+    float killTime = cfg.detachedKillCamFollowDuration
+                   + cfg.detachedKillCamRepositionDuration;
+    if (killTime < 0.1f) killTime = 0.1f;
+    float releaseTime = killTime + cfg.detachedKillCamHoldDuration;
+    if (releaseTime < killTime + 0.1f) releaseTime = killTime + 0.1f;
+
+    float advance = cfg.killLookLockAdvance;
+    if (advance < 0.1f) advance = 0.1f;
+    if (advance > killTime) advance = killTime;
+
+    float elapsed = CameraDirector_GetKillCamElapsed();
+    return elapsed >= (killTime - advance) && elapsed < releaseTime;
+}
+
+static bool Get3pvLookLockTarget(CameraState dirState,
+                                 KillCamStyle kcStyle,
+                                 const CameraConfig& cfg,
+                                 int* outTarget,
+                                 const char** outReason) {
+    if (WorldCameraTracker_GetCurrentCamType() != 2) {
+        return false;
+    }
+
+    if (dirState == CameraState::FlagWatch
+        || dirState == CameraState::FollowPlayer) {
+        int killer = 0;
+        if (CameraDirector_GetFlagCarrierKillLook(&killer, nullptr, nullptr, nullptr)) {
+            if (outTarget) *outTarget = killer;
+            if (outReason) {
+                *outReason = dirState == CameraState::FlagWatch
+                    ? "flag-victim"
+                    : "victim";
+            }
+            return killer != 0;
+        }
+    }
+
+    if (dirState == CameraState::KillCam
+        && kcStyle == KillCamStyle::DetachedVantage
+        && IsCloseKillCamLookLockActive(cfg)) {
+        int victim = CameraDirector_GetKillCamVictimHandle();
+        if (outTarget) *outTarget = victim;
+        if (outReason) *outReason = "killcam";
+        return victim != 0;
+    }
+
+    return false;
+}
+
+static void AimCameraAt(void* cameraProp, const float* camPos, const float* lookAt) {
+    float dx = lookAt[0] - camPos[0];
+    float dy = lookAt[1] - camPos[1];
+    float dz = lookAt[2] - camPos[2];
+    float horizDist = sqrtf(dx * dx + dy * dy);
+
+    float yaw = (horizDist > 0.01f) ? atan2f(-dx, dy) : 0.0f;
+    float pitch = (horizDist > 0.01f) ? -atan2f(dz, horizDist) : 0.0f;
+
+    if (g_SetCameraRotation) {
+        g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
+    }
 }
 
 static bool GetBoneRotation(void* skeleton, unsigned int boneId, float* outYaw, float* outPitch) {
@@ -315,6 +429,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
     CameraState dirState = CameraDirector_GetState();
     KillCamPhase kcPhase = CameraDirector_GetKillCamPhase();
+    KillCamStyle kcStyle = CameraDirector_GetKillCamStyle();
     const CameraConfig& cfg = CameraDirector_GetConfig();
 
     // Detect player change and reset render state
@@ -364,35 +479,49 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         // New KillCam started — snapshot positions
         int killerHandle = CameraDirector_GetKillCamKillerHandle();
         int victimHandle = CameraDirector_GetKillCamVictimHandle();
+        g_killCamStyle = kcStyle;
 
-        void* ke = FindEntityByHandle(killerHandle);
-        if (ke) GetEntityPos(ke, g_killCamKillerLastPos);
-        else memset(g_killCamKillerLastPos, 0, sizeof(g_killCamKillerLastPos));
+        if (!GetBestKillCamPosition(killerHandle, g_killCamKillerLastPos)) {
+            memset(g_killCamKillerLastPos, 0, sizeof(g_killCamKillerLastPos));
+        }
 
-        void* ve = FindEntityByHandle(victimHandle);
-        if (ve) GetEntityPos(ve, g_killCamVictimLastPos);
-        else memset(g_killCamVictimLastPos, 0, sizeof(g_killCamVictimLastPos));
+        if (!GetBestKillCamPosition(victimHandle, g_killCamVictimLastPos)) {
+            memset(g_killCamVictimLastPos, 0, sizeof(g_killCamVictimLastPos));
+        }
 
         g_killCamKillerPosLocked = false;
         g_killCamVictimPosLocked = false;
         g_killCamPhase2Entered = false;
+        g_killCamHoldPosValid = false;
+
+        if (g_killCamStyle == KillCamStyle::DetachedVantage) {
+            g_yawInitialized = false;
+            std::cout << "[Camera] Close KillCam: 3PV victim look lock\n";
+        }
     }
 
-    // 3PV pre-processing: run for all states except KillCam Transition
-    bool do3pvPreprocess = !(dirState == CameraState::KillCam && kcPhase == KillCamPhase::Transition);
+    // 3PV pre-processing: run unless the bullet-travel KillCam takes full camera control.
+    bool killCamOverridesCamera = dirState == CameraState::KillCam
+        && kcPhase == KillCamPhase::Transition
+        && g_killCamStyle == KillCamStyle::BulletTravel;
+    bool do3pvPreprocess = !killCamOverridesCamera;
+    int lookLockTarget = 0;
+    const char* lookLockReason = nullptr;
+    bool lookLockActive = Get3pvLookLockTarget(dirState, kcStyle, cfg,
+                                               &lookLockTarget,
+                                               &lookLockReason);
 
     if (do3pvPreprocess && playerEntity) {
         void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+
         if (skeletonPtrPtr && *skeletonPtrPtr) {
             void* skeleton = *skeletonPtrPtr;
-            float yaw = 0.0f;
-            float pitch = 0.0f;
 
             if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
-                constexpr float YAW_OFFSET_3PV = 3.14159265f - 0.35f;
                 yaw += YAW_OFFSET_3PV;
 
-                constexpr float MAX_PITCH_3PV = 0.175f;
                 if (pitch > MAX_PITCH_3PV) pitch = MAX_PITCH_3PV;
                 if (pitch < -MAX_PITCH_3PV) pitch = -MAX_PITCH_3PV;
 
@@ -593,80 +722,116 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         s_prevCamType = wcType;
     }
 
+    // Keep the final camera rotation centered on the lock target after
+    // distance smoothing has moved the 3PV camera.
+    if (lookLockActive && result) {
+        float targetAim[3];
+        if (GetPlayerAimPoint(lookLockTarget, targetAim)) {
+            if (!g_lookLockWasActive || g_lastLookLockTarget != lookLockTarget) {
+                FpvLog("[LookLock] start reason=%s target=%d view-only\n",
+                       lookLockReason ? lookLockReason : "unknown",
+                       lookLockTarget);
+            }
+            g_lookLockWasActive = true;
+            g_lastLookLockTarget = lookLockTarget;
+
+            float* camPos = (float*)cameraProp;
+            AimCameraAt(cameraProp, camPos, targetAim);
+        } else if (g_lookLockWasActive) {
+            FpvLog("[LookLock] end target=%d target-lost\n", g_lastLookLockTarget);
+            g_lookLockWasActive = false;
+            g_lastLookLockTarget = 0;
+        }
+    } else if (g_lookLockWasActive) {
+        FpvLog("[LookLock] end target=%d\n", g_lastLookLockTarget);
+        g_lookLockWasActive = false;
+        g_lastLookLockTarget = 0;
+    }
+
     // KillCam phased logic
     if (dirState == CameraState::KillCam && result) {
         float elapsed = CameraDirector_GetKillCamElapsed();
         int killerHandle = CameraDirector_GetKillCamKillerHandle();
         int victimHandle = CameraDirector_GetKillCamVictimHandle();
 
-        // Look up entities, snapshot positions
-        void* killerEntity = FindEntityByHandle(killerHandle);
-        void* victimEntity = FindEntityByHandle(victimHandle);
-
-        float killerPos[3], victimPos[3];
-
-        if (killerEntity) {
-            GetEntityPos(killerEntity, killerPos);
-            memcpy(g_killCamKillerLastPos, killerPos, sizeof(killerPos));
+        if (g_killCamStyle == KillCamStyle::DetachedVantage) {
+            (void)elapsed;
+            (void)victimHandle;
         } else {
-            if (!g_killCamKillerPosLocked) g_killCamKillerPosLocked = true;
-            memcpy(killerPos, g_killCamKillerLastPos, sizeof(killerPos));
-        }
+            // Look up entities, snapshot positions
+            void* killerEntity = FindEntityByHandle(killerHandle);
+            void* victimEntity = FindEntityByHandle(victimHandle);
 
-        if (victimEntity) {
-            GetEntityPos(victimEntity, victimPos);
-            memcpy(g_killCamVictimLastPos, victimPos, sizeof(victimPos));
-        } else {
-            if (!g_killCamVictimPosLocked) g_killCamVictimPosLocked = true;
-            memcpy(victimPos, g_killCamVictimLastPos, sizeof(victimPos));
-        }
+            float killerPos[3], victimPos[3];
 
-        float waitEnd = cfg.killCamWaitDuration;
-        float transEnd = waitEnd + cfg.killCamTransitionDuration;
-
-        // Phase 1 (transition): slide camera from killer to victim
-        if (kcPhase == KillCamPhase::Transition) {
-            float t = SmoothStep((elapsed - waitEnd) / (transEnd - waitEnd));
-            float* camPos = (float*)cameraProp;
-
-            camPos[0] = killerPos[0] + (victimPos[0] - killerPos[0]) * t;
-            camPos[1] = killerPos[1] + (victimPos[1] - killerPos[1]) * t;
-            camPos[2] = killerPos[2] + (victimPos[2] - killerPos[2]) * t + cfg.killCamSlideHeight;
-
-            // Look forward: killer -> victim direction
-            float ddx = victimPos[0] - killerPos[0];
-            float ddy = victimPos[1] - killerPos[1];
-            float ddz = victimPos[2] - killerPos[2];
-            float horizDist = sqrtf(ddx * ddx + ddy * ddy);
-
-            float yaw = (horizDist > 0.01f) ? atan2f(-ddx, ddy) : 0.0f;
-            float pitch = (horizDist > 0.01f) ? -atan2f(ddz, horizDist) : 0.0f;
-
-            if (g_SetCameraRotation) {
-                g_SetCameraRotation(cameraProp, pitch, 0.0f, yaw);
+            if (killerEntity) {
+                GetEntityPos(killerEntity, killerPos);
+                memcpy(g_killCamKillerLastPos, killerPos, sizeof(killerPos));
+            } else {
+                if (!g_killCamKillerPosLocked) g_killCamKillerPosLocked = true;
+                memcpy(killerPos, g_killCamKillerLastPos, sizeof(killerPos));
             }
-        }
 
-        // Phase 2 (attached): switch to victim on first frame
-        if (kcPhase == KillCamPhase::Attached && !g_killCamPhase2Entered) {
-            g_killCamPhase2Entered = true;
+            if (victimEntity) {
+                GetEntityPos(victimEntity, victimPos);
+                memcpy(g_killCamVictimLastPos, victimPos, sizeof(victimPos));
+            } else {
+                if (!g_killCamVictimPosLocked) g_killCamVictimPosLocked = true;
+                memcpy(victimPos, g_killCamVictimLastPos, sizeof(victimPos));
+            }
 
-            // Switch spectator target to victim
-            uintptr_t spectObj = g_gameBase + 0x7AE320;
-            int playerCount = *(int*)(spectObj + 0x24);
-            uintptr_t listBase = spectObj + 0x2C;
-            for (int i = 0; i < playerCount && i < 64; i++) {
-                if (*(int*)(listBase + i * 20) == victimHandle) {
-                    *(int*)(spectObj + 0x28) = i;
-                    break;
+            float waitEnd = cfg.killCamWaitDuration;
+            float transEnd = waitEnd + cfg.killCamTransitionDuration;
+
+            // Phase 1 (transition): slide camera from killer to victim
+            if (kcPhase == KillCamPhase::Transition) {
+                float denom = transEnd - waitEnd;
+                float t = denom > 0.001f ? SmoothStep((elapsed - waitEnd) / denom) : 1.0f;
+                float* camPos = (float*)cameraProp;
+
+                camPos[0] = killerPos[0] + (victimPos[0] - killerPos[0]) * t;
+                camPos[1] = killerPos[1] + (victimPos[1] - killerPos[1]) * t;
+                camPos[2] = killerPos[2] + (victimPos[2] - killerPos[2]) * t + cfg.killCamSlideHeight;
+
+                float lookAt[3] = { victimPos[0], victimPos[1], victimPos[2] + 1.0f };
+                AimCameraAt(cameraProp, camPos, lookAt);
+            }
+
+            // Phase 2 (attached): hold a fixed post-kill shot for a few seconds
+            // instead of immediately handing off to normal spectator follow.
+            if (kcPhase == KillCamPhase::Attached) {
+                if (!g_killCamPhase2Entered || !g_killCamHoldPosValid) {
+                    g_killCamPhase2Entered = true;
+
+                    float dirX = victimPos[0] - killerPos[0];
+                    float dirY = victimPos[1] - killerPos[1];
+                    float len = sqrtf(dirX * dirX + dirY * dirY);
+                    if (len > 0.01f) {
+                        dirX /= len;
+                        dirY /= len;
+                    } else {
+                        dirX = 0.0f;
+                        dirY = 1.0f;
+                    }
+
+                    constexpr float HOLD_BACK_DISTANCE = 3.5f;
+                    constexpr float HOLD_HEIGHT = 1.4f;
+                    g_killCamHoldPos[0] = victimPos[0] - dirX * HOLD_BACK_DISTANCE;
+                    g_killCamHoldPos[1] = victimPos[1] - dirY * HOLD_BACK_DISTANCE;
+                    g_killCamHoldPos[2] = victimPos[2] + HOLD_HEIGHT;
+                    g_killCamHoldPosValid = true;
+
+                    std::cout << "[Camera] KillCam phase 2: fixed post-kill hold\n";
                 }
+
+                float* camPos = (float*)cameraProp;
+                camPos[0] = g_killCamHoldPos[0];
+                camPos[1] = g_killCamHoldPos[1];
+                camPos[2] = g_killCamHoldPos[2];
+
+                float lookAt[3] = { victimPos[0], victimPos[1], victimPos[2] + 1.0f };
+                AimCameraAt(cameraProp, camPos, lookAt);
             }
-
-            // Reset smoothing for fresh 3PV on victim
-            g_yawInitialized = false;
-            g_distanceInitialized = false;
-
-            std::cout << "[Camera] KillCam phase 2: attached to victim\n";
         }
     }
 

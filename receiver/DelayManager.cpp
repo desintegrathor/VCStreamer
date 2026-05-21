@@ -16,7 +16,7 @@ float DelayManager::fpvOffsetBack = 0.8f;
 float DelayManager::fpvOffsetLeft = 0.3f;
 float DelayManager::fpvOffsetUp = 0.3f;
 float DelayManager::fpvPitchOffset = 0.785f;
-int DelayManager::fpvChance = 10;
+int DelayManager::fpvChance = 0;
 bool DelayManager::debugMode = false;
 DWORD DelayManager::lastConfigReload = 0;
 
@@ -92,7 +92,7 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "fpv_pitch_offset=0.785\n";
                 outFile << "\n";
                 outFile << "; FPV chance in percent (0-100, chance of FPV vs 3PV when switching players)\n";
-                outFile << "fpv_chance=10\n";
+                outFile << "fpv_chance=0\n";
                 outFile << "\n";
                 outFile << "; Debug mode (0=normal, 1=reload config periodically for live tuning)\n";
                 outFile << "debug_mode=0\n";
@@ -108,6 +108,33 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "low_player_overlay_threshold=2\n";
                 outFile << "low_player_overlay_image=stream_waiting.bmp\n";
                 outFile << "low_player_overlay_fade_seconds=1.5\n";
+                outFile << "\n";
+                outFile << "[CameraDirector]\n";
+                outFile << "killcam_long_range_distance=40.0\n";
+                outFile << "detached_killcam_chance=1.00\n";
+                outFile << "bullet_killcam_chance=0.70\n";
+                outFile << "kill_cooldown=6.0\n";
+                outFile << "kill_interrupt_min_hold=4.0\n";
+                outFile << "flag_camping_distance=2.0\n";
+                outFile << "flag_camping_window=10.0\n";
+                outFile << "flag_camping_glimpse_duration=5.0\n";
+                outFile << "flag_camping_glimpse_interval=35.0\n";
+                outFile << "cam_share_player=0.04\n";
+                outFile << "cam_share_world=0.88\n";
+                outFile << "cam_share_drone=0.08\n";
+                outFile << "cam_min_hold_player=8.0\n";
+                outFile << "cam_min_hold_world=12.0\n";
+                outFile << "cam_min_hold_drone=16.0\n";
+                outFile << "detached_killcam_follow_duration=2.5\n";
+                outFile << "detached_killcam_reposition_duration=2.5\n";
+                outFile << "killcam_attached_duration=3.0\n";
+                outFile << "detached_killcam_hold_duration=3.0\n";
+                outFile << "detached_killcam_min_height=3.0\n";
+                outFile << "detached_killcam_max_height=12.0\n";
+                outFile << "detached_killcam_min_radius=6.0\n";
+                outFile << "detached_killcam_max_radius=22.0\n";
+                outFile << "detached_killcam_min_clearance=1.0\n";
+                outFile << "kill_look_lock_advance=3.0\n";
                 outFile.close();
                 return 0;
             }
@@ -227,6 +254,13 @@ static int ReadIniInt(const std::string& iniPath, const char* key, int defaultVa
     try { return std::stoi(buf); } catch (...) { return defaultVal; }
 }
 
+static float NormalizeChance(float value) {
+    if (value > 1.0f && value <= 100.0f) value *= 0.01f;
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
 void LoadCameraDirectorConfig(CameraConfig& cfg) {
     std::string iniPath = GetIniPath();
 
@@ -235,13 +269,32 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.cinematicMinChance        = ReadIniFloat(iniPath, "cinematic_min_chance", 0.05f);
     cfg.cinematicMaxChance        = ReadIniFloat(iniPath, "cinematic_max_chance", 0.25f);
 
+    cfg.killCamLongRangeDistance  = ReadIniFloat(iniPath, "killcam_long_range_distance", 40.0f);
+    cfg.detachedKillCamChance     = NormalizeChance(ReadIniFloat(iniPath, "detached_killcam_chance", 1.00f));
+    cfg.bulletKillCamChance       = NormalizeChance(ReadIniFloat(iniPath, "bullet_killcam_chance", 0.70f));
+
     cfg.killCamWaitDuration       = ReadIniFloat(iniPath, "killcam_wait_duration", 3.5f);
     cfg.killCamTransitionDuration = ReadIniFloat(iniPath, "killcam_transition_duration", 1.5f);
-    cfg.killCamAttachedDuration   = ReadIniFloat(iniPath, "killcam_attached_duration", 4.0f);
+    cfg.killCamAttachedDuration   = ReadIniFloat(iniPath, "killcam_attached_duration", 3.0f);
     cfg.killCamSlideHeight        = ReadIniFloat(iniPath, "killcam_slide_height", 0.8f);
 
-    cfg.killCooldown              = ReadIniFloat(iniPath, "kill_cooldown", 15.0f);
+    cfg.detachedKillCamFollowDuration     = ReadIniFloat(iniPath, "detached_killcam_follow_duration", 2.5f);
+    cfg.detachedKillCamRepositionDuration = ReadIniFloat(iniPath, "detached_killcam_reposition_duration", 2.5f);
+    cfg.detachedKillCamHoldDuration       = ReadIniFloat(iniPath, "detached_killcam_hold_duration", 3.0f);
+    cfg.detachedKillCamMinHeight          = ReadIniFloat(iniPath, "detached_killcam_min_height", 3.0f);
+    cfg.detachedKillCamMaxHeight          = ReadIniFloat(iniPath, "detached_killcam_max_height", 12.0f);
+    cfg.detachedKillCamMinRadius          = ReadIniFloat(iniPath, "detached_killcam_min_radius", 6.0f);
+    cfg.detachedKillCamMaxRadius          = ReadIniFloat(iniPath, "detached_killcam_max_radius", 22.0f);
+    cfg.detachedKillCamMinClearance       = ReadIniFloat(iniPath, "detached_killcam_min_clearance", 1.0f);
+    cfg.killLookLockAdvance               = ReadIniFloat(iniPath, "kill_look_lock_advance", 3.0f);
+
+    cfg.killCooldown              = ReadIniFloat(iniPath, "kill_cooldown", 6.0f);
+    cfg.killInterruptMinHold      = ReadIniFloat(iniPath, "kill_interrupt_min_hold", 4.0f);
     cfg.flagLostGracePeriod       = ReadIniFloat(iniPath, "flag_lost_grace_period", 7.0f);
+    cfg.flagCampingDistance       = ReadIniFloat(iniPath, "flag_camping_distance", 2.0f);
+    cfg.flagCampingWindow         = ReadIniFloat(iniPath, "flag_camping_window", 10.0f);
+    cfg.flagCampingGlimpseDuration = ReadIniFloat(iniPath, "flag_camping_glimpse_duration", 5.0f);
+    cfg.flagCampingGlimpseInterval = ReadIniFloat(iniPath, "flag_camping_glimpse_interval", 35.0f);
 
     cfg.worldCamMaxDistance       = ReadIniFloat(iniPath, "worldcam_max_distance", 22.0f);
     cfg.worldCamSwitchCooldown    = ReadIniFloat(iniPath, "worldcam_switch_cooldown", 12.0f);
@@ -269,12 +322,12 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.droneLookSmooth           = ReadIniFloat(iniPath, "drone_look_smooth", 0.08f);
     cfg.droneHoldDuration         = ReadIniFloat(iniPath, "drone_hold_duration", 8.0f);
     cfg.droneIdleTimeout          = ReadIniFloat(iniPath, "drone_idle_timeout", 15.0f);
-    cfg.camSharePlayer            = ReadIniFloat(iniPath, "cam_share_player", 0.12f);
-    cfg.camShareWorld             = ReadIniFloat(iniPath, "cam_share_world", 0.80f);
+    cfg.camSharePlayer            = ReadIniFloat(iniPath, "cam_share_player", 0.04f);
+    cfg.camShareWorld             = ReadIniFloat(iniPath, "cam_share_world", 0.88f);
     cfg.camShareDrone             = ReadIniFloat(iniPath, "cam_share_drone", 0.08f);
-    cfg.camMinHoldPlayer          = ReadIniFloat(iniPath, "cam_min_hold_player", 14.0f);
-    cfg.camMinHoldWorld           = ReadIniFloat(iniPath, "cam_min_hold_world", 20.0f);
-    cfg.camMinHoldDrone           = ReadIniFloat(iniPath, "cam_min_hold_drone", 20.0f);
+    cfg.camMinHoldPlayer          = ReadIniFloat(iniPath, "cam_min_hold_player", 8.0f);
+    cfg.camMinHoldWorld           = ReadIniFloat(iniPath, "cam_min_hold_world", 12.0f);
+    cfg.camMinHoldDrone           = ReadIniFloat(iniPath, "cam_min_hold_drone", 16.0f);
     cfg.droneMinAreaClearance     = ReadIniFloat(iniPath, "drone_min_area_clearance", 5.0f);
 
     cfg.droneGridResolution       = ReadIniFloat(iniPath, "drone_grid_resolution", 1.0f);

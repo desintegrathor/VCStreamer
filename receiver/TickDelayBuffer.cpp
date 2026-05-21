@@ -143,6 +143,7 @@ static unsigned int __cdecl Hooked_NET_ReadMessages(
         // Scan raw buffer for kill/flag messages before any splitting
         ScanBufferForKills(rawBuf, rawSize);
         ScanBufferForFlags(rawBuf, rawSize);
+        ScanBufferForPlayerPositions(rawBuf, rawSize);
 
         // Pass through ALL messages until spectator has fully spawned
         // mpSubState must reach 10 (spectator spawned) before we start buffering

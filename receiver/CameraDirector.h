@@ -13,15 +13,39 @@ struct CameraConfig {
     float cinematicMinChance       = 0.05f;
     float cinematicMaxChance       = 0.25f;
 
+    // Range-split KillCam selection
+    float killCamLongRangeDistance  = 40.0f;
+    float detachedKillCamChance     = 1.00f;
+    float bulletKillCamChance       = 0.70f;
+
     // KillCam timing (seconds)
     float killCamWaitDuration      = 3.5f;
     float killCamTransitionDuration = 1.5f;
-    float killCamAttachedDuration  = 4.0f;
+    float killCamAttachedDuration  = 3.0f;
     float killCamSlideHeight       = 0.8f;
 
+    // Close/mid 3PV victim-look KillCam timing.
+    // Kept under detached_* INI names for compatibility with existing configs.
+    float detachedKillCamFollowDuration     = 2.5f;
+    float detachedKillCamRepositionDuration = 2.5f;
+    float detachedKillCamHoldDuration       = 3.0f;
+    float detachedKillCamMinHeight          = 3.0f;
+    float detachedKillCamMaxHeight          = 12.0f;
+    float detachedKillCamMinRadius          = 6.0f;
+    float detachedKillCamMaxRadius          = 22.0f;
+    float detachedKillCamMinClearance       = 1.0f;
+    float killLookLockAdvance               = 3.0f;
+
     // Cooldowns (seconds)
-    float killCooldown             = 15.0f;
+    float killCooldown             = 6.0f;
+    float killInterruptMinHold     = 4.0f;
     float flagLostGracePeriod      = 7.0f;
+
+    // Flag carrier camping behavior
+    float flagCampingDistance      = 2.0f;
+    float flagCampingWindow        = 10.0f;
+    float flagCampingGlimpseDuration = 5.0f;
+    float flagCampingGlimpseInterval = 35.0f;
 
     // World camera
     float worldCamMaxDistance       = 22.0f;
@@ -55,14 +79,14 @@ struct CameraConfig {
     float droneIdleTimeout         = 2.0f;
 
     // Camera budget shares (normalized at runtime)
-    float camSharePlayer           = 0.12f;  // target share for player/FPV camera
-    float camShareWorld            = 0.80f;  // target share for world cameras
+    float camSharePlayer           = 0.04f;  // target share for player/FPV camera
+    float camShareWorld            = 0.88f;  // target share for world cameras
     float camShareDrone            = 0.08f;  // target share for drone
 
     // Min hold times (seconds) before voluntary switch
-    float camMinHoldPlayer         = 14.0f;
-    float camMinHoldWorld          = 20.0f;
-    float camMinHoldDrone          = 20.0f;
+    float camMinHoldPlayer         = 8.0f;
+    float camMinHoldWorld          = 12.0f;
+    float camMinHoldDrone          = 16.0f;
 
     // Drone area clearance threshold
     float droneMinAreaClearance    = 5.0f;   // avg clearance needed for drone activation
@@ -101,6 +125,11 @@ enum class KillCamPhase {
     Attached
 };
 
+enum class KillCamStyle {
+    DetachedVantage, // close/mid 3PV victim-look lock
+    BulletTravel
+};
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -118,12 +147,17 @@ void CameraDirector_Update();
 // State query (called by Hooked_FillCamera to know what to render)
 CameraState CameraDirector_GetState();
 KillCamPhase CameraDirector_GetKillCamPhase();
+KillCamStyle CameraDirector_GetKillCamStyle();
 int CameraDirector_GetTargetHandle();
 int CameraDirector_GetKillCamKillerHandle();
 int CameraDirector_GetKillCamVictimHandle();
 float CameraDirector_GetKillCamElapsed();
 const CameraConfig& CameraDirector_GetConfig();
 bool CameraDirector_ShouldUseFpv();
+bool CameraDirector_GetFlagCarrierKillLook(int* killerHandle,
+                                           int* victimHandle,
+                                           float* elapsed,
+                                           float* duration);
 
 // Config loading (implemented in DelayManager.cpp, follows existing INI pattern)
 void LoadCameraDirectorConfig(CameraConfig& config);

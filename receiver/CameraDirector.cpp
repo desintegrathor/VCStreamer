@@ -3,6 +3,7 @@
 #include "DelayManager.h"
 #include "DroneCamera.h"
 #include "PathGrid.h"
+#include "RealtimeHook.h"
 #include "SpectatorController.h"
 #include "WorldCameraTracker.h"
 #include <iostream>
@@ -27,13 +28,14 @@ static int g_currentTargetHandle = 0;
 static DWORD g_shotHoldUntil = 0;
 static bool g_currentShotUseFpv = false;
 
-static constexpr float NORMAL_SHOT_MIN_HOLD_SEC = 20.0f;
-static constexpr float NORMAL_SHOT_MAX_HOLD_SEC = 25.0f;
+static constexpr float NORMAL_SHOT_MIN_HOLD_SEC = 12.0f;
+static constexpr float NORMAL_SHOT_MAX_HOLD_SEC = 18.0f;
 static constexpr float FLAG_ALTERNATE_MIN_SEC = 8.0f;
 static constexpr float FLAG_ALTERNATE_MAX_SEC = 12.0f;
 
 // KillCam state
 static KillCamPhase g_killCamPhase = KillCamPhase::Wait;
+static KillCamStyle g_kcStyle = KillCamStyle::BulletTravel;
 static int g_kcKillerHandle = 0;
 static int g_kcVictimHandle = 0;
 static DWORD g_kcStartTick = 0;
@@ -43,6 +45,22 @@ static int g_flagCarrierUS = 0;
 static int g_flagCarrierVC = 0;
 static DWORD g_flagAlternateTimer = 0;
 static float g_flagAlternateDelay = 10.0f;
+static int g_flagKillLookKillerHandle = 0;
+static int g_flagKillLookVictimHandle = 0;
+static DWORD g_flagKillLookStartTick = 0;
+static DWORD g_flagKillLookKillTick = 0;
+struct FlagCarrierMotion {
+    int handle = 0;
+    bool initialized = false;
+    bool camping = false;
+    float anchorPos[3] = {};
+    DWORD anchorTick = 0;
+    DWORD lastGlimpseTick = 0;
+};
+static FlagCarrierMotion g_flagMotionUS;
+static FlagCarrierMotion g_flagMotionVC;
+static int g_flagCampingGlimpseHandle = 0;
+static DWORD g_flagCampingGlimpseUntil = 0;
 
 // Cooldowns
 static DWORD g_lastKillSwitch = 0;
@@ -60,6 +78,16 @@ static DWORD g_lastUpdateTick = 0;
 static DWORD g_currentHoldStart = 0;
 static DWORD g_lastScreenTimeLog = 0;
 
+struct PlayerActivity {
+    int handle = 0;
+    bool initialized = false;
+    float lastPos[3] = {};
+    DWORD lastSeen = 0;
+    float score = 0.0f;
+};
+
+static PlayerActivity g_playerActivity[64];
+
 // Camera type enum for deficit scheduler
 enum CamBudgetType { CAM_PLAYER = 0, CAM_WORLD = 1, CAM_DRONE = 2 };
 
@@ -75,6 +103,7 @@ struct ShotRequest {
     ShotKind kind;
     int targetHandle;
     int victimHandle;
+    KillCamStyle killCamStyle;
     CamBudgetType preference;
     float holdSeconds;
     bool force;
@@ -151,11 +180,243 @@ static bool CD_IsUsablePlayerHandle(int handle) {
     return CD_IsUsablePlayerEntry(CD_FindPlayerEntryByHandle(handle));
 }
 
+static float Clamp01(float value) {
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+static float PosDistance(const float* a, const float* b) {
+    float dx = a[0] - b[0];
+    float dy = a[1] - b[1];
+    float dz = a[2] - b[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+static void BumpPlayerActivity(int handle, float amount) {
+    if (handle == 0) return;
+    for (PlayerActivity& activity : g_playerActivity) {
+        if (activity.initialized && activity.handle == handle) {
+            activity.score = Clamp01(activity.score + amount);
+            activity.lastSeen = GetTickCount();
+            return;
+        }
+    }
+}
+
+static void UpdatePlayerActivity(DWORD now) {
+    if (!g_gameBase) return;
+
+    void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
+    for (int i = 0; i < 64; ++i) {
+        PlayerActivity& activity = g_playerActivity[i];
+        void* entry = playerTable[i];
+
+        if (!CD_IsUsablePlayerEntry(entry)) {
+            if (activity.initialized && now - activity.lastSeen > 5000) {
+                activity.score *= 0.8f;
+                if (activity.score < 0.01f) {
+                    activity = PlayerActivity();
+                }
+            }
+            continue;
+        }
+
+        int handle = *(int*)entry;
+        void* entity = (void*)*(uintptr_t*)((uintptr_t)entry + 244);
+        float pos[3];
+        CD_GetEntityPos(entity, pos);
+
+        if (!activity.initialized || activity.handle != handle) {
+            activity.handle = handle;
+            activity.initialized = true;
+            activity.lastPos[0] = pos[0];
+            activity.lastPos[1] = pos[1];
+            activity.lastPos[2] = pos[2];
+            activity.lastSeen = now;
+            activity.score = 0.0f;
+            continue;
+        }
+
+        float dt = (now - activity.lastSeen) / 1000.0f;
+        if (dt > 0.001f && dt < 2.0f) {
+            float moved = PosDistance(pos, activity.lastPos);
+            float speed = moved / dt;
+            float movementScore = Clamp01((speed - 0.12f) / 1.4f);
+            float decay = expf(-dt * 0.35f);
+            activity.score *= decay;
+            if (movementScore > activity.score) {
+                activity.score += (movementScore - activity.score) * 0.6f;
+            }
+        } else if (dt >= 2.0f) {
+            activity.score *= 0.5f;
+        }
+
+        activity.lastPos[0] = pos[0];
+        activity.lastPos[1] = pos[1];
+        activity.lastPos[2] = pos[2];
+        activity.lastSeen = now;
+    }
+}
+
+static float ActivityScoreForTableIndex(int index, int handle) {
+    if (index < 0 || index >= 64) return 0.0f;
+    const PlayerActivity& activity = g_playerActivity[index];
+    if (!activity.initialized || activity.handle != handle) return 0.0f;
+    if (GetTickCount() - activity.lastSeen > 10000) return 0.0f;
+    return activity.score;
+}
+
+static float ActivityScoreForHandle(int handle) {
+    if (handle == 0) return 0.0f;
+    for (int i = 0; i < 64; ++i) {
+        if (g_playerActivity[i].initialized && g_playerActivity[i].handle == handle) {
+            return ActivityScoreForTableIndex(i, handle);
+        }
+    }
+    return 0.0f;
+}
+
+static void ClearFlagCampingGlimpse() {
+    g_flagCampingGlimpseHandle = 0;
+    g_flagCampingGlimpseUntil = 0;
+}
+
+static bool ReadPlayerPosition(int handle, float out[3]) {
+    void* entity = CD_FindEntityByHandle(handle);
+    if (!entity) return false;
+    CD_GetEntityPos(entity, out);
+    return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);
+}
+
+static void UpdateFlagCarrierMotionState(FlagCarrierMotion& motion,
+                                         int handle,
+                                         DWORD now,
+                                         const char* label) {
+    if (handle == 0 || !CD_IsUsablePlayerHandle(handle)) {
+        if (motion.initialized) {
+            motion = FlagCarrierMotion();
+        }
+        return;
+    }
+
+    float pos[3];
+    if (!ReadPlayerPosition(handle, pos)) return;
+
+    if (!motion.initialized || motion.handle != handle) {
+        motion.handle = handle;
+        motion.initialized = true;
+        motion.camping = false;
+        motion.anchorPos[0] = pos[0];
+        motion.anchorPos[1] = pos[1];
+        motion.anchorPos[2] = pos[2];
+        motion.anchorTick = now;
+        motion.lastGlimpseTick = now;
+        return;
+    }
+
+    float moved = PosDistance(pos, motion.anchorPos);
+    float elapsed = (now - motion.anchorTick) / 1000.0f;
+    float window = g_config.flagCampingWindow;
+    if (window < 1.0f) window = 1.0f;
+
+    if (motion.camping && moved >= g_config.flagCampingDistance) {
+        motion.camping = false;
+        motion.anchorPos[0] = pos[0];
+        motion.anchorPos[1] = pos[1];
+        motion.anchorPos[2] = pos[2];
+        motion.anchorTick = now;
+        motion.lastGlimpseTick = now;
+        std::cout << "[CameraDirector] Flag carrier moving again "
+                  << label << "=" << handle << " moved=" << moved << "m\n";
+        return;
+    }
+
+    if (elapsed >= window) {
+        bool isCamping = moved < g_config.flagCampingDistance;
+        if (isCamping && !motion.camping) {
+            motion.camping = true;
+            motion.lastGlimpseTick = now;
+            std::cout << "[CameraDirector] Flag carrier camping "
+                      << label << "=" << handle << " moved=" << moved
+                      << "m/" << (int)window << "s\n";
+        } else if (!isCamping && motion.camping) {
+            motion.camping = false;
+            motion.lastGlimpseTick = now;
+            std::cout << "[CameraDirector] Flag carrier moving again "
+                      << label << "=" << handle << " moved=" << moved << "m\n";
+        }
+
+        motion.anchorPos[0] = pos[0];
+        motion.anchorPos[1] = pos[1];
+        motion.anchorPos[2] = pos[2];
+        motion.anchorTick = now;
+    }
+}
+
+static void UpdateFlagCarrierMotion(DWORD now) {
+    UpdateFlagCarrierMotionState(g_flagMotionUS, g_flagCarrierUS, now, "US");
+    UpdateFlagCarrierMotionState(g_flagMotionVC, g_flagCarrierVC, now, "VC");
+}
+
+static bool IsCampingFlagCarrier(int handle) {
+    if (handle == 0) return false;
+    return (g_flagMotionUS.initialized && g_flagMotionUS.handle == handle && g_flagMotionUS.camping)
+        || (g_flagMotionVC.initialized && g_flagMotionVC.handle == handle && g_flagMotionVC.camping);
+}
+
+static FlagCarrierMotion* FlagMotionForHandle(int handle) {
+    if (g_flagMotionUS.initialized && g_flagMotionUS.handle == handle) return &g_flagMotionUS;
+    if (g_flagMotionVC.initialized && g_flagMotionVC.handle == handle) return &g_flagMotionVC;
+    return nullptr;
+}
+
+static int PickMovingFlagCarrierTarget() {
+    bool usMoving = g_flagCarrierUS != 0
+        && CD_IsUsablePlayerHandle(g_flagCarrierUS)
+        && !IsCampingFlagCarrier(g_flagCarrierUS);
+    bool vcMoving = g_flagCarrierVC != 0
+        && CD_IsUsablePlayerHandle(g_flagCarrierVC)
+        && !IsCampingFlagCarrier(g_flagCarrierVC);
+
+    if (usMoving && vcMoving) {
+        return (g_currentTargetHandle == g_flagCarrierUS) ? g_flagCarrierVC : g_flagCarrierUS;
+    }
+    if (usMoving) return g_flagCarrierUS;
+    if (vcMoving) return g_flagCarrierVC;
+    return 0;
+}
+
+static bool HasActiveAlternative(int avoidHandle) {
+    if (!g_gameBase) return false;
+
+    void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
+    for (int i = 0; i < 64; ++i) {
+        void* entry = playerTable[i];
+        if (!CD_IsUsablePlayerEntry(entry)) continue;
+
+        int handle = *(int*)entry;
+        if (handle == avoidHandle) continue;
+        if (IsCampingFlagCarrier(handle)) continue;
+        if (ActivityScoreForTableIndex(i, handle) >= 0.12f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int PickRandomActivePlayer(int avoidHandle) {
     if (!g_gameBase) return 0;
 
-    std::vector<int> handles;
-    handles.reserve(64);
+    struct Candidate {
+        int handle;
+        float activity;
+    };
+
+    std::vector<Candidate> candidates;
+    std::vector<Candidate> fallbackCandidates;
+    candidates.reserve(64);
+    fallbackCandidates.reserve(64);
 
     void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
     for (int i = 0; i < 64; ++i) {
@@ -164,16 +425,59 @@ static int PickRandomActivePlayer(int avoidHandle) {
 
         int handle = *(int*)entry;
         if (handle != avoidHandle) {
-            handles.push_back(handle);
+            Candidate candidate = { handle, ActivityScoreForTableIndex(i, handle) };
+            if (IsCampingFlagCarrier(handle)) {
+                fallbackCandidates.push_back(candidate);
+            } else {
+                candidates.push_back(candidate);
+            }
         }
     }
 
-    if (handles.empty() && avoidHandle != 0 && CD_IsUsablePlayerHandle(avoidHandle)) {
+    if (candidates.empty() && !fallbackCandidates.empty()) {
+        candidates.swap(fallbackCandidates);
+    }
+
+    if (candidates.empty() && avoidHandle != 0 && CD_IsUsablePlayerHandle(avoidHandle)) {
         return avoidHandle;
     }
-    if (handles.empty()) return 0;
+    if (candidates.empty()) return 0;
 
-    return handles[(size_t)(rand() % (int)handles.size())];
+    bool hasActiveCandidate = false;
+    for (const Candidate& candidate : candidates) {
+        if (candidate.activity >= 0.12f) {
+            hasActiveCandidate = true;
+            break;
+        }
+    }
+
+    float totalWeight = 0.0f;
+    for (const Candidate& candidate : candidates) {
+        if (hasActiveCandidate && candidate.activity < 0.04f) {
+            continue;
+        }
+        totalWeight += hasActiveCandidate
+            ? (0.05f + candidate.activity * candidate.activity * 8.0f)
+            : 1.0f;
+    }
+
+    if (totalWeight <= 0.001f) {
+        return candidates[(size_t)(rand() % (int)candidates.size())].handle;
+    }
+
+    float pick = ((float)(rand() % 10000) / 10000.0f) * totalWeight;
+    for (const Candidate& candidate : candidates) {
+        if (hasActiveCandidate && candidate.activity < 0.04f) {
+            continue;
+        }
+        float weight = hasActiveCandidate
+            ? (0.05f + candidate.activity * candidate.activity * 8.0f)
+            : 1.0f;
+        if (pick <= weight) return candidate.handle;
+        pick -= weight;
+    }
+
+    return candidates.back().handle;
 }
 
 static float RandomRange(float minValue, float maxValue) {
@@ -203,10 +507,7 @@ static bool IsShotHoldActive(DWORD now) {
 }
 
 static bool RollFpvForShot() {
-    int chance = DelayManager::GetFpvChance();
-    if (chance <= 0) return false;
-    if (chance >= 100) return true;
-    return (rand() % 100) < chance;
+    return false;
 }
 
 static bool CurrentViewUsable() {
@@ -228,6 +529,42 @@ static bool CurrentHasGoodWorldView() {
 // ============================================================================
 // Distance-Based Cinematic Chance
 // ============================================================================
+
+static bool GetCurrentPlayerPosition(int handle, float* out) {
+    void* entity = CD_FindEntityByHandle(handle);
+    if (!entity) return false;
+
+    CD_GetEntityPos(entity, out);
+    return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);
+}
+
+static bool GetBestKillPosition(int handle, float* out, bool* usedPredicted) {
+    if (usedPredicted) *usedPredicted = false;
+
+    if (RealtimeHook_GetPredictedPlayerPosition(handle, out, 7000)) {
+        if (usedPredicted) *usedPredicted = true;
+        return true;
+    }
+
+    return GetCurrentPlayerPosition(handle, out);
+}
+
+static float GetKillDistance(int killerHandle, int victimHandle, bool* usedPredicted) {
+    if (usedPredicted) *usedPredicted = false;
+
+    bool killerPredicted = false;
+    bool victimPredicted = false;
+    float kp[3], vp[3];
+    if (!GetBestKillPosition(killerHandle, kp, &killerPredicted)) return 0.0f;
+    if (!GetBestKillPosition(victimHandle, vp, &victimPredicted)) return 0.0f;
+
+    if (usedPredicted) *usedPredicted = killerPredicted || victimPredicted;
+
+    float dx = kp[0] - vp[0];
+    float dy = kp[1] - vp[1];
+    float dz = kp[2] - vp[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
 
 static float GetKillDistance(int killerHandle, int victimHandle) {
     void* killerEntity = CD_FindEntityByHandle(killerHandle);
@@ -266,21 +603,98 @@ static float GetKillCamElapsedInternal() {
     return (GetTickCount() - g_kcStartTick) / 1000.0f;
 }
 
+static float GetKillCamWaitDuration(KillCamStyle style) {
+    return style == KillCamStyle::DetachedVantage
+        ? g_config.detachedKillCamFollowDuration
+        : g_config.killCamWaitDuration;
+}
+
+static float GetKillCamTransitionDuration(KillCamStyle style) {
+    return style == KillCamStyle::DetachedVantage
+        ? g_config.detachedKillCamRepositionDuration
+        : g_config.killCamTransitionDuration;
+}
+
+static float GetKillCamAttachedDuration(KillCamStyle style) {
+    return style == KillCamStyle::DetachedVantage
+        ? g_config.detachedKillCamHoldDuration
+        : g_config.killCamAttachedDuration;
+}
+
+static float GetKillCamTotalDuration(KillCamStyle style) {
+    return GetKillCamWaitDuration(style)
+         + GetKillCamTransitionDuration(style)
+         + GetKillCamAttachedDuration(style);
+}
+
 static float GetKillCamTotalDuration() {
-    return g_config.killCamWaitDuration
-         + g_config.killCamTransitionDuration
-         + g_config.killCamAttachedDuration;
+    return GetKillCamTotalDuration(g_kcStyle);
 }
 
 static bool IsKillCamInterruptible() {
     float elapsed = GetKillCamElapsedInternal();
-    float waitEnd = g_config.killCamWaitDuration;
-    float transEnd = waitEnd + g_config.killCamTransitionDuration;
+    float waitEnd = GetKillCamWaitDuration(g_kcStyle);
+    float transEnd = waitEnd + GetKillCamTransitionDuration(g_kcStyle);
 
     if (elapsed < waitEnd) return true;
     if (elapsed < transEnd) return false;
     if (elapsed > transEnd + 1.0f) return true;
     return false;
+}
+
+static bool TickReached(DWORD now, DWORD tick) {
+    return (LONG)(now - tick) >= 0;
+}
+
+static float GetKillLookLeadDuration() {
+    return g_config.detachedKillCamFollowDuration
+         + g_config.detachedKillCamRepositionDuration;
+}
+
+static float GetKillLookAdvanceDuration() {
+    float lead = GetKillLookLeadDuration();
+    if (lead < 0.1f) lead = 0.1f;
+
+    float advance = g_config.killLookLockAdvance;
+    if (advance < 0.1f) advance = 0.1f;
+    if (advance > lead) advance = lead;
+    return advance;
+}
+
+static void ClearFlagKillLook() {
+    g_flagKillLookKillerHandle = 0;
+    g_flagKillLookVictimHandle = 0;
+    g_flagKillLookStartTick = 0;
+    g_flagKillLookKillTick = 0;
+}
+
+static void MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD now) {
+    bool victimIsFlagCarrier = (victimHandle != 0)
+        && (victimHandle == g_flagCarrierUS || victimHandle == g_flagCarrierVC);
+    bool watchingVictim = (g_state == CameraState::FlagWatch
+        || g_state == CameraState::FollowPlayer)
+        && g_currentTargetHandle == victimHandle;
+
+    if (!watchingVictim || killerHandle == 0) {
+        return;
+    }
+
+    float leadSeconds = GetKillLookLeadDuration();
+    float advanceSeconds = GetKillLookAdvanceDuration();
+    DWORD leadMs = (DWORD)(leadSeconds * 1000.0f + 0.5f);
+    DWORD advanceMs = (DWORD)(advanceSeconds * 1000.0f + 0.5f);
+    if (leadMs < advanceMs) leadMs = advanceMs;
+
+    g_flagKillLookKillerHandle = killerHandle;
+    g_flagKillLookVictimHandle = victimHandle;
+    g_flagKillLookKillTick = now + leadMs;
+    g_flagKillLookStartTick = g_flagKillLookKillTick - advanceMs;
+
+    std::cout << "[CameraDirector] Victim death look: victim="
+              << victimHandle << " killer=" << killerHandle
+              << " flagCarrier=" << (victimIsFlagCarrier ? "yes" : "no")
+              << " startsIn=" << (int)((leadMs - advanceMs) / 1000)
+              << "s, holds until camera changes\n";
 }
 
 // ============================================================================
@@ -324,6 +738,10 @@ static const char* ShotKindName(ShotKind kind) {
     }
 }
 
+static const char* KillCamStyleName(KillCamStyle style) {
+    return style == KillCamStyle::DetachedVantage ? "victim-lock-3pv" : "bullet";
+}
+
 static bool CurrentCommittedShotUsable() {
     switch (g_state) {
         case CameraState::FollowPlayer:
@@ -356,8 +774,11 @@ static void ClearCommittedShot(DWORD now, const char* reason) {
     g_currentHoldStart = now;
     g_shotHoldUntil = 0;
     g_currentShotUseFpv = false;
+    g_kcStyle = KillCamStyle::BulletTravel;
     g_kcKillerHandle = 0;
     g_kcVictimHandle = 0;
+    ClearFlagKillLook();
+    ClearFlagCampingGlimpse();
     WorldCameraTracker_ClearTarget();
 
     std::cout << "[CameraDirector] Shot cleared: " << (reason ? reason : "none") << "\n";
@@ -379,8 +800,11 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_currentHoldStart = now;
             g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
             g_currentShotUseFpv = RollFpvForShot();
+            g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
             g_kcVictimHandle = 0;
+            ClearFlagKillLook();
+            ClearFlagCampingGlimpse();
 
             SetSpectatorToPlayerId(request.targetHandle);
             WorldCameraTracker_SetTarget(request.targetHandle);
@@ -401,6 +825,7 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_committedShotKind = ShotKind::KillCam;
             g_committedPreference = CAM_WORLD;
             g_killCamPhase = KillCamPhase::Wait;
+            g_kcStyle = request.killCamStyle;
             g_kcKillerHandle = request.targetHandle;
             g_kcVictimHandle = request.victimHandle;
             g_kcStartTick = now;
@@ -408,13 +833,16 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_currentHoldStart = now;
             g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
             g_currentShotUseFpv = false;
+            ClearFlagKillLook();
+            ClearFlagCampingGlimpse();
 
             SetSpectatorToPlayerId(request.targetHandle);
             WorldCameraTracker_SetTarget(request.targetHandle);
-            WorldCameraTracker_SetPreference(0);
+            WorldCameraTracker_SetPreference(g_kcStyle == KillCamStyle::DetachedVantage ? 2 : 0);
 
             std::cout << "[CameraDirector] Commit killcam killer=" << request.targetHandle
                       << " victim=" << request.victimHandle
+                      << " style=" << KillCamStyleName(g_kcStyle)
                       << " reason=" << (request.reason ? request.reason : "none") << "\n";
             return true;
         }
@@ -429,8 +857,15 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_currentHoldStart = now;
             g_shotHoldUntil = 0;
             g_currentShotUseFpv = RollFpvForShot();
+            g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
             g_kcVictimHandle = 0;
+            if (g_flagKillLookVictimHandle != request.targetHandle) {
+                ClearFlagKillLook();
+            }
+            if (g_flagCampingGlimpseHandle != request.targetHandle) {
+                ClearFlagCampingGlimpse();
+            }
 
             SetSpectatorToPlayerId(request.targetHandle);
             WorldCameraTracker_SetTarget(request.targetHandle);
@@ -467,8 +902,11 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_currentHoldStart = now;
             g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
             g_currentShotUseFpv = false;
+            g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
             g_kcVictimHandle = 0;
+            ClearFlagKillLook();
+            ClearFlagCampingGlimpse();
 
             WorldCameraTracker_SetTarget(request.targetHandle);
             WorldCameraTracker_SetPreference(-1);
@@ -517,6 +955,7 @@ static bool RequestFollowPlayerShot(int targetHandle,
         ShotKind::FollowPlayer,
         targetHandle,
         0,
+        KillCamStyle::BulletTravel,
         preference,
         NormalFollowHoldSeconds(preference),
         force,
@@ -527,6 +966,7 @@ static bool RequestFollowPlayerShot(int targetHandle,
 
 static bool RequestKillCamShot(int killerHandle,
                                int victimHandle,
+                               KillCamStyle style,
                                bool force,
                                const char* reason,
                                DWORD now) {
@@ -534,8 +974,9 @@ static bool RequestKillCamShot(int killerHandle,
         ShotKind::KillCam,
         killerHandle,
         victimHandle,
+        style,
         CAM_WORLD,
-        GetKillCamTotalDuration(),
+        GetKillCamTotalDuration(style),
         force,
         reason
     };
@@ -549,12 +990,54 @@ static bool RequestFlagWatchShot(int carrierHandle,
         ShotKind::FlagWatch,
         carrierHandle,
         0,
+        KillCamStyle::BulletTravel,
         CAM_WORLD,
         0.0f,
         true,
         reason
     };
     return RequestShot(request, now);
+}
+
+static bool RequestFlagCampingGlimpse(int carrierHandle, DWORD now) {
+    FlagCarrierMotion* motion = FlagMotionForHandle(carrierHandle);
+    if (!motion || !motion->camping) return false;
+
+    g_flagCampingGlimpseHandle = carrierHandle;
+    g_flagCampingGlimpseUntil = HoldUntil(now, g_config.flagCampingGlimpseDuration);
+    motion->lastGlimpseTick = now;
+
+    if (!RequestFlagWatchShot(carrierHandle, "flag camper glimpse", now)) {
+        ClearFlagCampingGlimpse();
+        return false;
+    }
+
+    return true;
+}
+
+static bool TryStartFlagCampingGlimpse(DWORD now) {
+    if (g_state == CameraState::KillCam) return false;
+    if (g_state == CameraState::FlagWatch) return false;
+    if (PickMovingFlagCarrierTarget() != 0) return false;
+
+    float interval = g_config.flagCampingGlimpseInterval;
+    if (interval < g_config.flagCampingGlimpseDuration + 1.0f) {
+        interval = g_config.flagCampingGlimpseDuration + 1.0f;
+    }
+    DWORD intervalMs = (DWORD)(interval * 1000.0f);
+
+    FlagCarrierMotion* motions[2] = { &g_flagMotionUS, &g_flagMotionVC };
+    for (FlagCarrierMotion* motion : motions) {
+        if (!motion->initialized || !motion->camping) continue;
+        if (!CD_IsUsablePlayerHandle(motion->handle)) continue;
+        if (now - motion->lastGlimpseTick < intervalMs) continue;
+
+        std::cout << "[CameraDirector] Showing camping flag carrier briefly handle="
+                  << motion->handle << "\n";
+        return RequestFlagCampingGlimpse(motion->handle, now);
+    }
+
+    return false;
 }
 
 static bool RequestDroneShot(int targetHandle,
@@ -565,6 +1048,7 @@ static bool RequestDroneShot(int targetHandle,
         ShotKind::Drone,
         targetHandle,
         0,
+        KillCamStyle::BulletTravel,
         CAM_DRONE,
         g_config.camMinHoldDrone,
         force,
@@ -637,7 +1121,10 @@ static CamBudgetType GetHighestDeficitType() {
 
 static bool StartNextScheduledShot(DWORD now, const char* reason) {
     CamBudgetType needed = GetHighestDeficitType();
-    int currentTarget = CD_IsUsablePlayerHandle(g_currentTargetHandle) ? g_currentTargetHandle : 0;
+    int currentTarget = CD_IsUsablePlayerHandle(g_currentTargetHandle)
+        && !IsCampingFlagCarrier(g_currentTargetHandle)
+        ? g_currentTargetHandle
+        : 0;
 
     if (needed == CAM_DRONE) {
         int droneTarget = currentTarget != 0 ? currentTarget : PickRandomActivePlayer(0);
@@ -660,8 +1147,8 @@ static bool StartNextScheduledShot(DWORD now, const char* reason) {
 
 static void UpdateKillCamPhase() {
     float elapsed = GetKillCamElapsedInternal();
-    float waitEnd = g_config.killCamWaitDuration;
-    float transEnd = waitEnd + g_config.killCamTransitionDuration;
+    float waitEnd = GetKillCamWaitDuration(g_kcStyle);
+    float transEnd = waitEnd + GetKillCamTransitionDuration(g_kcStyle);
     float totalEnd = GetKillCamTotalDuration();
 
     if (elapsed < waitEnd) {
@@ -684,14 +1171,13 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle) {
 
     DWORD now = GetTickCount();
     g_lastEventTick = now;
+    UpdatePlayerActivity(now);
+    BumpPlayerActivity(killerHandle, 0.8f);
+    BumpPlayerActivity(victimHandle, 0.4f);
+    MaybeStartVictimKillLook(killerHandle, victimHandle, now);
 
     if (g_state == CameraState::FlagWatch) {
         std::cout << "[CameraDirector] Kill ignored: flag shot committed\n";
-        return;
-    }
-
-    if (IsCommittedShotLocked(now)) {
-        std::cout << "[CameraDirector] Kill ignored: committed shot hold active\n";
         return;
     }
 
@@ -705,21 +1191,42 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle) {
         return;
     }
 
-    // Measure kill distance
-    float distance = GetKillDistance(killerHandle, victimHandle);
+    // Measure kill distance against live packet positions when available.
+    bool usedPredictedPosition = false;
+    float distance = GetKillDistance(killerHandle, victimHandle, &usedPredictedPosition);
+    KillCamStyle style = (distance >= g_config.killCamLongRangeDistance)
+        ? KillCamStyle::BulletTravel
+        : KillCamStyle::DetachedVantage;
 
-    // Compute cinematic chance based on distance
-    float chance = ComputeCinematicChance(distance);
+    float chance = (style == KillCamStyle::BulletTravel)
+        ? g_config.bulletKillCamChance
+        : g_config.detachedKillCamChance;
     bool cinematic = RollCinematic(chance);
+    bool locked = IsCommittedShotLocked(now);
+    float heldSeconds = (now - g_currentHoldStart) / 1000.0f;
+    bool canInterruptHold = locked
+        && cinematic
+        && heldSeconds >= g_config.killInterruptMinHold;
 
     std::cout << "[CameraDirector] Kill: killer=" << killerHandle
               << " victim=" << victimHandle
               << " distance=" << distance << "m"
-              << " cinematicChance=" << (int)(chance * 100) << "%"
+              << " predicted=" << (usedPredictedPosition ? "yes" : "no")
+              << " style=" << KillCamStyleName(style)
+              << " chance=" << (int)(chance * 100) << "%"
+              << " locked=" << (locked ? "yes" : "no")
               << " result=" << (cinematic ? "CINEMATIC" : "NORMAL") << "\n";
 
+    if (locked && !canInterruptHold) {
+        std::cout << "[CameraDirector] Kill ignored: committed shot hold active\n";
+        return;
+    }
+
     if (cinematic) {
-        if (RequestKillCamShot(killerHandle, victimHandle, false, "cinematic kill", now)) {
+        bool force = canInterruptHold;
+        if (RequestKillCamShot(killerHandle, victimHandle, style, force,
+                               force ? "cinematic kill interrupt" : "cinematic kill",
+                               now)) {
             g_lastKillSwitch = now;
         }
     } else if (CD_IsUsablePlayerHandle(killerHandle)) {
@@ -735,6 +1242,10 @@ void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier) {
     g_flagCarrierUS = usCarrier;
     g_flagCarrierVC = vcCarrier;
     g_lastEventTick = GetTickCount();
+    UpdatePlayerActivity(g_lastEventTick);
+    BumpPlayerActivity(usCarrier, 0.6f);
+    BumpPlayerActivity(vcCarrier, 0.6f);
+    UpdateFlagCarrierMotion(g_lastEventTick);
 
     bool anyFlag = (usCarrier != 0 || vcCarrier != 0);
 
@@ -780,6 +1291,42 @@ void CameraDirector_Update() {
     std::lock_guard<std::mutex> lock(g_directorMutex);
 
     DWORD now = GetTickCount();
+    UpdatePlayerActivity(now);
+    UpdateFlagCarrierMotion(now);
+
+    if (g_flagCampingGlimpseHandle != 0
+        && TickReached(now, g_flagCampingGlimpseUntil)) {
+        int glimpseHandle = g_flagCampingGlimpseHandle;
+        ClearFlagCampingGlimpse();
+        if (g_state == CameraState::FlagWatch
+            && g_currentTargetHandle == glimpseHandle
+            && IsCampingFlagCarrier(glimpseHandle)) {
+            ClearCommittedShot(now, "flag camper glimpse complete");
+            StartNextScheduledShot(now, "flag camper glimpse complete");
+        }
+    }
+
+    int movingFlagTarget = PickMovingFlagCarrierTarget();
+    bool canInterruptForMovingFlag = !(g_state == CameraState::KillCam
+        && !IsKillCamInterruptible());
+    if (movingFlagTarget != 0
+        && canInterruptForMovingFlag
+        && (g_state != CameraState::FlagWatch
+            || g_currentTargetHandle != movingFlagTarget)) {
+        ClearFlagCampingGlimpse();
+        RequestFlagWatchShot(movingFlagTarget, "flag carrier moving", now);
+    } else if (movingFlagTarget == 0) {
+        TryStartFlagCampingGlimpse(now);
+    }
+
+    if (g_flagKillLookKillTick != 0) {
+        bool watchingVictim = (g_state == CameraState::FlagWatch
+            || g_state == CameraState::FollowPlayer)
+            && g_currentTargetHandle == g_flagKillLookVictimHandle;
+        if (!watchingVictim) {
+            ClearFlagKillLook();
+        }
+    }
 
     // --- Screen time accumulation ---
     if (g_lastUpdateTick != 0) {
@@ -831,6 +1378,18 @@ void CameraDirector_Update() {
                 }
             }
 
+            if (IsCampingFlagCarrier(g_currentTargetHandle)) {
+                bool inGlimpse = g_flagCampingGlimpseHandle == g_currentTargetHandle
+                    && g_flagCampingGlimpseUntil != 0
+                    && !TickReached(now, g_flagCampingGlimpseUntil);
+                if (!inGlimpse) {
+                    ClearFlagCampingGlimpse();
+                    ClearCommittedShot(now, "flag carrier camping");
+                    StartNextScheduledShot(now, "flag carrier camping");
+                }
+                break;
+            }
+
             // Handle dual-flag alternation.
             if (g_flagCarrierUS != 0 && g_flagCarrierVC != 0) {
                 float elapsed = (now - g_flagAlternateTimer) / 1000.0f;
@@ -873,6 +1432,19 @@ void CameraDirector_Update() {
                 break;
             }
 
+            if (noFlagPriority && g_state == CameraState::FollowPlayer && currentTargetUsable) {
+                float heldSeconds = (now - g_currentHoldStart) / 1000.0f;
+                float currentActivity = ActivityScoreForHandle(g_currentTargetHandle);
+                if (heldSeconds >= 8.0f
+                    && currentActivity < 0.04f
+                    && HasActiveAlternative(g_currentTargetHandle)) {
+                    g_shotHoldUntil = 0;
+                    if (StartNextScheduledShot(now, "target idle")) {
+                        break;
+                    }
+                }
+            }
+
             if (noFlagPriority && !IsShotHoldActive(now)) {
                 if (StartNextScheduledShot(now, "shot hold expired")) {
                     break;
@@ -893,12 +1465,40 @@ void CameraDirector_Update() {
 
 CameraState CameraDirector_GetState() { return g_state; }
 KillCamPhase CameraDirector_GetKillCamPhase() { return g_killCamPhase; }
+KillCamStyle CameraDirector_GetKillCamStyle() { return g_kcStyle; }
 int CameraDirector_GetTargetHandle() { return g_currentTargetHandle; }
 int CameraDirector_GetKillCamKillerHandle() { return g_kcKillerHandle; }
 int CameraDirector_GetKillCamVictimHandle() { return g_kcVictimHandle; }
 float CameraDirector_GetKillCamElapsed() { return GetKillCamElapsedInternal(); }
 const CameraConfig& CameraDirector_GetConfig() { return g_config; }
 bool CameraDirector_ShouldUseFpv() { return g_currentShotUseFpv; }
+bool CameraDirector_GetFlagCarrierKillLook(int* killerHandle,
+                                           int* victimHandle,
+                                           float* elapsed,
+                                           float* duration) {
+    DWORD now = GetTickCount();
+    if (g_flagKillLookStartTick == 0
+        || g_flagKillLookKillTick == 0) {
+        return false;
+    }
+
+    bool watchingVictim = (g_state == CameraState::FlagWatch
+        || g_state == CameraState::FollowPlayer)
+        && g_currentTargetHandle == g_flagKillLookVictimHandle;
+    if (!watchingVictim || !TickReached(now, g_flagKillLookStartTick)) {
+        return false;
+    }
+
+    float dur = (g_flagKillLookKillTick - g_flagKillLookStartTick) / 1000.0f;
+    if (dur < 0.1f) dur = 0.1f;
+    float el = (now - g_flagKillLookStartTick) / 1000.0f;
+
+    if (killerHandle) *killerHandle = g_flagKillLookKillerHandle;
+    if (victimHandle) *victimHandle = g_flagKillLookVictimHandle;
+    if (elapsed) *elapsed = el;
+    if (duration) *duration = dur;
+    return true;
+}
 
 // ============================================================================
 // Lifecycle
@@ -922,6 +1522,7 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_committedShotKind = ShotKind::None;
     g_committedPreference = CAM_WORLD;
     g_currentShotUseFpv = false;
+    g_kcStyle = KillCamStyle::BulletTravel;
     g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
     g_lastScreenTimeLog = GetTickCount();
     g_playerCamTime = 0.0f;
@@ -929,9 +1530,12 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_droneCamTime = 0.0f;
 
     std::cout << "[CameraDirector] Initialized\n";
-    std::cout << "[CameraDirector] Cinematic range: "
-              << g_config.cinematicMinDistance << "m (" << (int)(g_config.cinematicMinChance * 100) << "%) -> "
-              << g_config.cinematicMaxDistance << "m (" << (int)(g_config.cinematicMaxChance * 100) << "%)\n";
+    std::cout << "[CameraDirector] KillCam split: victim-lock 3PV < "
+              << g_config.killCamLongRangeDistance << "m ("
+              << (int)(g_config.detachedKillCamChance * 100) << "%), bullet >= "
+              << g_config.killCamLongRangeDistance << "m ("
+              << (int)(g_config.bulletKillCamChance * 100) << "%), look-lock "
+              << g_config.killLookLockAdvance << "s before kill\n";
     std::cout << "[CameraDirector] Budget: P=" << (int)(g_config.camSharePlayer * 100)
               << "% W=" << (int)(g_config.camShareWorld * 100)
               << "% D=" << (int)(g_config.camShareDrone * 100)
