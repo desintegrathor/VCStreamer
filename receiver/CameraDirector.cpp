@@ -380,7 +380,11 @@ static int PickMovingFlagCarrierTarget() {
         && !IsCampingFlagCarrier(g_flagCarrierVC);
 
     if (usMoving && vcMoving) {
-        return (g_currentTargetHandle == g_flagCarrierUS) ? g_flagCarrierVC : g_flagCarrierUS;
+        if (g_currentTargetHandle == g_flagCarrierUS
+            || g_currentTargetHandle == g_flagCarrierVC) {
+            return g_currentTargetHandle;
+        }
+        return g_flagCarrierUS;
     }
     if (usMoving) return g_flagCarrierUS;
     if (vcMoving) return g_flagCarrierVC;
@@ -668,7 +672,7 @@ static void ClearFlagKillLook() {
     g_flagKillLookKillTick = 0;
 }
 
-static void MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD now) {
+static bool MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD now) {
     bool victimIsFlagCarrier = (victimHandle != 0)
         && (victimHandle == g_flagCarrierUS || victimHandle == g_flagCarrierVC);
     bool watchingVictim = (g_state == CameraState::FlagWatch
@@ -676,7 +680,7 @@ static void MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD n
         && g_currentTargetHandle == victimHandle;
 
     if (!watchingVictim || killerHandle == 0) {
-        return;
+        return false;
     }
 
     float leadSeconds = GetKillLookLeadDuration();
@@ -695,6 +699,7 @@ static void MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD n
               << " flagCarrier=" << (victimIsFlagCarrier ? "yes" : "no")
               << " startsIn=" << (int)((leadMs - advanceMs) / 1000)
               << "s, holds until camera changes\n";
+    return true;
 }
 
 // ============================================================================
@@ -1174,7 +1179,17 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle) {
     UpdatePlayerActivity(now);
     BumpPlayerActivity(killerHandle, 0.8f);
     BumpPlayerActivity(victimHandle, 0.4f);
-    MaybeStartVictimKillLook(killerHandle, victimHandle, now);
+    bool preservingVictimLook = MaybeStartVictimKillLook(killerHandle, victimHandle, now);
+    if (preservingVictimLook) {
+        if (g_state == CameraState::FollowPlayer
+            && (g_shotHoldUntil == 0 || TickReached(g_flagKillLookKillTick, g_shotHoldUntil))) {
+            g_shotHoldUntil = g_flagKillLookKillTick;
+        }
+
+        std::cout << "[CameraDirector] Kill preserved: victim death look target="
+                  << victimHandle << " killer=" << killerHandle << "\n";
+        return;
+    }
 
     if (g_state == CameraState::FlagWatch) {
         std::cout << "[CameraDirector] Kill ignored: flag shot committed\n";
@@ -1239,15 +1254,19 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle) {
 void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier) {
     std::lock_guard<std::mutex> lock(g_directorMutex);
 
+    bool wasDualFlag = (g_flagCarrierUS != 0 && g_flagCarrierVC != 0);
+    DWORD now = GetTickCount();
+
     g_flagCarrierUS = usCarrier;
     g_flagCarrierVC = vcCarrier;
-    g_lastEventTick = GetTickCount();
+    g_lastEventTick = now;
     UpdatePlayerActivity(g_lastEventTick);
     BumpPlayerActivity(usCarrier, 0.6f);
     BumpPlayerActivity(vcCarrier, 0.6f);
     UpdateFlagCarrierMotion(g_lastEventTick);
 
     bool anyFlag = (usCarrier != 0 || vcCarrier != 0);
+    bool dualFlag = (usCarrier != 0 && vcCarrier != 0);
 
     if (anyFlag) {
         g_flagLostGraceActive = false;
@@ -1266,18 +1285,33 @@ void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier) {
         if (usCarrier != 0 && vcCarrier == 0) target = usCarrier;
         else if (vcCarrier != 0 && usCarrier == 0) target = vcCarrier;
         else {
-            // Both flags taken — watch the one we're not currently on
-            target = (g_currentTargetHandle == usCarrier) ? vcCarrier : usCarrier;
-            g_flagAlternateTimer = GetTickCount();
-            g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
+            // Both flags taken: keep the current carrier until timed alternation.
+            if ((g_currentTargetHandle == usCarrier || g_currentTargetHandle == vcCarrier)
+                && CD_IsUsablePlayerHandle(g_currentTargetHandle)) {
+                target = g_currentTargetHandle;
+            } else if (CD_IsUsablePlayerHandle(usCarrier)) {
+                target = usCarrier;
+            } else {
+                target = vcCarrier;
+            }
+
+            if (!wasDualFlag) {
+                g_flagAlternateTimer = now;
+                g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
+            }
         }
 
-        RequestFlagWatchShot(target, "flag carrier", GetTickCount());
+        if (target != 0
+            && (g_state != CameraState::FlagWatch || g_currentTargetHandle != target)) {
+            RequestFlagWatchShot(target,
+                                 dualFlag ? "flag carrier dual" : "flag carrier",
+                                 now);
+        }
     } else {
         // No flags — start grace period
         if (g_state == CameraState::FlagWatch && !g_flagLostGraceActive) {
             g_flagLostGraceActive = true;
-            g_flagLostTimestamp = GetTickCount();
+            g_flagLostTimestamp = now;
             std::cout << "[CameraDirector] Flag lost - grace period started\n";
         }
     }

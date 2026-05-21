@@ -7,6 +7,8 @@
 #include "SpectatedPlayerData.h"
 #include "FpvViewmodel.h"
 #include "RealtimeHook.h"
+#include "OctCollision.h"
+#include "PathGrid.h"
 #include "minhook/MinHook.h"
 #include <iostream>
 #include <cmath>
@@ -103,8 +105,12 @@ static bool g_killCamKillerPosLocked = false;
 static float g_killCamVictimLastPos[3] = {};
 static bool g_killCamVictimPosLocked = false;
 static bool g_killCamPhase2Entered = false;
-static float g_killCamHoldPos[3] = {};
-static bool g_killCamHoldPosValid = false;
+static float g_killCamVantagePos[3] = {};
+static float g_killCamVantageLookAt[3] = {};
+static bool g_killCamVantageValid = false;
+static bool g_killCamVantageAttempted = false;
+static float g_killCamMoveStartPos[3] = {};
+static bool g_killCamMoveStartValid = false;
 static KillCamStyle g_killCamStyle = KillCamStyle::BulletTravel;
 
 // Track last director state for detecting KillCam entry
@@ -125,6 +131,29 @@ static void FpvLog(const char* fmt, ...) {
     vfprintf(g_fpvLog, fmt, args);
     fflush(g_fpvLog);
     va_end(args);
+}
+
+static void BeginLookLockLog(int target, const char* reason) {
+    if (!g_lookLockWasActive || g_lastLookLockTarget != target) {
+        FpvLog("[LookLock] start reason=%s target=%d orbit-yaw\n",
+               reason ? reason : "unknown",
+               target);
+    }
+    g_lookLockWasActive = true;
+    g_lastLookLockTarget = target;
+}
+
+static void EndLookLockLog(const char* detail) {
+    if (!g_lookLockWasActive) return;
+
+    if (detail) {
+        FpvLog("[LookLock] end target=%d %s\n", g_lastLookLockTarget, detail);
+    } else {
+        FpvLog("[LookLock] end target=%d\n", g_lastLookLockTarget);
+    }
+
+    g_lookLockWasActive = false;
+    g_lastLookLockTarget = 0;
 }
 
 // ============================================================================
@@ -217,6 +246,507 @@ static bool GetPlayerAimPoint(int playerHandle, float out[3]) {
     }
 
     return false;
+}
+
+static bool Get3pvOrbitPivot(void* playerEntity, float out[3]) {
+    if (!playerEntity) return false;
+
+    if (GetEntityBonePos(playerEntity, BONE_NECK, out)) {
+        return true;
+    }
+
+    if (GetEntityBonePos(playerEntity, BONE_CHEST, out)) {
+        return true;
+    }
+
+    if (g_GetChestPosition && g_GetChestPosition(playerEntity, out)) {
+        return true;
+    }
+
+    GetEntityPos(playerEntity, out);
+    out[2] += 1.25f;
+    return true;
+}
+
+static bool Get3pvOrbitYawToTarget(void* playerEntity, int targetHandle, float* outYaw) {
+    float pivot[3];
+    float target[3];
+    if (!Get3pvOrbitPivot(playerEntity, pivot)
+        || !GetPlayerAimPoint(targetHandle, target)) {
+        return false;
+    }
+
+    float dx = target[0] - pivot[0];
+    float dy = target[1] - pivot[1];
+    if ((dx * dx + dy * dy) < 0.0001f) {
+        return false;
+    }
+
+    *outYaw = atan2f(dx, dy) + YAW_OFFSET_3PV;
+    return true;
+}
+
+static float ClampFloat(float value, float minValue, float maxValue) {
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+static void CopyVec3(const float* src, float* dst) {
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+}
+
+static float Vec3Distance(const float* a, const float* b) {
+    float dx = a[0] - b[0];
+    float dy = a[1] - b[1];
+    float dz = a[2] - b[2];
+    return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+static void Vec3AtHeight(const float* base, float height, float out[3]) {
+    out[0] = base[0];
+    out[1] = base[1];
+    out[2] = base[2] + height;
+}
+
+struct KillCamTargetView {
+    float base[3];
+    float aim[3];
+    float samples[4][3];
+    int sampleCount;
+};
+
+struct KillCamCandidateDir {
+    float x;
+    float y;
+    float preference;
+};
+
+static void AddKillCamSample(KillCamTargetView& view, const float* pos) {
+    if (view.sampleCount >= 4) return;
+
+    for (int i = 0; i < view.sampleCount; ++i) {
+        if (Vec3Distance(view.samples[i], pos) < 0.05f) {
+            return;
+        }
+    }
+
+    CopyVec3(pos, view.samples[view.sampleCount]);
+    ++view.sampleCount;
+}
+
+static bool GetKillCamBasePosition(int handle, float out[3], bool* usedPredicted) {
+    if (usedPredicted) *usedPredicted = false;
+
+    if (RealtimeHook_GetPredictedPlayerPosition(handle, out, 7000)) {
+        if (usedPredicted) *usedPredicted = true;
+        return true;
+    }
+
+    void* entity = FindEntityByHandle(handle);
+    if (!entity) return false;
+
+    GetEntityPos(entity, out);
+    return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);
+}
+
+static bool GetKillCamTargetView(int handle, KillCamTargetView& out) {
+    memset(&out, 0, sizeof(out));
+
+    bool usedPredicted = false;
+    if (!GetKillCamBasePosition(handle, out.base, &usedPredicted)) {
+        return false;
+    }
+
+    if (usedPredicted) {
+        float neck[3], chest[3];
+        Vec3AtHeight(out.base, 1.45f, neck);
+        Vec3AtHeight(out.base, 1.05f, chest);
+        Vec3AtHeight(out.base, 1.25f, out.aim);
+        AddKillCamSample(out, neck);
+        AddKillCamSample(out, chest);
+        return true;
+    }
+
+    void* entity = FindEntityByHandle(handle);
+    float neck[3], chest[3];
+    bool haveNeck = GetEntityBonePos(entity, BONE_NECK, neck);
+    bool haveChest = GetEntityBonePos(entity, BONE_CHEST, chest);
+
+    if (haveNeck && haveChest) {
+        out.aim[0] = (neck[0] + chest[0]) * 0.5f;
+        out.aim[1] = (neck[1] + chest[1]) * 0.5f;
+        out.aim[2] = (neck[2] + chest[2]) * 0.5f;
+    } else if (haveNeck) {
+        CopyVec3(neck, out.aim);
+    } else if (haveChest) {
+        CopyVec3(chest, out.aim);
+        out.aim[2] += 0.20f;
+    } else {
+        Vec3AtHeight(out.base, 1.25f, out.aim);
+    }
+
+    if (haveNeck) {
+        AddKillCamSample(out, neck);
+    } else {
+        Vec3AtHeight(out.base, 1.45f, neck);
+        AddKillCamSample(out, neck);
+    }
+
+    if (haveChest) {
+        AddKillCamSample(out, chest);
+    } else {
+        Vec3AtHeight(out.base, 1.05f, chest);
+        AddKillCamSample(out, chest);
+    }
+
+    return true;
+}
+
+static bool KillCamTargetHasLos(const float* candidate, const KillCamTargetView& target) {
+    if (!OctCollision_LineOfSight(candidate, target.aim)) {
+        return false;
+    }
+
+    for (int i = 0; i < target.sampleCount; ++i) {
+        if (!OctCollision_LineOfSight(candidate, target.samples[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool KillCamCandidateInsideMap(const float* candidate) {
+    float boundsMin[3], boundsMax[3];
+    if (!OctCollision_GetBounds(boundsMin, boundsMax)) {
+        return false;
+    }
+
+    constexpr float BOUNDS_MARGIN = 0.05f;
+    return candidate[0] >= boundsMin[0] + BOUNDS_MARGIN
+        && candidate[1] >= boundsMin[1] + BOUNDS_MARGIN
+        && candidate[2] >= boundsMin[2] + BOUNDS_MARGIN
+        && candidate[0] <= boundsMax[0] - BOUNDS_MARGIN
+        && candidate[1] <= boundsMax[1] - BOUNDS_MARGIN
+        && candidate[2] <= boundsMax[2] - BOUNDS_MARGIN;
+}
+
+static bool ScoreKillCamCandidate(const float* candidate,
+                                  const KillCamTargetView& killer,
+                                  const KillCamTargetView& victim,
+                                  const float* mid,
+                                  float dirX,
+                                  float dirY,
+                                  float sidePreference,
+                                  const float* currentCam,
+                                  const CameraConfig& cfg,
+                                  float* outScore) {
+    if (!KillCamCandidateInsideMap(candidate)) {
+        return false;
+    }
+
+    float minClearance = cfg.detachedKillCamMinClearance;
+    if (minClearance < 0.0f) minClearance = 0.0f;
+
+    float clearance = minClearance + 2.0f;
+    if (PathGrid_IsReady()) {
+        clearance = PathGrid_GetClearance(candidate[0], candidate[1], candidate[2]);
+        if (clearance < minClearance) {
+            return false;
+        }
+    }
+
+    if (!KillCamTargetHasLos(candidate, killer)
+        || !KillCamTargetHasLos(candidate, victim)) {
+        return false;
+    }
+
+    float toMidX = candidate[0] - mid[0];
+    float toMidY = candidate[1] - mid[1];
+    float xyRadius = sqrtf(toMidX * toMidX + toMidY * toMidY);
+
+    float absDot = 1.0f;
+    if (xyRadius > 0.05f) {
+        float viewX = toMidX / xyRadius;
+        float viewY = toMidY / xyRadius;
+        absDot = fabsf(viewX * dirX + viewY * dirY);
+    }
+    float sideScore = 1.0f - ClampFloat(absDot, 0.0f, 1.0f);
+
+    float toKiller[3] = {
+        killer.aim[0] - candidate[0],
+        killer.aim[1] - candidate[1],
+        killer.aim[2] - candidate[2]
+    };
+    float toVictim[3] = {
+        victim.aim[0] - candidate[0],
+        victim.aim[1] - candidate[1],
+        victim.aim[2] - candidate[2]
+    };
+    float killerDist = sqrtf(toKiller[0] * toKiller[0] + toKiller[1] * toKiller[1] + toKiller[2] * toKiller[2]);
+    float victimDist = sqrtf(toVictim[0] * toVictim[0] + toVictim[1] * toVictim[1] + toVictim[2] * toVictim[2]);
+
+    float sepAngle = 0.0f;
+    if (killerDist > 0.05f && victimDist > 0.05f) {
+        float angleDot = (toKiller[0] * toVictim[0] + toKiller[1] * toVictim[1] + toKiller[2] * toVictim[2])
+                       / (killerDist * victimDist);
+        sepAngle = acosf(ClampFloat(angleDot, -1.0f, 1.0f));
+    }
+
+    float minRadius = cfg.detachedKillCamMinRadius;
+    if (minRadius < 1.0f) minRadius = 1.0f;
+
+    float minHeight = cfg.detachedKillCamMinHeight;
+    float maxHeight = cfg.detachedKillCamMaxHeight;
+    if (minHeight < 0.5f) minHeight = 0.5f;
+    if (maxHeight < minHeight) maxHeight = minHeight;
+
+    float heightRel = candidate[2] - mid[2];
+    float desiredHeight = minHeight + (maxHeight - minHeight) * 0.45f;
+    float minTargetDist = killerDist < victimDist ? killerDist : victimDist;
+
+    float sepScore = 1.0f - fabsf(sepAngle - 0.32f) / 0.32f;
+    sepScore = ClampFloat(sepScore, 0.0f, 1.0f);
+
+    float score = 0.0f;
+    score += sideScore * 34.0f;
+    score += sidePreference * 12.0f;
+    score += sepScore * 22.0f;
+    score += clearance * (PathGrid_IsReady() ? 2.5f : 0.5f);
+    score -= fabsf(killerDist - victimDist) * 0.35f;
+    score -= fabsf(heightRel - desiredHeight) * 0.75f;
+
+    if (absDot > 0.92f) score -= 9.0f;
+    if (sepAngle < 0.08f) score -= 16.0f;
+    if (sepAngle > 0.80f) score -= 10.0f;
+    if (minTargetDist < 4.0f) score -= (4.0f - minTargetDist) * 9.0f;
+    if (xyRadius < minRadius * 0.45f) score -= 16.0f;
+    if (heightRel < minHeight + 0.35f) score -= 8.0f;
+
+    float topDownRatio = heightRel / (xyRadius + 0.5f);
+    if (topDownRatio > 0.90f) {
+        score -= (topDownRatio - 0.90f) * 18.0f;
+    }
+
+    if (currentCam) {
+        float jumpDist = Vec3Distance(currentCam, candidate);
+        score -= jumpDist * 0.04f;
+        if (OctCollision_LineOfSight(currentCam, candidate)) {
+            score += 7.0f;
+        } else {
+            score -= 4.0f;
+        }
+    }
+
+    *outScore = score;
+    return true;
+}
+
+static void AddKillCamDirection(KillCamCandidateDir* dirs,
+                                int* dirCount,
+                                float x,
+                                float y,
+                                float preference) {
+    if (*dirCount >= 10) return;
+
+    float len = sqrtf(x * x + y * y);
+    if (len < 0.01f) return;
+
+    x /= len;
+    y /= len;
+
+    for (int i = 0; i < *dirCount; ++i) {
+        float dot = dirs[i].x * x + dirs[i].y * y;
+        if (dot > 0.985f) {
+            if (preference > dirs[i].preference) {
+                dirs[i].preference = preference;
+            }
+            return;
+        }
+    }
+
+    dirs[*dirCount].x = x;
+    dirs[*dirCount].y = y;
+    dirs[*dirCount].preference = preference;
+    ++(*dirCount);
+}
+
+static bool TryScoreKillCamCandidate(const float* candidate,
+                                     const KillCamTargetView& killer,
+                                     const KillCamTargetView& victim,
+                                     const float* mid,
+                                     float dirX,
+                                     float dirY,
+                                     float preference,
+                                     const float* currentCam,
+                                     const CameraConfig& cfg,
+                                     float* bestScore,
+                                     float* bestPos) {
+    float score = 0.0f;
+    if (!ScoreKillCamCandidate(candidate, killer, victim, mid,
+                               dirX, dirY, preference, currentCam, cfg,
+                               &score)) {
+        return false;
+    }
+
+    if (score > *bestScore) {
+        *bestScore = score;
+        CopyVec3(candidate, bestPos);
+    }
+    return true;
+}
+
+static bool SolveKillCamVantage(int killerHandle,
+                                int victimHandle,
+                                const float* currentCam,
+                                const CameraConfig& cfg,
+                                float outPos[3],
+                                float outLookAt[3]) {
+    if (!OctCollision_IsLoaded()) {
+        return false;
+    }
+
+    KillCamTargetView killer, victim;
+    if (!GetKillCamTargetView(killerHandle, killer)
+        || !GetKillCamTargetView(victimHandle, victim)) {
+        return false;
+    }
+
+    float mid[3] = {
+        (killer.base[0] + victim.base[0]) * 0.5f,
+        (killer.base[1] + victim.base[1]) * 0.5f,
+        (killer.base[2] + victim.base[2]) * 0.5f
+    };
+
+    outLookAt[0] = (killer.aim[0] + victim.aim[0]) * 0.5f;
+    outLookAt[1] = (killer.aim[1] + victim.aim[1]) * 0.5f;
+    outLookAt[2] = (killer.aim[2] + victim.aim[2]) * 0.5f;
+
+    float dirX = victim.base[0] - killer.base[0];
+    float dirY = victim.base[1] - killer.base[1];
+    float separationXY = sqrtf(dirX * dirX + dirY * dirY);
+    if (separationXY < 0.05f) {
+        dirX = victim.aim[0] - killer.aim[0];
+        dirY = victim.aim[1] - killer.aim[1];
+        separationXY = sqrtf(dirX * dirX + dirY * dirY);
+    }
+    if (separationXY < 0.05f) {
+        dirX = 0.0f;
+        dirY = 1.0f;
+    } else {
+        dirX /= separationXY;
+        dirY /= separationXY;
+    }
+
+    float sideX = -dirY;
+    float sideY = dirX;
+
+    float minRadius = cfg.detachedKillCamMinRadius;
+    float maxRadius = cfg.detachedKillCamMaxRadius;
+    if (minRadius < 1.0f) minRadius = 1.0f;
+    if (maxRadius < 1.0f) maxRadius = 1.0f;
+    if (maxRadius < minRadius) maxRadius = minRadius;
+
+    float separation = Vec3Distance(killer.base, victim.base);
+    float framingRadius = ClampFloat(separation * 0.85f + 2.0f, minRadius, maxRadius);
+    float midRadius = (minRadius + maxRadius) * 0.5f;
+    float radii[4] = { framingRadius, midRadius, minRadius, maxRadius };
+
+    float minHeight = cfg.detachedKillCamMinHeight;
+    float maxHeight = cfg.detachedKillCamMaxHeight;
+    if (minHeight < 0.5f) minHeight = 0.5f;
+    if (maxHeight < 0.5f) maxHeight = 0.5f;
+    if (maxHeight < minHeight) maxHeight = minHeight;
+
+    float midHeight = (minHeight + maxHeight) * 0.5f;
+    float heights[3] = { midHeight, minHeight, maxHeight };
+
+    KillCamCandidateDir dirs[10];
+    int dirCount = 0;
+    AddKillCamDirection(dirs, &dirCount,  sideX,          sideY,          1.00f);
+    AddKillCamDirection(dirs, &dirCount, -sideX,         -sideY,          1.00f);
+    AddKillCamDirection(dirs, &dirCount,  sideX + dirX,   sideY + dirY,   0.78f);
+    AddKillCamDirection(dirs, &dirCount, -sideX + dirX,  -sideY + dirY,   0.78f);
+    AddKillCamDirection(dirs, &dirCount,  sideX - dirX,   sideY - dirY,   0.72f);
+    AddKillCamDirection(dirs, &dirCount, -sideX - dirX,  -sideY - dirY,   0.72f);
+    AddKillCamDirection(dirs, &dirCount, -dirX,          -dirY,           0.35f);
+    AddKillCamDirection(dirs, &dirCount,  dirX,           dirY,           0.28f);
+
+    float bestScore = -1.0e30f;
+    float bestPos[3] = {};
+
+    for (int d = 0; d < dirCount; ++d) {
+        for (int r = 0; r < 4; ++r) {
+            for (int h = 0; h < 3; ++h) {
+                float candidate[3] = {
+                    mid[0] + dirs[d].x * radii[r],
+                    mid[1] + dirs[d].y * radii[r],
+                    mid[2] + heights[h]
+                };
+
+                TryScoreKillCamCandidate(candidate, killer, victim, mid,
+                                         dirX, dirY, dirs[d].preference,
+                                         currentCam, cfg, &bestScore, bestPos);
+            }
+        }
+    }
+
+    float topOffsets[5][2] = {
+        { 0.0f, 0.0f },
+        {  sideX * minRadius * 0.35f,  sideY * minRadius * 0.35f },
+        { -sideX * minRadius * 0.35f, -sideY * minRadius * 0.35f },
+        {  dirX  * minRadius * 0.35f,  dirY  * minRadius * 0.35f },
+        { -dirX  * minRadius * 0.35f, -dirY  * minRadius * 0.35f }
+    };
+
+    for (int i = 0; i < 5; ++i) {
+        float candidate[3] = {
+            mid[0] + topOffsets[i][0],
+            mid[1] + topOffsets[i][1],
+            mid[2] + maxHeight
+        };
+
+        TryScoreKillCamCandidate(candidate, killer, victim, mid,
+                                 dirX, dirY, 0.12f, currentCam, cfg,
+                                 &bestScore, bestPos);
+    }
+
+    if (bestScore <= -1.0e29f) {
+        return false;
+    }
+
+    CopyVec3(bestPos, outPos);
+    std::cout << "[Camera] KillCam solved vantage pos=("
+              << outPos[0] << ", " << outPos[1] << ", " << outPos[2]
+              << ") score=" << bestScore << "\n";
+    return true;
+}
+
+static bool EnsureKillCamVantage(int killerHandle,
+                                 int victimHandle,
+                                 const float* currentCam,
+                                 const CameraConfig& cfg) {
+    if (g_killCamVantageValid) {
+        return true;
+    }
+    if (g_killCamVantageAttempted) {
+        return false;
+    }
+
+    g_killCamVantageAttempted = true;
+    g_killCamVantageValid = SolveKillCamVantage(killerHandle,
+                                                victimHandle,
+                                                currentCam,
+                                                cfg,
+                                                g_killCamVantagePos,
+                                                g_killCamVantageLookAt);
+    if (!g_killCamVantageValid) {
+        std::cout << "[Camera] KillCam vantage unavailable; using safe spectator fallback\n";
+    }
+    return g_killCamVantageValid;
 }
 
 static bool IsCloseKillCamLookLockActive(const CameraConfig& cfg) {
@@ -492,11 +1022,13 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         g_killCamKillerPosLocked = false;
         g_killCamVictimPosLocked = false;
         g_killCamPhase2Entered = false;
-        g_killCamHoldPosValid = false;
+        g_killCamVantageValid = false;
+        g_killCamVantageAttempted = false;
+        g_killCamMoveStartValid = false;
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
             g_yawInitialized = false;
-            std::cout << "[Camera] Close KillCam: 3PV victim look lock\n";
+            std::cout << "[Camera] Close KillCam: solving collision-safe vantage\n";
         }
     }
 
@@ -510,6 +1042,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
     bool lookLockActive = Get3pvLookLockTarget(dirState, kcStyle, cfg,
                                                &lookLockTarget,
                                                &lookLockReason);
+    bool lookLockApplied = false;
 
     if (do3pvPreprocess && playerEntity) {
         void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
@@ -520,17 +1053,23 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
             void* skeleton = *skeletonPtrPtr;
 
             if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
-                yaw += YAW_OFFSET_3PV;
+                float desiredYaw = yaw + YAW_OFFSET_3PV;
+                float lookLockYaw = 0.0f;
+                if (lookLockActive
+                    && Get3pvOrbitYawToTarget(playerEntity, lookLockTarget, &lookLockYaw)) {
+                    desiredYaw = lookLockYaw;
+                    lookLockApplied = true;
+                }
 
                 if (pitch > MAX_PITCH_3PV) pitch = MAX_PITCH_3PV;
                 if (pitch < -MAX_PITCH_3PV) pitch = -MAX_PITCH_3PV;
 
                 if (!g_yawInitialized) {
-                    g_smoothedYaw = yaw;
+                    g_smoothedYaw = desiredYaw;
                     g_yawInitialized = true;
                 }
 
-                g_smoothedYaw = LerpAngle(g_smoothedYaw, yaw, cfg.tpvYawSmoothFactor);
+                g_smoothedYaw = LerpAngle(g_smoothedYaw, desiredYaw, cfg.tpvYawSmoothFactor);
 
                 int cameraIndex = *(int*)((char*)thisPtr + 0x28);
                 char* cameraEntry = (char*)thisPtr + 44 + 20 * cameraIndex;
@@ -545,6 +1084,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
     // Drone camera: override position/rotation entirely, skip all post-processing
     if (dirState == CameraState::Drone && result) {
+        EndLookLockLog(nullptr);
         RestoreHiddenHead();
         float pos[3], pitch, yaw;
         DroneCamera_GetCameraState(pos, &pitch, &yaw);
@@ -641,7 +1181,14 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         }
 
         g_lastDirState = dirState;
+        EndLookLockLog(nullptr);
         return result;
+    }
+
+    if (lookLockApplied && result) {
+        BeginLookLockLog(lookLockTarget, lookLockReason);
+    } else if (g_lookLockWasActive) {
+        EndLookLockLog(lookLockActive ? "target-lost" : nullptr);
     }
 
     // 3PV Post-processing: distance smoothing (skip during KillCam Transition)
@@ -722,41 +1269,47 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         s_prevCamType = wcType;
     }
 
-    // Keep the final camera rotation centered on the lock target after
-    // distance smoothing has moved the 3PV camera.
-    if (lookLockActive && result) {
-        float targetAim[3];
-        if (GetPlayerAimPoint(lookLockTarget, targetAim)) {
-            if (!g_lookLockWasActive || g_lastLookLockTarget != lookLockTarget) {
-                FpvLog("[LookLock] start reason=%s target=%d view-only\n",
-                       lookLockReason ? lookLockReason : "unknown",
-                       lookLockTarget);
-            }
-            g_lookLockWasActive = true;
-            g_lastLookLockTarget = lookLockTarget;
-
-            float* camPos = (float*)cameraProp;
-            AimCameraAt(cameraProp, camPos, targetAim);
-        } else if (g_lookLockWasActive) {
-            FpvLog("[LookLock] end target=%d target-lost\n", g_lastLookLockTarget);
-            g_lookLockWasActive = false;
-            g_lastLookLockTarget = 0;
-        }
-    } else if (g_lookLockWasActive) {
-        FpvLog("[LookLock] end target=%d\n", g_lastLookLockTarget);
-        g_lookLockWasActive = false;
-        g_lastLookLockTarget = 0;
-    }
-
     // KillCam phased logic
     if (dirState == CameraState::KillCam && result) {
         float elapsed = CameraDirector_GetKillCamElapsed();
         int killerHandle = CameraDirector_GetKillCamKillerHandle();
         int victimHandle = CameraDirector_GetKillCamVictimHandle();
+        float* liveCamPos = (float*)cameraProp;
+        bool hasSolvedVantage = EnsureKillCamVantage(killerHandle,
+                                                     victimHandle,
+                                                     liveCamPos,
+                                                     cfg);
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
-            (void)elapsed;
-            (void)victimHandle;
+            if (hasSolvedVantage) {
+                float waitEnd = cfg.detachedKillCamFollowDuration;
+                float transEnd = waitEnd + cfg.detachedKillCamRepositionDuration;
+
+                if (kcPhase == KillCamPhase::Transition) {
+                    if (!g_killCamMoveStartValid) {
+                        CopyVec3(liveCamPos, g_killCamMoveStartPos);
+                        g_killCamMoveStartValid = true;
+                        std::cout << "[Camera] KillCam moving to solved vantage\n";
+                    }
+
+                    float denom = transEnd - waitEnd;
+                    float t = denom > 0.001f ? SmoothStep((elapsed - waitEnd) / denom) : 1.0f;
+                    liveCamPos[0] = g_killCamMoveStartPos[0] + (g_killCamVantagePos[0] - g_killCamMoveStartPos[0]) * t;
+                    liveCamPos[1] = g_killCamMoveStartPos[1] + (g_killCamVantagePos[1] - g_killCamMoveStartPos[1]) * t;
+                    liveCamPos[2] = g_killCamMoveStartPos[2] + (g_killCamVantagePos[2] - g_killCamMoveStartPos[2]) * t;
+                    AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
+                }
+
+                if (kcPhase == KillCamPhase::Attached) {
+                    if (!g_killCamPhase2Entered) {
+                        g_killCamPhase2Entered = true;
+                        std::cout << "[Camera] KillCam fixed solved vantage hold\n";
+                    }
+
+                    CopyVec3(g_killCamVantagePos, liveCamPos);
+                    AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
+                }
+            }
         } else {
             // Look up entities, snapshot positions
             void* killerEntity = FindEntityByHandle(killerHandle);
@@ -798,39 +1351,20 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
             }
 
             // Phase 2 (attached): hold a fixed post-kill shot for a few seconds
-            // instead of immediately handing off to normal spectator follow.
+            // only when the collision solver found a clear dual-LOS shot.
             if (kcPhase == KillCamPhase::Attached) {
-                if (!g_killCamPhase2Entered || !g_killCamHoldPosValid) {
-                    g_killCamPhase2Entered = true;
-
-                    float dirX = victimPos[0] - killerPos[0];
-                    float dirY = victimPos[1] - killerPos[1];
-                    float len = sqrtf(dirX * dirX + dirY * dirY);
-                    if (len > 0.01f) {
-                        dirX /= len;
-                        dirY /= len;
-                    } else {
-                        dirX = 0.0f;
-                        dirY = 1.0f;
+                if (hasSolvedVantage) {
+                    if (!g_killCamPhase2Entered) {
+                        g_killCamPhase2Entered = true;
+                        std::cout << "[Camera] KillCam phase 2: solved post-kill hold\n";
                     }
 
-                    constexpr float HOLD_BACK_DISTANCE = 3.5f;
-                    constexpr float HOLD_HEIGHT = 1.4f;
-                    g_killCamHoldPos[0] = victimPos[0] - dirX * HOLD_BACK_DISTANCE;
-                    g_killCamHoldPos[1] = victimPos[1] - dirY * HOLD_BACK_DISTANCE;
-                    g_killCamHoldPos[2] = victimPos[2] + HOLD_HEIGHT;
-                    g_killCamHoldPosValid = true;
-
-                    std::cout << "[Camera] KillCam phase 2: fixed post-kill hold\n";
+                    CopyVec3(g_killCamVantagePos, liveCamPos);
+                    AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
+                } else if (!g_killCamPhase2Entered) {
+                    g_killCamPhase2Entered = true;
+                    std::cout << "[Camera] KillCam phase 2: no solved vantage, keeping spectator fallback\n";
                 }
-
-                float* camPos = (float*)cameraProp;
-                camPos[0] = g_killCamHoldPos[0];
-                camPos[1] = g_killCamHoldPos[1];
-                camPos[2] = g_killCamHoldPos[2];
-
-                float lookAt[3] = { victimPos[0], victimPos[1], victimPos[2] + 1.0f };
-                AimCameraAt(cameraProp, camPos, lookAt);
             }
         }
     }
