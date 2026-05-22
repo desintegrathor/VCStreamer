@@ -6,6 +6,16 @@
 // Configuration — all tunables loaded from vcstreamer.ini
 // ============================================================================
 
+enum class DebugCameraMode {
+    Auto,
+    Player3pv,
+    Fpv,
+    World,
+    Drone,
+    VictimLook3pv,
+    BulletKillcam
+};
+
 struct CameraConfig {
     // Distance-based cinematic thresholds
     float cinematicMinDistance      = 35.0f;
@@ -29,8 +39,10 @@ struct CameraConfig {
     float detachedKillCamFollowDuration     = 2.5f;
     float detachedKillCamRepositionDuration = 2.5f;
     float detachedKillCamHoldDuration       = 3.0f;
+    float detachedKillCamVantageChance      = 0.25f;
+    float detachedKillCamMinVantageScore    = 60.0f;
     float detachedKillCamMinHeight          = 3.0f;
-    float detachedKillCamMaxHeight          = 12.0f;
+    float detachedKillCamMaxHeight          = 7.0f;
     float detachedKillCamMinRadius          = 6.0f;
     float detachedKillCamMaxRadius          = 22.0f;
     float detachedKillCamMinClearance       = 1.0f;
@@ -107,6 +119,7 @@ struct CameraConfig {
 
     // Debug
     bool debugMode                 = false;
+    DebugCameraMode debugCameraMode = DebugCameraMode::Auto;
 };
 
 // ============================================================================
@@ -154,6 +167,7 @@ KillCamStyle CameraDirector_GetKillCamStyle();
 int CameraDirector_GetTargetHandle();
 int CameraDirector_GetKillCamKillerHandle();
 int CameraDirector_GetKillCamVictimHandle();
+bool CameraDirector_GetKillCamVictimAimPoint(float out[3]);
 float CameraDirector_GetKillCamElapsed();
 const CameraConfig& CameraDirector_GetConfig();
 bool CameraDirector_ShouldUseFpv();

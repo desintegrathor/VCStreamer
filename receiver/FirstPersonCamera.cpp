@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 // ============================================================================
@@ -109,12 +110,16 @@ static float g_killCamVantagePos[3] = {};
 static float g_killCamVantageLookAt[3] = {};
 static bool g_killCamVantageValid = false;
 static bool g_killCamVantageAttempted = false;
+static bool g_killCamVantageRollDecided = false;
+static bool g_killCamVantageRollPassed = false;
 static float g_killCamMoveStartPos[3] = {};
 static bool g_killCamMoveStartValid = false;
 static KillCamStyle g_killCamStyle = KillCamStyle::BulletTravel;
 
 // Track last director state for detecting KillCam entry
 static CameraState g_lastDirState = CameraState::Idle;
+static int g_lastKillCamKillerHandle = 0;
+static int g_lastKillCamVictimHandle = 0;
 
 // Spectated player combat state
 static SpectatedPlayerState g_spectatedState;
@@ -130,6 +135,115 @@ static void FpvLog(const char* fmt, ...) {
     va_start(args, fmt);
     DiagnosticsLog_Write(g_fpvLog, fmt, args);
     va_end(args);
+}
+
+static FILE* g_tpvDebugLog = nullptr;
+
+static void TpvDebugLog(const char* fmt, ...) {
+    if (!g_tpvDebugLog) {
+        g_tpvDebugLog = fopen("camera_3pv_debug.log", "a");
+        if (!g_tpvDebugLog) return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    DiagnosticsLog_Write(g_tpvDebugLog, fmt, args);
+    va_end(args);
+    fflush(g_tpvDebugLog);
+}
+
+static const char* CameraStateName(CameraState state) {
+    switch (state) {
+        case CameraState::Idle: return "Idle";
+        case CameraState::FollowPlayer: return "FollowPlayer";
+        case CameraState::KillCam: return "KillCam";
+        case CameraState::FlagWatch: return "FlagWatch";
+        case CameraState::Drone: return "Drone";
+        default: return "Unknown";
+    }
+}
+
+static const char* KillCamPhaseName(KillCamPhase phase) {
+    switch (phase) {
+        case KillCamPhase::Wait: return "Wait";
+        case KillCamPhase::Transition: return "Transition";
+        case KillCamPhase::Attached: return "Attached";
+        default: return "Unknown";
+    }
+}
+
+static const char* KillCamStyleName(KillCamStyle style) {
+    return style == KillCamStyle::DetachedVantage ? "DetachedVantage" : "BulletTravel";
+}
+
+static const char* DebugCameraModeName(DebugCameraMode mode) {
+    switch (mode) {
+        case DebugCameraMode::Player3pv: return "player_3pv";
+        case DebugCameraMode::Fpv: return "fpv";
+        case DebugCameraMode::World: return "world";
+        case DebugCameraMode::Drone: return "drone";
+        case DebugCameraMode::VictimLook3pv: return "victim_look_3pv";
+        case DebugCameraMode::BulletKillcam: return "bullet_killcam";
+        case DebugCameraMode::Auto:
+        default: return "auto";
+    }
+}
+
+struct TpvYawDebugFrame {
+    bool preprocess = false;
+    bool boneValid = false;
+    bool lookLockActive = false;
+    bool lookLockApplied = false;
+    bool lookLockFrozenTarget = false;
+    int lookLockTarget = 0;
+    const char* lookLockReason = nullptr;
+    float boneYaw = 0.0f;
+    float bonePitch = 0.0f;
+    float desiredYaw = 0.0f;
+    float lookLockYaw = 0.0f;
+    float smoothedYaw = 0.0f;
+    int cameraIndex = -1;
+};
+
+static int TpvDebugFrontClass(float dot) {
+    if (dot > 0.25f) return 1;
+    if (dot < -0.25f) return -1;
+    return 0;
+}
+
+static const char* TpvDebugFrontClassName(int klass) {
+    if (klass > 0) return "FRONT";
+    if (klass < 0) return "BEHIND";
+    return "SIDE";
+}
+
+static bool ShouldLogTpvDebug(const CameraConfig& cfg,
+                              CameraState state,
+                              int frontClass,
+                              bool lookLockApplied) {
+    static int s_frame = 0;
+    static int s_lastFrontClass = 99;
+    static CameraState s_lastState = CameraState::Idle;
+    static DebugCameraMode s_lastDebugMode = DebugCameraMode::Auto;
+    static bool s_lastLookLockApplied = false;
+
+    ++s_frame;
+    bool active = cfg.debugMode || cfg.debugCameraMode != DebugCameraMode::Auto;
+    if (!active) return false;
+
+    bool changed = frontClass != s_lastFrontClass
+                || state != s_lastState
+                || cfg.debugCameraMode != s_lastDebugMode
+                || lookLockApplied != s_lastLookLockApplied;
+    bool sampled = (s_frame % 30) == 0;
+
+    if (changed || sampled) {
+        s_lastFrontClass = frontClass;
+        s_lastState = state;
+        s_lastDebugMode = cfg.debugCameraMode;
+        s_lastLookLockApplied = lookLockApplied;
+        return true;
+    }
+    return false;
 }
 
 static void BeginLookLockLog(int target, const char* reason) {
@@ -168,6 +282,12 @@ static float NormalizeAngle(float angle) {
 static float LerpAngle(float from, float to, float t) {
     float diff = NormalizeAngle(to - from);
     return from + diff * t;
+}
+
+static void Reset3pvYawSmoothing(const char* reason) {
+    if (!g_yawInitialized) return;
+    g_yawInitialized = false;
+    FpvLog("[3PV] yaw smoothing reset: %s\n", reason ? reason : "unknown");
 }
 
 static float SmoothStep(float t) {
@@ -267,11 +387,9 @@ static bool Get3pvOrbitPivot(void* playerEntity, float out[3]) {
     return true;
 }
 
-static bool Get3pvOrbitYawToTarget(void* playerEntity, int targetHandle, float* outYaw) {
+static bool Get3pvOrbitYawToPoint(void* playerEntity, const float* target, float* outYaw) {
     float pivot[3];
-    float target[3];
-    if (!Get3pvOrbitPivot(playerEntity, pivot)
-        || !GetPlayerAimPoint(targetHandle, target)) {
+    if (!target || !Get3pvOrbitPivot(playerEntity, pivot)) {
         return false;
     }
 
@@ -281,8 +399,17 @@ static bool Get3pvOrbitYawToTarget(void* playerEntity, int targetHandle, float* 
         return false;
     }
 
-    *outYaw = atan2f(dx, dy) + YAW_OFFSET_3PV;
+    *outYaw = atan2f(dx, dy) + YAW_OFFSET_3PV + PI_F;
     return true;
+}
+
+static bool Get3pvOrbitYawToTarget(void* playerEntity, int targetHandle, float* outYaw) {
+    float target[3];
+    if (!GetPlayerAimPoint(targetHandle, target)) {
+        return false;
+    }
+
+    return Get3pvOrbitYawToPoint(playerEntity, target, outYaw);
 }
 
 static float ClampFloat(float value, float minValue, float maxValue) {
@@ -598,6 +725,126 @@ static bool TryScoreKillCamCandidate(const float* candidate,
     return true;
 }
 
+static bool ScoreVerticalKillCamCandidate(const float* candidate,
+                                          const KillCamTargetView& killer,
+                                          const KillCamTargetView& victim,
+                                          const float* currentCam,
+                                          float lift,
+                                          const CameraConfig& cfg,
+                                          float* outScore) {
+    if (!currentCam || !KillCamCandidateInsideMap(candidate)) {
+        return false;
+    }
+
+    float minClearance = cfg.detachedKillCamMinClearance;
+    if (minClearance < 0.0f) minClearance = 0.0f;
+
+    float clearance = minClearance + 2.0f;
+    if (PathGrid_IsReady()) {
+        clearance = PathGrid_GetClearance(candidate[0], candidate[1], candidate[2]);
+        if (clearance < minClearance) {
+            return false;
+        }
+    }
+
+    if (!KillCamTargetHasLos(candidate, killer)
+        || !KillCamTargetHasLos(candidate, victim)) {
+        return false;
+    }
+
+    float toKiller[3] = {
+        killer.aim[0] - candidate[0],
+        killer.aim[1] - candidate[1],
+        killer.aim[2] - candidate[2]
+    };
+    float toVictim[3] = {
+        victim.aim[0] - candidate[0],
+        victim.aim[1] - candidate[1],
+        victim.aim[2] - candidate[2]
+    };
+    float killerDist = sqrtf(toKiller[0] * toKiller[0] + toKiller[1] * toKiller[1] + toKiller[2] * toKiller[2]);
+    float victimDist = sqrtf(toVictim[0] * toVictim[0] + toVictim[1] * toVictim[1] + toVictim[2] * toVictim[2]);
+    float minTargetDist = killerDist < victimDist ? killerDist : victimDist;
+    if (minTargetDist < 3.5f) {
+        return false;
+    }
+
+    float sepAngle = 0.0f;
+    if (killerDist > 0.05f && victimDist > 0.05f) {
+        float angleDot = (toKiller[0] * toVictim[0] + toKiller[1] * toVictim[1] + toKiller[2] * toVictim[2])
+                       / (killerDist * victimDist);
+        sepAngle = acosf(ClampFloat(angleDot, -1.0f, 1.0f));
+    }
+
+    if (sepAngle < 0.12f || sepAngle > 1.05f) {
+        return false;
+    }
+
+    float mid[3] = {
+        (killer.aim[0] + victim.aim[0]) * 0.5f,
+        (killer.aim[1] + victim.aim[1]) * 0.5f,
+        (killer.aim[2] + victim.aim[2]) * 0.5f
+    };
+    float horizToMidX = mid[0] - candidate[0];
+    float horizToMidY = mid[1] - candidate[1];
+    float horizToMid = sqrtf(horizToMidX * horizToMidX + horizToMidY * horizToMidY);
+
+    float minLift = cfg.detachedKillCamMinHeight;
+    if (minLift < 3.0f) minLift = 3.0f;
+    float maxLift = cfg.detachedKillCamMaxHeight;
+    if (maxLift < minLift) maxLift = minLift;
+    float idealLift = ClampFloat(7.0f, minLift, maxLift);
+    float liftSpan = maxLift - minLift;
+    if (liftSpan < 0.25f) liftSpan = 4.0f;
+
+    float sepScore = 1.0f - fabsf(sepAngle - 0.35f) / 0.35f;
+    sepScore = ClampFloat(sepScore, 0.0f, 1.0f);
+
+    float liftScore = 1.0f - fabsf(lift - idealLift) / liftSpan;
+    liftScore = ClampFloat(liftScore, 0.0f, 1.0f);
+
+    float targetDistScore = ClampFloat((minTargetDist - 3.5f) / 6.0f, 0.0f, 1.0f);
+    float balancePenalty = fabsf(killerDist - victimDist) * 0.25f;
+
+    float score = 0.0f;
+    score += sepScore * 42.0f;
+    score += liftScore * 22.0f;
+    score += targetDistScore * 14.0f;
+    score += clearance * (PathGrid_IsReady() ? 2.0f : 0.75f);
+    score -= balancePenalty;
+
+    float topDownRatio = lift / (horizToMid + 0.5f);
+    if (topDownRatio > 1.35f) {
+        score -= (topDownRatio - 1.35f) * 12.0f;
+    }
+    if (horizToMid < 1.5f) {
+        score -= (1.5f - horizToMid) * 10.0f;
+    }
+
+    *outScore = score;
+    return true;
+}
+
+static bool TryScoreVerticalKillCamCandidate(const float* candidate,
+                                             const KillCamTargetView& killer,
+                                             const KillCamTargetView& victim,
+                                             const float* currentCam,
+                                             float lift,
+                                             const CameraConfig& cfg,
+                                             float* bestScore,
+                                             float* bestPos) {
+    float score = 0.0f;
+    if (!ScoreVerticalKillCamCandidate(candidate, killer, victim, currentCam, lift, cfg, &score)) {
+        return false;
+    }
+
+    if (score > *bestScore) {
+        *bestScore = score;
+        CopyVec3(candidate, bestPos);
+    }
+    return true;
+}
+
 static bool SolveKillCamVantage(int killerHandle,
                                 int victimHandle,
                                 const float* currentCam,
@@ -723,24 +970,135 @@ static bool SolveKillCamVantage(int killerHandle,
     return true;
 }
 
+static bool SolveVerticalKillCamVantage(int killerHandle,
+                                        int victimHandle,
+                                        const float* currentCam,
+                                        const CameraConfig& cfg,
+                                        float outPos[3],
+                                        float outLookAt[3]) {
+    if (!currentCam || !OctCollision_IsLoaded()) {
+        return false;
+    }
+
+    KillCamTargetView killer, victim;
+    if (!GetKillCamTargetView(killerHandle, killer)
+        || !GetKillCamTargetView(victimHandle, victim)) {
+        return false;
+    }
+
+    outLookAt[0] = (killer.aim[0] + victim.aim[0]) * 0.5f;
+    outLookAt[1] = (killer.aim[1] + victim.aim[1]) * 0.5f;
+    outLookAt[2] = (killer.aim[2] + victim.aim[2]) * 0.5f;
+
+    float minLift = cfg.detachedKillCamMinHeight;
+    if (minLift < 3.0f) minLift = 3.0f;
+    float maxLift = cfg.detachedKillCamMaxHeight;
+    if (maxLift < minLift) maxLift = minLift;
+    float idealLift = ClampFloat(7.0f, minLift, maxLift);
+
+    float lifts[5] = {
+        idealLift,
+        minLift,
+        (minLift + idealLift) * 0.5f,
+        (idealLift + maxLift) * 0.5f,
+        maxLift
+    };
+
+    float bestScore = -1.0e30f;
+    float bestPos[3] = {};
+
+    for (int i = 0; i < 5; ++i) {
+        bool duplicate = false;
+        for (int j = 0; j < i; ++j) {
+            if (fabsf(lifts[i] - lifts[j]) < 0.05f) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        float lift = lifts[i];
+        if (lift < minLift) lift = minLift;
+        if (lift > maxLift) lift = maxLift;
+
+        float candidate[3] = {
+            currentCam[0],
+            currentCam[1],
+            currentCam[2] + lift
+        };
+
+        TryScoreVerticalKillCamCandidate(candidate, killer, victim,
+                                         currentCam, lift, cfg,
+                                         &bestScore, bestPos);
+    }
+
+    float minScore = cfg.detachedKillCamMinVantageScore;
+    if (minScore < 0.0f) minScore = 0.0f;
+    if (bestScore < minScore) {
+        FpvLog("[Camera] KillCam vertical lift rejected: score=%.2f min=%.2f\n",
+               bestScore, minScore);
+        return false;
+    }
+
+    CopyVec3(bestPos, outPos);
+    FpvLog("[Camera] KillCam vertical lift pos=(%.2f, %.2f, %.2f) lift=%.2f score=%.2f\n",
+           outPos[0], outPos[1], outPos[2], outPos[2] - currentCam[2], bestScore);
+    return true;
+}
+
+static bool ShouldAttemptDetachedKillCamVantage(const CameraConfig& cfg) {
+    if (cfg.debugCameraMode == DebugCameraMode::VictimLook3pv) {
+        return false;
+    }
+    if (g_killCamVantageRollDecided) {
+        return g_killCamVantageRollPassed;
+    }
+
+    g_killCamVantageRollDecided = true;
+    float chance = ClampFloat(cfg.detachedKillCamVantageChance, 0.0f, 1.0f);
+    float roll = (float)(rand() % 10000) / 10000.0f;
+    g_killCamVantageRollPassed = roll < chance;
+
+    if (!g_killCamVantageRollPassed) {
+        FpvLog("[Camera] KillCam vertical lift skipped: roll=%.3f chance=%.3f\n",
+               roll, chance);
+    }
+
+    return g_killCamVantageRollPassed;
+}
+
 static bool EnsureKillCamVantage(int killerHandle,
                                  int victimHandle,
                                  const float* currentCam,
-                                 const CameraConfig& cfg) {
+                                 const CameraConfig& cfg,
+                                 bool verticalOnly) {
     if (g_killCamVantageValid) {
         return true;
     }
     if (g_killCamVantageAttempted) {
         return false;
     }
+    if (verticalOnly && !ShouldAttemptDetachedKillCamVantage(cfg)) {
+        g_killCamVantageAttempted = true;
+        return false;
+    }
 
     g_killCamVantageAttempted = true;
-    g_killCamVantageValid = SolveKillCamVantage(killerHandle,
-                                                victimHandle,
-                                                currentCam,
-                                                cfg,
-                                                g_killCamVantagePos,
-                                                g_killCamVantageLookAt);
+    if (verticalOnly) {
+        g_killCamVantageValid = SolveVerticalKillCamVantage(killerHandle,
+                                                           victimHandle,
+                                                           currentCam,
+                                                           cfg,
+                                                           g_killCamVantagePos,
+                                                           g_killCamVantageLookAt);
+    } else {
+        g_killCamVantageValid = SolveKillCamVantage(killerHandle,
+                                                   victimHandle,
+                                                   currentCam,
+                                                   cfg,
+                                                   g_killCamVantagePos,
+                                                   g_killCamVantageLookAt);
+    }
     if (!g_killCamVantageValid) {
         FpvLog("[Camera] KillCam vantage unavailable; using safe spectator fallback\n");
     }
@@ -958,6 +1316,8 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
     CameraState dirState = CameraDirector_GetState();
     KillCamPhase kcPhase = CameraDirector_GetKillCamPhase();
     KillCamStyle kcStyle = CameraDirector_GetKillCamStyle();
+    int currentKillCamKillerHandle = CameraDirector_GetKillCamKillerHandle();
+    int currentKillCamVictimHandle = CameraDirector_GetKillCamVictimHandle();
     const CameraConfig& cfg = CameraDirector_GetConfig();
 
     // Detect player change and reset render state
@@ -1002,11 +1362,21 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         }
     }
 
-    // Detect KillCam start (transition from non-KillCam to KillCam)
-    if (dirState == CameraState::KillCam && g_lastDirState != CameraState::KillCam) {
-        // New KillCam started — snapshot positions
-        int killerHandle = CameraDirector_GetKillCamKillerHandle();
-        int victimHandle = CameraDirector_GetKillCamVictimHandle();
+    bool newKillCam = dirState == CameraState::KillCam
+        && (g_lastDirState != CameraState::KillCam
+            || currentKillCamKillerHandle != g_lastKillCamKillerHandle
+            || currentKillCamVictimHandle != g_lastKillCamVictimHandle);
+    if (dirState != CameraState::KillCam) {
+        g_lastKillCamKillerHandle = 0;
+        g_lastKillCamVictimHandle = 0;
+    }
+
+    // Detect KillCam start or a new killcam pair while still in KillCam state.
+    if (newKillCam) {
+        int killerHandle = currentKillCamKillerHandle;
+        int victimHandle = currentKillCamVictimHandle;
+        g_lastKillCamKillerHandle = killerHandle;
+        g_lastKillCamVictimHandle = victimHandle;
         g_killCamStyle = kcStyle;
 
         if (!GetBestKillCamPosition(killerHandle, g_killCamKillerLastPos)) {
@@ -1022,11 +1392,15 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         g_killCamPhase2Entered = false;
         g_killCamVantageValid = false;
         g_killCamVantageAttempted = false;
+        g_killCamVantageRollDecided = false;
+        g_killCamVantageRollPassed = false;
         g_killCamMoveStartValid = false;
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
             g_yawInitialized = false;
-            FpvLog("[Camera] Close KillCam: solving collision-safe vantage\n");
+            FpvLog("[Camera] Close KillCam: victim look-lock with optional vertical lift killer=%d victim=%d\n",
+                   killerHandle,
+                   victimHandle);
         }
     }
 
@@ -1041,6 +1415,17 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                                                &lookLockTarget,
                                                &lookLockReason);
     bool lookLockApplied = false;
+    if (g_lastDirState == CameraState::KillCam && dirState != CameraState::KillCam) {
+        Reset3pvYawSmoothing("left-killcam");
+    } else if (g_lookLockWasActive && !lookLockActive) {
+        Reset3pvYawSmoothing("left-look-lock");
+    }
+
+    TpvYawDebugFrame tpvDebug;
+    tpvDebug.preprocess = do3pvPreprocess;
+    tpvDebug.lookLockActive = lookLockActive;
+    tpvDebug.lookLockTarget = lookLockTarget;
+    tpvDebug.lookLockReason = lookLockReason;
 
     if (do3pvPreprocess && playerEntity) {
         void** skeletonPtrPtr = *(void***)((char*)playerEntity + PLAYER_SKELETON_PTR);
@@ -1051,13 +1436,31 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
             void* skeleton = *skeletonPtrPtr;
 
             if (GetBoneRotation(skeleton, BONE_HEAD, &yaw, &pitch)) {
-                float desiredYaw = yaw + YAW_OFFSET_3PV;
+                float desiredYaw = NormalizeAngle(yaw + YAW_OFFSET_3PV);
                 float lookLockYaw = 0.0f;
+                tpvDebug.boneValid = true;
+                tpvDebug.boneYaw = yaw;
+                tpvDebug.bonePitch = pitch;
                 if (lookLockActive
+                    && dirState == CameraState::KillCam
+                    && kcStyle == KillCamStyle::DetachedVantage) {
+                    float frozenVictimAim[3];
+                    if (CameraDirector_GetKillCamVictimAimPoint(frozenVictimAim)
+                        && Get3pvOrbitYawToPoint(playerEntity, frozenVictimAim, &lookLockYaw)) {
+                        desiredYaw = NormalizeAngle(lookLockYaw);
+                        lookLockApplied = true;
+                        tpvDebug.lookLockFrozenTarget = true;
+                    }
+                }
+                if (lookLockActive
+                    && !lookLockApplied
                     && Get3pvOrbitYawToTarget(playerEntity, lookLockTarget, &lookLockYaw)) {
-                    desiredYaw = lookLockYaw;
+                    desiredYaw = NormalizeAngle(lookLockYaw);
                     lookLockApplied = true;
                 }
+                tpvDebug.lookLockApplied = lookLockApplied;
+                tpvDebug.lookLockYaw = lookLockYaw;
+                tpvDebug.desiredYaw = desiredYaw;
 
                 if (pitch > MAX_PITCH_3PV) pitch = MAX_PITCH_3PV;
                 if (pitch < -MAX_PITCH_3PV) pitch = -MAX_PITCH_3PV;
@@ -1067,12 +1470,14 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                     g_yawInitialized = true;
                 }
 
-                g_smoothedYaw = LerpAngle(g_smoothedYaw, desiredYaw, cfg.tpvYawSmoothFactor);
+                g_smoothedYaw = NormalizeAngle(LerpAngle(g_smoothedYaw, desiredYaw, cfg.tpvYawSmoothFactor));
 
                 int cameraIndex = *(int*)((char*)thisPtr + 0x28);
                 char* cameraEntry = (char*)thisPtr + 44 + 20 * cameraIndex;
                 *(float*)(cameraEntry + 8) = pitch;
                 *(float*)(cameraEntry + 12) = g_smoothedYaw;
+                tpvDebug.smoothedYaw = g_smoothedYaw;
+                tpvDebug.cameraIndex = cameraIndex;
             }
         }
     }
@@ -1226,6 +1631,110 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         }
     }
 
+    if (do3pvPreprocess && result && playerEntity && WorldCameraTracker_GetCurrentCamType() == 2) {
+        float playerPos[3];
+        if (g_GetChestPosition && g_GetChestPosition(playerEntity, playerPos)) {
+            // chest position already populated
+        } else {
+            GetEntityPos(playerEntity, playerPos);
+            playerPos[2] += 1.25f;
+        }
+
+        float* camPos = (float*)cameraProp;
+        float camDx = camPos[0] - playerPos[0];
+        float camDy = camPos[1] - playerPos[1];
+        float camDz = camPos[2] - playerPos[2];
+        float horizDist = sqrtf(camDx * camDx + camDy * camDy);
+        float dist3d = sqrtf(camDx * camDx + camDy * camDy + camDz * camDz);
+
+        float forwardX = 0.0f;
+        float forwardY = 1.0f;
+        float forwardYaw = 0.0f;
+        if (tpvDebug.boneValid) {
+            forwardYaw = tpvDebug.boneYaw;
+            forwardX = sinf(forwardYaw);
+            forwardY = cosf(forwardYaw);
+        } else {
+            float entYaw = *(float*)((char*)playerEntity + 0xFC);
+            forwardYaw = entYaw;
+            forwardX = -sinf(entYaw);
+            forwardY = cosf(entYaw);
+        }
+
+        float camDirX = 0.0f;
+        float camDirY = 0.0f;
+        if (horizDist > 0.001f) {
+            camDirX = camDx / horizDist;
+            camDirY = camDy / horizDist;
+        }
+
+        float frontDot = forwardX * camDirX + forwardY * camDirY;
+        int frontClass = TpvDebugFrontClass(frontDot);
+
+        if (ShouldLogTpvDebug(cfg, dirState, frontClass, lookLockApplied)) {
+            int cameraIndex = *(int*)((char*)thisPtr + 0x28);
+            char* cameraEntry = (char*)thisPtr + 44 + 20 * cameraIndex;
+            float entryPitch = *(float*)(cameraEntry + 8);
+            float entryYaw = *(float*)(cameraEntry + 12);
+            float targetPos[3] = {};
+            bool haveTarget = false;
+            if (lookLockActive && tpvDebug.lookLockFrozenTarget) {
+                haveTarget = CameraDirector_GetKillCamVictimAimPoint(targetPos);
+            }
+            if (lookLockActive && !haveTarget) {
+                haveTarget = GetPlayerAimPoint(lookLockTarget, targetPos);
+            }
+            float targetDx = haveTarget ? targetPos[0] - playerPos[0] : 0.0f;
+            float targetDy = haveTarget ? targetPos[1] - playerPos[1] : 0.0f;
+            float targetYawDx = haveTarget ? NormalizeAngle(atan2f(targetDx, targetDy) + YAW_OFFSET_3PV) : 0.0f;
+            float targetYawNegDx = haveTarget ? NormalizeAngle(atan2f(-targetDx, targetDy) + YAW_OFFSET_3PV) : 0.0f;
+            float targetYawDxPi = haveTarget ? NormalizeAngle(targetYawDx + PI_F) : 0.0f;
+
+            TpvDebugLog(
+                "[3PV] tick=%lu dbg=%s state=%s phase=%s style=%s target=%d wcType=%d "
+                "source=%s lookActive=%d lookApplied=%d lookFrozen=%d lookTarget=%d reason=%s "
+                "class=%s dot=%.3f horiz=%.2f dist=%.2f dz=%.2f "
+                "player=(%.2f,%.2f,%.2f) cam=(%.2f,%.2f,%.2f) "
+                "fwd=(%.3f,%.3f) camDir=(%.3f,%.3f) "
+                "boneYaw=%.4f fwdYaw=%.4f desired=%.4f smooth=%.4f entryYaw=%.4f entryPitch=%.4f "
+                "lookYaw=%.4f targetYawDx=%.4f targetYawDxPi=%.4f targetYawNegDx=%.4f targetDelta=(%.2f,%.2f)\n",
+                GetTickCount(),
+                DebugCameraModeName(cfg.debugCameraMode),
+                CameraStateName(dirState),
+                KillCamPhaseName(kcPhase),
+                KillCamStyleName(kcStyle),
+                CameraDirector_GetTargetHandle(),
+                WorldCameraTracker_GetCurrentCamType(),
+                lookLockApplied ? "look-lock" : (tpvDebug.boneValid ? "head" : "none"),
+                lookLockActive ? 1 : 0,
+                lookLockApplied ? 1 : 0,
+                tpvDebug.lookLockFrozenTarget ? 1 : 0,
+                lookLockTarget,
+                lookLockReason ? lookLockReason : "-",
+                TpvDebugFrontClassName(frontClass),
+                frontDot,
+                horizDist,
+                dist3d,
+                camDz,
+                playerPos[0], playerPos[1], playerPos[2],
+                camPos[0], camPos[1], camPos[2],
+                forwardX, forwardY,
+                camDirX, camDirY,
+                tpvDebug.boneYaw,
+                forwardYaw,
+                tpvDebug.desiredYaw,
+                tpvDebug.smoothedYaw,
+                entryYaw,
+                entryPitch,
+                tpvDebug.lookLockYaw,
+                targetYawDx,
+                targetYawDxPi,
+                targetYawNegDx,
+                targetDx,
+                targetDy);
+        }
+    }
+
     // World camera auto-zoom: reduce FOV when player is far from camera
     {
         static float s_smoothedFovScale = 1.0f;
@@ -1273,12 +1782,14 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         int killerHandle = CameraDirector_GetKillCamKillerHandle();
         int victimHandle = CameraDirector_GetKillCamVictimHandle();
         float* liveCamPos = (float*)cameraProp;
-        bool hasSolvedVantage = EnsureKillCamVantage(killerHandle,
-                                                     victimHandle,
-                                                     liveCamPos,
-                                                     cfg);
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
+            bool canLiftNow = (kcPhase == KillCamPhase::Transition
+                            || kcPhase == KillCamPhase::Attached);
+            bool hasSolvedVantage = canLiftNow
+                && EnsureKillCamVantage(killerHandle, victimHandle,
+                                        liveCamPos, cfg, true);
+
             if (hasSolvedVantage) {
                 float waitEnd = cfg.detachedKillCamFollowDuration;
                 float transEnd = waitEnd + cfg.detachedKillCamRepositionDuration;
@@ -1287,7 +1798,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                     if (!g_killCamMoveStartValid) {
                         CopyVec3(liveCamPos, g_killCamMoveStartPos);
                         g_killCamMoveStartValid = true;
-                        FpvLog("[Camera] KillCam moving to solved vantage\n");
+                        FpvLog("[Camera] KillCam lifting vertically\n");
                     }
 
                     float denom = transEnd - waitEnd;
@@ -1301,7 +1812,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 if (kcPhase == KillCamPhase::Attached) {
                     if (!g_killCamPhase2Entered) {
                         g_killCamPhase2Entered = true;
-                        FpvLog("[Camera] KillCam fixed solved vantage hold\n");
+                        FpvLog("[Camera] KillCam fixed vertical hold\n");
                     }
 
                     CopyVec3(g_killCamVantagePos, liveCamPos);
@@ -1309,6 +1820,12 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 }
             }
         } else {
+            bool hasSolvedVantage = EnsureKillCamVantage(killerHandle,
+                                                         victimHandle,
+                                                         liveCamPos,
+                                                         cfg,
+                                                         false);
+
             // Look up entities, snapshot positions
             void* killerEntity = FindEntityByHandle(killerHandle);
             void* victimEntity = FindEntityByHandle(victimHandle);

@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <Windows.h>
 
 uintptr_t DelayManager::gameBase = 0;
@@ -137,13 +139,18 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "detached_killcam_reposition_duration=2.5\n";
                 outFile << "killcam_attached_duration=3.0\n";
                 outFile << "detached_killcam_hold_duration=3.0\n";
+                outFile << "detached_killcam_vantage_chance=0.25\n";
+                outFile << "detached_killcam_min_vantage_score=60.0\n";
                 outFile << "detached_killcam_min_height=3.0\n";
-                outFile << "detached_killcam_max_height=12.0\n";
+                outFile << "detached_killcam_max_height=7.0\n";
                 outFile << "detached_killcam_min_radius=6.0\n";
                 outFile << "detached_killcam_max_radius=22.0\n";
                 outFile << "detached_killcam_min_clearance=1.0\n";
                 outFile << "kill_look_lock_advance=3.0\n";
                 outFile << "director_pre_roll=5.0\n";
+                outFile << "; Debug override: auto, player_3pv, fpv, world, drone, victim_look_3pv, bullet_killcam\n";
+                outFile << "debug_camera_mode=auto\n";
+                outFile << "debug_only_victim_look_3pv=0\n";
                 outFile.close();
                 return 0;
             }
@@ -250,6 +257,52 @@ static int ReadIniInt(const std::string& iniPath, const char* key, int defaultVa
     try { return std::stoi(buf); } catch (...) { return defaultVal; }
 }
 
+static std::string ReadIniString(const std::string& iniPath, const char* key, const char* defaultVal) {
+    char buf[96];
+    GetPrivateProfileStringA("CameraDirector", key, defaultVal, buf, sizeof(buf), iniPath.c_str());
+    return std::string(buf);
+}
+
+static std::string NormalizeIniToken(std::string value) {
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) {
+        return !std::isspace(ch);
+    }).base(), value.end());
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return (char)std::tolower(ch);
+    });
+    return value;
+}
+
+static DebugCameraMode ParseDebugCameraMode(std::string value) {
+    value = NormalizeIniToken(value);
+    if (value.empty() || value == "0" || value == "auto" || value == "off" || value == "none") {
+        return DebugCameraMode::Auto;
+    }
+    if (value == "player" || value == "player_3pv" || value == "3pv" || value == "tpv") {
+        return DebugCameraMode::Player3pv;
+    }
+    if (value == "fpv" || value == "first_person") {
+        return DebugCameraMode::Fpv;
+    }
+    if (value == "world" || value == "worldcam" || value == "world_cam") {
+        return DebugCameraMode::World;
+    }
+    if (value == "drone") {
+        return DebugCameraMode::Drone;
+    }
+    if (value == "victim_look" || value == "victim_look_3pv" || value == "look_lock"
+        || value == "looklock" || value == "killcam_victim") {
+        return DebugCameraMode::VictimLook3pv;
+    }
+    if (value == "bullet" || value == "bullet_killcam" || value == "bullet_travel") {
+        return DebugCameraMode::BulletKillcam;
+    }
+    return DebugCameraMode::Auto;
+}
+
 static float NormalizeChance(float value) {
     if (value > 1.0f && value <= 100.0f) value *= 0.01f;
     if (value < 0.0f) return 0.0f;
@@ -277,8 +330,10 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.detachedKillCamFollowDuration     = ReadIniFloat(iniPath, "detached_killcam_follow_duration", 2.5f);
     cfg.detachedKillCamRepositionDuration = ReadIniFloat(iniPath, "detached_killcam_reposition_duration", 2.5f);
     cfg.detachedKillCamHoldDuration       = ReadIniFloat(iniPath, "detached_killcam_hold_duration", 3.0f);
+    cfg.detachedKillCamVantageChance      = NormalizeChance(ReadIniFloat(iniPath, "detached_killcam_vantage_chance", 0.25f));
+    cfg.detachedKillCamMinVantageScore    = ReadIniFloat(iniPath, "detached_killcam_min_vantage_score", 60.0f);
     cfg.detachedKillCamMinHeight          = ReadIniFloat(iniPath, "detached_killcam_min_height", 3.0f);
-    cfg.detachedKillCamMaxHeight          = ReadIniFloat(iniPath, "detached_killcam_max_height", 12.0f);
+    cfg.detachedKillCamMaxHeight          = ReadIniFloat(iniPath, "detached_killcam_max_height", 7.0f);
     cfg.detachedKillCamMinRadius          = ReadIniFloat(iniPath, "detached_killcam_min_radius", 6.0f);
     cfg.detachedKillCamMaxRadius          = ReadIniFloat(iniPath, "detached_killcam_max_radius", 22.0f);
     cfg.detachedKillCamMinClearance       = ReadIniFloat(iniPath, "detached_killcam_min_clearance", 1.0f);
@@ -339,6 +394,12 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.droneVantageRecomputeDist = ReadIniFloat(iniPath, "drone_vantage_recompute_dist", 5.0f);
 
     cfg.debugMode                 = (ReadIniInt(iniPath, "debug_mode", 0) != 0);
+    std::string debugCameraMode = ReadIniString(iniPath, "debug_camera_mode", "");
+    cfg.debugCameraMode = ParseDebugCameraMode(debugCameraMode);
+    if (debugCameraMode.empty()
+        && ReadIniInt(iniPath, "debug_only_victim_look_3pv", 0) != 0) {
+        cfg.debugCameraMode = DebugCameraMode::VictimLook3pv;
+    }
 
     DiagnosticsLog_Append("receiver_debug.log", "[CameraDirector] Config loaded from %s\n", iniPath.c_str());
 }

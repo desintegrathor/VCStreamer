@@ -22,7 +22,9 @@ int WorldCameraTracker_GetCurrentCamType();
 bool WorldCameraTracker_GetCurrentCamPos(float* outPos);
 
 // Set camera type preference for deficit-based scheduling.
-// preferType: 0 or 1 = bias toward world cameras, 2 = bias toward player cam, -1 = neutral
+// preferType: 0 or 1 = bias toward world cameras, 2 = bias toward player cam,
+// 3 = force player cam, 4 = force world cam when any usable world cam exists,
+// -1 = neutral
 void WorldCameraTracker_SetPreference(int preferType);
 
 // Apply CameraDirector tuning values loaded from vcstreamer.ini.

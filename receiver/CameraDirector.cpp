@@ -43,6 +43,8 @@ static KillCamPhase g_killCamPhase = KillCamPhase::Wait;
 static KillCamStyle g_kcStyle = KillCamStyle::BulletTravel;
 static int g_kcKillerHandle = 0;
 static int g_kcVictimHandle = 0;
+static float g_kcVictimAimPoint[3] = {};
+static bool g_kcVictimAimPointValid = false;
 static DWORD g_kcStartTick = 0;
 
 // Flag state
@@ -114,6 +116,8 @@ struct ShotRequest {
     float holdSeconds;
     bool force;
     const char* reason;
+    bool hasVictimAimPoint;
+    float victimAimPoint[3];
 };
 
 struct PendingDirectorEvent {
@@ -679,6 +683,31 @@ static bool CopySnapshotPosition(const PlayerSnapshot& snapshot, float* out) {
     return true;
 }
 
+static bool GetFrozenVictimAimPoint(const DirectorEvent& event, float* out) {
+    if (!out || event.type != DirectorEventType::Kill) return false;
+
+    PlayerSnapshot snapshot = {};
+    if (event.hasVictimSnapshot && event.victimSnapshot.hasPosition) {
+        snapshot = event.victimSnapshot;
+    } else if (!ServerStateSniffer_GetSnapshotAt(event.victimHandle,
+                                                 event.visibleTick,
+                                                 &snapshot)) {
+        if (!GetCurrentPlayerPosition(event.victimHandle, out)) {
+            return false;
+        }
+
+        out[2] += 1.25f;
+        return true;
+    }
+
+    if (!CopySnapshotPosition(snapshot, out)) {
+        return false;
+    }
+
+    out[2] += 1.25f;
+    return true;
+}
+
 static bool GetBestKillPosition(int handle,
                                 DWORD visibleTick,
                                 const PlayerSnapshot* eventSnapshot,
@@ -906,6 +935,76 @@ static const char* KillCamStyleName(KillCamStyle style) {
     return style == KillCamStyle::DetachedVantage ? "victim-lock-3pv" : "bullet";
 }
 
+static const char* DebugCameraModeName(DebugCameraMode mode) {
+    switch (mode) {
+        case DebugCameraMode::Player3pv: return "player_3pv";
+        case DebugCameraMode::Fpv: return "fpv";
+        case DebugCameraMode::World: return "world";
+        case DebugCameraMode::Drone: return "drone";
+        case DebugCameraMode::VictimLook3pv: return "victim_look_3pv";
+        case DebugCameraMode::BulletKillcam: return "bullet_killcam";
+        case DebugCameraMode::Auto:
+        default: return "auto";
+    }
+}
+
+static DebugCameraMode ActiveDebugCameraMode() {
+    return g_config.debugCameraMode;
+}
+
+static bool IsDebugCameraModeActive() {
+    return ActiveDebugCameraMode() != DebugCameraMode::Auto;
+}
+
+static bool ShouldDropDirectorEventForDebug(const DirectorEvent& event) {
+    return IsDebugCameraModeActive()
+        && event.type == DirectorEventType::Flag;
+}
+
+static bool DebugKillEventCanPreemptLock(const PendingDirectorEvent& pending) {
+    return IsDebugCameraModeActive()
+        && pending.event.type == DirectorEventType::Kill
+        && g_committedShotKind != ShotKind::KillCam;
+}
+
+static bool DebugModeForcesPlayerCamera() {
+    DebugCameraMode mode = ActiveDebugCameraMode();
+    return mode == DebugCameraMode::Player3pv
+        || mode == DebugCameraMode::Fpv
+        || mode == DebugCameraMode::VictimLook3pv
+        || mode == DebugCameraMode::BulletKillcam;
+}
+
+static int WorldPreferenceForDebugMode() {
+    DebugCameraMode mode = ActiveDebugCameraMode();
+    if (DebugModeForcesPlayerCamera()) return 3;
+    if (mode == DebugCameraMode::World) return 4;
+    if (mode == DebugCameraMode::Drone) return -1;
+    return -2;
+}
+
+static int WorldPreferenceForRequest(const ShotRequest& request) {
+    int debugPreference = WorldPreferenceForDebugMode();
+    if (debugPreference != -2) return debugPreference;
+    if (request.kind == ShotKind::KillCam) {
+        return request.killCamStyle == KillCamStyle::DetachedVantage ? 2 : 0;
+    }
+    return request.preference == CAM_PLAYER ? 2 : 0;
+}
+
+static bool ShouldUseFpvForFollowShot() {
+    DebugCameraMode mode = ActiveDebugCameraMode();
+    if (mode == DebugCameraMode::Fpv) return true;
+    if (mode == DebugCameraMode::Player3pv
+        || mode == DebugCameraMode::World
+        || mode == DebugCameraMode::Drone
+        || mode == DebugCameraMode::VictimLook3pv
+        || mode == DebugCameraMode::BulletKillcam) {
+        return false;
+    }
+    return RollFpvForShot();
+}
+
 static const char* ViewNameForRequest(const ShotRequest& request) {
     if (request.kind == ShotKind::Drone) return "drone";
     if (request.kind == ShotKind::KillCam) return "world";
@@ -1043,6 +1142,7 @@ static void ClearCommittedShot(DWORD now, const char* reason) {
     g_kcStyle = KillCamStyle::BulletTravel;
     g_kcKillerHandle = 0;
     g_kcVictimHandle = 0;
+    g_kcVictimAimPointValid = false;
     ClearFlagKillLook();
     ClearFlagCampingGlimpse();
     WorldCameraTracker_ClearTarget();
@@ -1071,12 +1171,13 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
             g_kcVictimHandle = 0;
+            g_kcVictimAimPointValid = false;
             ClearFlagKillLook();
             ClearFlagCampingGlimpse();
 
             SetSpectatorToPlayerId(request.targetHandle);
             WorldCameraTracker_SetTarget(request.targetHandle);
-            WorldCameraTracker_SetPreference(request.preference == CAM_PLAYER ? 2 : 0);
+            WorldCameraTracker_SetPreference(WorldPreferenceForRequest(request));
 
             CD_Log("[CameraDirector] Commit follow target=%d pref=%s hold=%ds fpv=%s reason=%s\n",
                    request.targetHandle,
@@ -1098,6 +1199,12 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_kcStyle = request.killCamStyle;
             g_kcKillerHandle = request.targetHandle;
             g_kcVictimHandle = request.victimHandle;
+            g_kcVictimAimPointValid = request.hasVictimAimPoint;
+            if (g_kcVictimAimPointValid) {
+                g_kcVictimAimPoint[0] = request.victimAimPoint[0];
+                g_kcVictimAimPoint[1] = request.victimAimPoint[1];
+                g_kcVictimAimPoint[2] = request.victimAimPoint[2];
+            }
             g_kcStartTick = now;
             g_currentTargetHandle = request.targetHandle;
             g_currentHoldStart = now;
@@ -1108,12 +1215,13 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
 
             SetSpectatorToPlayerId(request.targetHandle);
             WorldCameraTracker_SetTarget(request.targetHandle);
-            WorldCameraTracker_SetPreference(g_kcStyle == KillCamStyle::DetachedVantage ? 2 : 0);
+            WorldCameraTracker_SetPreference(WorldPreferenceForRequest(request));
 
-            CD_Log("[CameraDirector] Commit killcam killer=%d victim=%d style=%s reason=%s\n",
+            CD_Log("[CameraDirector] Commit killcam killer=%d victim=%d style=%s frozenVictimAim=%s reason=%s\n",
                    request.targetHandle,
                    request.victimHandle,
                    KillCamStyleName(g_kcStyle),
+                   g_kcVictimAimPointValid ? "yes" : "no",
                    request.reason ? request.reason : "none");
             FeedCurrentWatching(request, now);
             return true;
@@ -1130,10 +1238,11 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_currentTargetHandle = request.targetHandle;
             g_currentHoldStart = now;
             g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
-            g_currentShotUseFpv = RollFpvForShot();
+            g_currentShotUseFpv = ShouldUseFpvForFollowShot();
             g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
             g_kcVictimHandle = 0;
+            g_kcVictimAimPointValid = false;
             if (g_flagKillLookVictimHandle != request.targetHandle) {
                 ClearFlagKillLook();
             }
@@ -1185,6 +1294,7 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
             g_kcVictimHandle = 0;
+            g_kcVictimAimPointValid = false;
             ClearFlagKillLook();
             ClearFlagCampingGlimpse();
 
@@ -1241,7 +1351,8 @@ static bool RequestKillCamShot(int killerHandle,
                                KillCamStyle style,
                                bool force,
                                const char* reason,
-                               DWORD now) {
+                               DWORD now,
+                               const float* victimAimPoint = nullptr) {
     ShotRequest request = {
         ShotKind::KillCam,
         killerHandle,
@@ -1252,6 +1363,12 @@ static bool RequestKillCamShot(int killerHandle,
         force,
         reason
     };
+    if (victimAimPoint) {
+        request.hasVictimAimPoint = true;
+        request.victimAimPoint[0] = victimAimPoint[0];
+        request.victimAimPoint[1] = victimAimPoint[1];
+        request.victimAimPoint[2] = victimAimPoint[2];
+    }
     return RequestShot(request, now);
 }
 
@@ -1341,13 +1458,18 @@ static void CompleteKillCam(DWORD now) {
     int nextTarget = g_kcKillerHandle;
     g_kcKillerHandle = 0;
     g_kcVictimHandle = 0;
+    g_kcVictimAimPointValid = false;
     g_lastEventTick = now;
     g_shotHoldUntil = 0;
 
     CD_Log("[CameraDirector] KillCam ended\n");
 
     if (CD_IsUsablePlayerHandle(nextTarget)) {
-        RequestFollowPlayerShot(nextTarget, CAM_WORLD, true, "killcam complete", now);
+        RequestFollowPlayerShot(nextTarget,
+                                DebugModeForcesPlayerCamera() ? CAM_PLAYER : CAM_WORLD,
+                                true,
+                                "killcam complete",
+                                now);
     } else {
         ClearCommittedShot(now, "killcam target lost");
     }
@@ -1400,11 +1522,25 @@ static CamBudgetType GetHighestDeficitType() {
 }
 
 static bool StartNextScheduledShot(DWORD now, const char* reason) {
-    CamBudgetType needed = GetHighestDeficitType();
     int currentTarget = CD_IsUsablePlayerHandle(g_currentTargetHandle)
         && !IsCampingFlagCarrier(g_currentTargetHandle)
         ? g_currentTargetHandle
         : 0;
+
+    DebugCameraMode debugMode = ActiveDebugCameraMode();
+    if (debugMode == DebugCameraMode::Drone) {
+        int droneTarget = currentTarget != 0 ? currentTarget : PickRandomActivePlayer(0);
+        return droneTarget != 0
+            && IsDroneSuitableForTarget(droneTarget)
+            && RequestDroneShot(droneTarget, false, reason, now);
+    }
+
+    CamBudgetType needed = GetHighestDeficitType();
+    if (debugMode == DebugCameraMode::World) {
+        needed = CAM_WORLD;
+    } else if (IsDebugCameraModeActive()) {
+        needed = CAM_PLAYER;
+    }
 
     if (needed == CAM_DRONE) {
         int droneTarget = currentTarget != 0 ? currentTarget : PickRandomActivePlayer(0);
@@ -1484,6 +1620,9 @@ static bool IsEventStale(const DirectorEvent& event, DWORD now) {
 }
 
 static int EventScore(const DirectorEvent& event) {
+    if (IsDebugCameraModeActive()) {
+        return event.type == DirectorEventType::Kill ? 200 : 0;
+    }
     return event.type == DirectorEventType::Flag ? 200 : 100;
 }
 
@@ -1519,6 +1658,20 @@ static void AttachEventSnapshots(DirectorEvent& event) {
 
 static void QueueDirectorEvent(DirectorEvent event, const char* reason) {
     AttachEventSnapshots(event);
+
+    if (ShouldDropDirectorEventForDebug(event)) {
+        DWORD plannedStart = PlannedStartTickForEvent(event);
+        TimingLog("[Plan] seq=%llu type=%s raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=drop-debug-%s\n",
+                  event.sequence,
+                  DirectorEventTypeName(event.type),
+                  event.rawTick,
+                  event.playbackDelayMs,
+                  event.visibleTick,
+                  plannedStart,
+                  event.availableLeadMs,
+                  DebugCameraModeName(ActiveDebugCameraMode()));
+        return;
+    }
 
     if (event.type == DirectorEventType::Flag) {
         for (size_t i = 0; i < g_eventQueue.size();) {
@@ -1578,6 +1731,7 @@ static void DrainSnifferEvents() {
 
 static bool ApplyVictimLookForEvent(const DirectorEvent& event, DWORD now) {
     if (event.type != DirectorEventType::Kill) return false;
+    if (IsDebugCameraModeActive()) return false;
 
     if (!MaybeStartVictimKillLook(event.killerHandle,
                                   event.victimHandle,
@@ -1606,6 +1760,66 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
 
     bool usedLiveAheadPosition = false;
     float distance = GetKillDistanceFromEvent(event, &usedLiveAheadPosition);
+    float frozenVictimAimPoint[3] = {};
+    bool hasFrozenVictimAimPoint = GetFrozenVictimAimPoint(event, frozenVictimAimPoint);
+
+    DebugCameraMode debugMode = ActiveDebugCameraMode();
+    if (debugMode != DebugCameraMode::Auto) {
+        bool committed = false;
+        switch (debugMode) {
+            case DebugCameraMode::VictimLook3pv:
+                committed = RequestKillCamShot(event.killerHandle,
+                                               event.victimHandle,
+                                               KillCamStyle::DetachedVantage,
+                                               true,
+                                               "debug victim-look 3pv",
+                                               now,
+                                               hasFrozenVictimAimPoint ? frozenVictimAimPoint : nullptr);
+                break;
+            case DebugCameraMode::BulletKillcam:
+                committed = RequestKillCamShot(event.killerHandle,
+                                               event.victimHandle,
+                                               KillCamStyle::BulletTravel,
+                                               true,
+                                               "debug bullet killcam",
+                                               now,
+                                               nullptr);
+                break;
+            case DebugCameraMode::Drone:
+                committed = RequestDroneShot(event.killerHandle,
+                                             true,
+                                             "debug drone",
+                                             now);
+                break;
+            case DebugCameraMode::World:
+                committed = RequestFollowPlayerShot(event.killerHandle,
+                                                    CAM_WORLD,
+                                                    true,
+                                                    "debug world",
+                                                    now);
+                break;
+            case DebugCameraMode::Fpv:
+            case DebugCameraMode::Player3pv:
+            default:
+                committed = RequestFollowPlayerShot(event.killerHandle,
+                                                    CAM_PLAYER,
+                                                    true,
+                                                    "debug player",
+                                                    now);
+                break;
+        }
+
+        if (committed) {
+            g_lastKillSwitch = now;
+            FeedNextKill(event.killerHandle,
+                         event.victimHandle,
+                         event.weaponId,
+                         event.availableLeadMs,
+                         distance,
+                         DebugCameraModeName(debugMode));
+        }
+        return committed;
+    }
 
     if (ApplyVictimLookForEvent(event, now)) {
         FeedNextKill(event.killerHandle,
@@ -1644,7 +1858,10 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
                                        style,
                                        false,
                                        "queued kill",
-                                       now);
+                                       now,
+                                       (style == KillCamStyle::DetachedVantage && hasFrozenVictimAimPoint)
+                                           ? frozenVictimAimPoint
+                                           : nullptr);
     } else if (CD_IsUsablePlayerHandle(event.killerHandle)) {
         committed = RequestFollowPlayerShot(event.killerHandle,
                                             CAM_WORLD,
@@ -1698,6 +1915,10 @@ static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
     BumpPlayerActivity(event.usCarrier, 0.6f);
     BumpPlayerActivity(event.vcCarrier, 0.6f);
     UpdateFlagCarrierMotion(now);
+
+    if (IsDebugCameraModeActive()) {
+        return true;
+    }
 
     bool anyFlag = (event.usCarrier != 0 || event.vcCarrier != 0);
     bool dualFlag = (event.usCarrier != 0 && event.vcCarrier != 0);
@@ -1815,7 +2036,8 @@ static bool PromoteQueuedEvents(DWORD now) {
             return changed;
         }
 
-        if (IsCommittedShotLocked(now)) {
+        bool debugPreempt = DebugKillEventCanPreemptLock(g_eventQueue[bestIndex]);
+        if (IsCommittedShotLocked(now) && !debugPreempt) {
             bool appliedVictimLook = TryApplyQueuedVictimLook(now);
             if (appliedVictimLook) {
                 return true;
@@ -1840,10 +2062,16 @@ static bool PromoteQueuedEvents(DWORD now) {
             }
             return changed;
         }
+        if (debugPreempt) {
+            CD_Log("[CameraDirector] Debug kill preempting locked %s seq=%llu\n",
+                   ShotKindName(g_committedShotKind),
+                   g_eventQueue[bestIndex].event.sequence);
+        }
 
         PendingDirectorEvent pending = g_eventQueue[bestIndex];
 
-        if (pending.event.type == DirectorEventType::Kill
+        if (!IsDebugCameraModeActive()
+            && pending.event.type == DirectorEventType::Kill
             && g_currentTargetHandle == pending.event.victimHandle
             && !TickReached(now, pending.event.visibleTick)) {
             if (ApplyVictimLookForEvent(pending.event, now)) {
@@ -2043,14 +2271,16 @@ void CameraDirector_Update() {
         }
     }
 
-    int movingFlagTarget = PickMovingFlagCarrierTarget();
-    if (movingFlagTarget != 0
-        && (g_state != CameraState::FlagWatch
-            || g_currentTargetHandle != movingFlagTarget)) {
-        ClearFlagCampingGlimpse();
-        RequestFlagWatchShot(movingFlagTarget, "flag carrier moving", now);
-    } else if (movingFlagTarget == 0) {
-        TryStartFlagCampingGlimpse(now);
+    if (!IsDebugCameraModeActive()) {
+        int movingFlagTarget = PickMovingFlagCarrierTarget();
+        if (movingFlagTarget != 0
+            && (g_state != CameraState::FlagWatch
+                || g_currentTargetHandle != movingFlagTarget)) {
+            ClearFlagCampingGlimpse();
+            RequestFlagWatchShot(movingFlagTarget, "flag carrier moving", now);
+        } else if (movingFlagTarget == 0) {
+            TryStartFlagCampingGlimpse(now);
+        }
     }
 
     if (g_flagKillLookKillTick != 0) {
@@ -2175,7 +2405,8 @@ void CameraDirector_Update() {
 
         case CameraState::FollowPlayer:
         case CameraState::Idle: {
-            bool noFlagPriority = (g_flagCarrierUS == 0 && g_flagCarrierVC == 0);
+            bool noFlagPriority = IsDebugCameraModeActive()
+                || (g_flagCarrierUS == 0 && g_flagCarrierVC == 0);
             bool currentTargetUsable = CD_IsUsablePlayerHandle(g_currentTargetHandle);
 
             if (noFlagPriority && !currentTargetUsable) {
@@ -2184,7 +2415,11 @@ void CameraDirector_Update() {
                 }
                 int picked = PickRandomActivePlayer(0);
                 if (picked != 0) {
-                    RequestFollowPlayerShot(picked, CAM_WORLD, true, "target lost", now);
+                    RequestFollowPlayerShot(picked,
+                                            ActiveDebugCameraMode() == DebugCameraMode::World ? CAM_WORLD : CAM_PLAYER,
+                                            true,
+                                            "target lost",
+                                            now);
                 } else {
                     ClearCommittedShot(now, "target lost and no active players");
                 }
@@ -2209,6 +2444,10 @@ void CameraDirector_OnSpectatorFrame(int* spectObj, float deltaTime) {
     CameraDirector_Update();
 
     if (spectObj) {
+        int debugWorldPreference = WorldPreferenceForDebugMode();
+        if (debugWorldPreference != -2) {
+            WorldCameraTracker_SetPreference(debugWorldPreference);
+        }
         WorldCameraTracker_Update(spectObj, g_gameBase);
     }
 
@@ -2227,6 +2466,13 @@ KillCamStyle CameraDirector_GetKillCamStyle() { return g_kcStyle; }
 int CameraDirector_GetTargetHandle() { return g_currentTargetHandle; }
 int CameraDirector_GetKillCamKillerHandle() { return g_kcKillerHandle; }
 int CameraDirector_GetKillCamVictimHandle() { return g_kcVictimHandle; }
+bool CameraDirector_GetKillCamVictimAimPoint(float out[3]) {
+    if (!out || !g_kcVictimAimPointValid) return false;
+    out[0] = g_kcVictimAimPoint[0];
+    out[1] = g_kcVictimAimPoint[1];
+    out[2] = g_kcVictimAimPoint[2];
+    return true;
+}
 float CameraDirector_GetKillCamElapsed() { return GetKillCamElapsedInternal(); }
 const CameraConfig& CameraDirector_GetConfig() { return g_config; }
 bool CameraDirector_ShouldUseFpv() { return g_currentShotUseFpv; }
@@ -2293,9 +2539,10 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_droneCamTime = 0.0f;
 
     CD_Log("[CameraDirector] Initialized\n");
-    CD_Log("[CameraDirector] KillCam split: victim-lock 3PV < %.2fm (%d%%), bullet >= %.2fm (%d%%), look-lock %.2fs before kill\n",
+    CD_Log("[CameraDirector] KillCam split: victim-lock 3PV < %.2fm (%d%%), vertical detach %d%%, bullet >= %.2fm (%d%%), look-lock %.2fs before kill\n",
            g_config.killCamLongRangeDistance,
            (int)(g_config.detachedKillCamChance * 100),
+           (int)(g_config.detachedKillCamVantageChance * 100),
            g_config.killCamLongRangeDistance,
            (int)(g_config.bulletKillCamChance * 100),
            g_config.killLookLockAdvance);
@@ -2304,6 +2551,10 @@ void InitCameraDirector(uintptr_t gameBase) {
            (int)(g_config.camShareWorld * 100),
            (int)(g_config.camShareDrone * 100),
            g_config.droneMinAreaClearance);
+    if (IsDebugCameraModeActive()) {
+        CD_Log("[CameraDirector] Debug camera mode: %s\n",
+               DebugCameraModeName(ActiveDebugCameraMode()));
+    }
     TimingLog("[Director] initialized preRollMs=%d\n",
               (int)(g_config.directorPreRollSeconds * 1000.0f));
 }

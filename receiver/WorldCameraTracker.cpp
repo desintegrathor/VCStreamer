@@ -35,7 +35,7 @@ constexpr uintptr_t SPECT_CAM_UPDATE_OFFSET = 0x148100;
 constexpr uintptr_t PLAYER_TABLE_OFFSET = 0x7AE9C8;
 constexpr uintptr_t CAM_SPLINE_EVALUATE_OFFSET = 0x32460; // 0xDA2460 - 0xD70000
 constexpr int CAM_REEVAL_INTERVAL = 30;
-static int g_preference = -1; // -1=neutral, 0/1=prefer world cam, 2=prefer player cam
+static int g_preference = -1; // -1=neutral, 0/1=prefer world cam, 2=prefer player cam, 3=force player cam, 4=force world cam
 
 static int SecondsToFrames(float seconds) {
     if (seconds < 0.1f) seconds = 0.1f;
@@ -149,6 +149,12 @@ static float ThresholdForPreference(int preferType) {
     }
     if (preferType == 2) {
         return g_worldCamScoreThreshold + 20.0f;
+    }
+    if (preferType == 3) {
+        return 1.0e9f;
+    }
+    if (preferType == 4) {
+        return 0.0f;
     }
     return g_worldCamScoreThreshold + 5.0f;
 }
@@ -275,6 +281,9 @@ void WorldCameraTracker_ClearTarget() {
 }
 
 void WorldCameraTracker_SetPreference(int preferType) {
+    if (g_preference == preferType) {
+        return;
+    }
     g_preference = preferType;
     ApplyPreferenceThreshold();
     LogWC("[WorldCam] Preference=%d scoreThreshold=%.1f\n",
@@ -400,6 +409,13 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
         ResolveDynCamPositions(spectObj);
     }
 
+    if (g_preference == 3) {
+        if (g_currentCamType != 2 || spectObj[0] != 2) {
+            SwitchToPlayerCamera(spectObj, "forced player preference");
+        }
+        return;
+    }
+
     int targetHandle = g_targetHandle.load();
     if (targetHandle == 0) return;
 
@@ -436,14 +452,17 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
         return;
     }
 
-    if ((g_currentCamType == 0 || g_currentCamType == 1)
+    bool forceWorldCam = (g_preference == 4);
+
+    if (!forceWorldCam
+        && (g_currentCamType == 0 || g_currentCamType == 1)
         && g_holdFrames >= g_maxHoldFrameBudget) {
         SwitchToPlayerCamera(spectObj, "world cam max hold reached");
         return;
     }
 
     bool needEval = (g_currentCamIndex == -1 && g_currentCamType != 2)
-                  || (g_holdFrames >= g_maxHoldFrameBudget)
+                  || (!forceWorldCam && g_holdFrames >= g_maxHoldFrameBudget)
                   || (g_switchCooldownFrames == 0 && (g_frameCounter % CAM_REEVAL_INTERVAL) == 0);
 
     if (needEval) {
