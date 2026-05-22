@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "FirstPersonCamera.h"
 #include "CameraDirector.h"
+#include "DiagnosticsLog.h"
 #include "DroneCamera.h"
 #include "DelayManager.h"
 #include "WorldCameraTracker.h"
@@ -10,7 +11,6 @@
 #include "OctCollision.h"
 #include "PathGrid.h"
 #include "minhook/MinHook.h"
-#include <iostream>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -128,8 +128,7 @@ static void FpvLog(const char* fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_fpvLog, fmt, args);
-    fflush(g_fpvLog);
+    DiagnosticsLog_Write(g_fpvLog, fmt, args);
     va_end(args);
 }
 
@@ -719,9 +718,8 @@ static bool SolveKillCamVantage(int killerHandle,
     }
 
     CopyVec3(bestPos, outPos);
-    std::cout << "[Camera] KillCam solved vantage pos=("
-              << outPos[0] << ", " << outPos[1] << ", " << outPos[2]
-              << ") score=" << bestScore << "\n";
+    FpvLog("[Camera] KillCam solved vantage pos=(%.2f, %.2f, %.2f) score=%.2f\n",
+           outPos[0], outPos[1], outPos[2], bestScore);
     return true;
 }
 
@@ -744,7 +742,7 @@ static bool EnsureKillCamVantage(int killerHandle,
                                                 g_killCamVantagePos,
                                                 g_killCamVantageLookAt);
     if (!g_killCamVantageValid) {
-        std::cout << "[Camera] KillCam vantage unavailable; using safe spectator fallback\n";
+        FpvLog("[Camera] KillCam vantage unavailable; using safe spectator fallback\n");
     }
     return g_killCamVantageValid;
 }
@@ -1028,7 +1026,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
             g_yawInitialized = false;
-            std::cout << "[Camera] Close KillCam: solving collision-safe vantage\n";
+            FpvLog("[Camera] Close KillCam: solving collision-safe vantage\n");
         }
     }
 
@@ -1289,7 +1287,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                     if (!g_killCamMoveStartValid) {
                         CopyVec3(liveCamPos, g_killCamMoveStartPos);
                         g_killCamMoveStartValid = true;
-                        std::cout << "[Camera] KillCam moving to solved vantage\n";
+                        FpvLog("[Camera] KillCam moving to solved vantage\n");
                     }
 
                     float denom = transEnd - waitEnd;
@@ -1303,7 +1301,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 if (kcPhase == KillCamPhase::Attached) {
                     if (!g_killCamPhase2Entered) {
                         g_killCamPhase2Entered = true;
-                        std::cout << "[Camera] KillCam fixed solved vantage hold\n";
+                        FpvLog("[Camera] KillCam fixed solved vantage hold\n");
                     }
 
                     CopyVec3(g_killCamVantagePos, liveCamPos);
@@ -1356,14 +1354,14 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 if (hasSolvedVantage) {
                     if (!g_killCamPhase2Entered) {
                         g_killCamPhase2Entered = true;
-                        std::cout << "[Camera] KillCam phase 2: solved post-kill hold\n";
+                        FpvLog("[Camera] KillCam phase 2: solved post-kill hold\n");
                     }
 
                     CopyVec3(g_killCamVantagePos, liveCamPos);
                     AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
                 } else if (!g_killCamPhase2Entered) {
                     g_killCamPhase2Entered = true;
-                    std::cout << "[Camera] KillCam phase 2: no solved vantage, keeping spectator fallback\n";
+                    FpvLog("[Camera] KillCam phase 2: no solved vantage, keeping spectator fallback\n");
                 }
             }
         }
@@ -1381,12 +1379,12 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
 bool InitFirstPersonCamera(uintptr_t gameBase) {
     g_gameBase = gameBase;
 
-    std::cout << "[FirstPerson] Initializing camera hook...\n";
-    std::cout << "[FirstPerson] game.dll base: 0x" << std::hex << gameBase << std::dec << "\n";
+    FpvLog("[FirstPerson] Initializing camera hook...\n");
+    FpvLog("[FirstPerson] game.dll base: 0x%08X\n", (unsigned)gameBase);
 
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
-        std::cout << "[FirstPerson] Failed to initialize MinHook: " << MH_StatusToString(status) << "\n";
+        FpvLog("[FirstPerson] Failed to initialize MinHook: %s\n", MH_StatusToString(status));
         return false;
     }
 
@@ -1399,8 +1397,8 @@ bool InitFirstPersonCamera(uintptr_t gameBase) {
     g_GetEyeWorldPos = *(GetEyeWorldPos_t*)(gameBase + OFFSET_GET_EYE_POS_IMPORT);
     g_GetHandFireZone = *(GetHandFireZone_t*)(gameBase + OFFSET_GET_HAND_FIRE_IMPORT);
 
-    std::cout << "[FirstPerson] FillCamera addr: 0x" << std::hex << fillCameraAddr << "\n";
-    std::cout << "[FirstPerson] SetCamRotation addr: 0x" << (uintptr_t)g_SetCameraRotation << std::dec << "\n";
+    FpvLog("[FirstPerson] FillCamera addr: 0x%08X\n", (unsigned)fillCameraAddr);
+    FpvLog("[FirstPerson] SetCamRotation addr: 0x%08X\n", (unsigned)(uintptr_t)g_SetCameraRotation);
 
     status = MH_CreateHook(
         (LPVOID)fillCameraAddr,
@@ -1409,19 +1407,19 @@ bool InitFirstPersonCamera(uintptr_t gameBase) {
     );
 
     if (status != MH_OK) {
-        std::cout << "[FirstPerson] Failed to create hook: " << MH_StatusToString(status) << "\n";
+        FpvLog("[FirstPerson] Failed to create hook: %s\n", MH_StatusToString(status));
         return false;
     }
 
     status = MH_EnableHook((LPVOID)fillCameraAddr);
     if (status != MH_OK) {
-        std::cout << "[FirstPerson] Failed to enable hook: " << MH_StatusToString(status) << "\n";
+        FpvLog("[FirstPerson] Failed to enable hook: %s\n", MH_StatusToString(status));
         MH_RemoveHook((LPVOID)fillCameraAddr);
         return false;
     }
 
     g_hookInstalled = true;
-    std::cout << "[FirstPerson] Camera hook installed successfully!\n";
+    FpvLog("[FirstPerson] Camera hook installed successfully!\n");
 
     return true;
 }
@@ -1429,7 +1427,7 @@ bool InitFirstPersonCamera(uintptr_t gameBase) {
 void ShutdownFirstPersonCamera() {
     RestoreHiddenHead();
     if (g_hookInstalled) {
-        std::cout << "[FirstPerson] Shutting down...\n";
+        FpvLog("[FirstPerson] Shutting down...\n");
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
         g_hookInstalled = false;

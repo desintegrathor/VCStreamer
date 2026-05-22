@@ -1,7 +1,7 @@
 #include "DelayManager.h"
 #include "CameraDirector.h"
+#include "DiagnosticsLog.h"
 #include "TickDelayBuffer.h"
-#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -119,8 +119,10 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "flag_camping_window=10.0\n";
                 outFile << "flag_camping_glimpse_duration=5.0\n";
                 outFile << "flag_camping_glimpse_interval=35.0\n";
-                outFile << "cam_share_player=0.04\n";
-                outFile << "cam_share_world=0.88\n";
+                outFile << "worldcam_max_hold=12.0\n";
+                outFile << "worldcam_score_threshold=55.0\n";
+                outFile << "cam_share_player=0.25\n";
+                outFile << "cam_share_world=0.67\n";
                 outFile << "cam_share_drone=0.08\n";
                 outFile << "cam_min_hold_player=8.0\n";
                 outFile << "cam_min_hold_world=12.0\n";
@@ -167,11 +169,11 @@ void DelayManager::AddDelayedAction(const DelayedAction& action) {
     if (totalDelayMs <= 6000) {
         switch (action.type) {
             case DelayedAction::Type::KILL:
-                CameraDirector_OnKill(action.killerId, action.victimId);
+                CameraDirector_OnKill(action.killerId, action.victimId, action.weaponId, action.leadMs);
                 break;
 
             case DelayedAction::Type::FLAG:
-                CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier);
+                CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier, action.leadMs);
                 break;
         }
         return;
@@ -191,11 +193,11 @@ void DelayManager::ProcessActions() {
         if (action.executeTime <= now) {
             switch (action.type) {
                 case DelayedAction::Type::KILL:
-                    CameraDirector_OnKill(action.killerId, action.victimId);
+                    CameraDirector_OnKill(action.killerId, action.victimId, action.weaponId, action.leadMs);
                     break;
 
                 case DelayedAction::Type::FLAG:
-                    CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier);
+                    CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier, action.leadMs);
                     break;
             }
             actions.pop();
@@ -298,9 +300,10 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
 
     cfg.worldCamMaxDistance       = ReadIniFloat(iniPath, "worldcam_max_distance", 22.0f);
     cfg.worldCamSwitchCooldown    = ReadIniFloat(iniPath, "worldcam_switch_cooldown", 12.0f);
-    cfg.worldCamMaxHold           = ReadIniFloat(iniPath, "worldcam_max_hold", 24.0f);
+    cfg.worldCamMaxHold           = ReadIniFloat(iniPath, "worldcam_max_hold", 12.0f);
     cfg.worldCamLOSPenalty        = ReadIniFloat(iniPath, "worldcam_los_penalty", 1000.0f);
     cfg.worldCamStickiness        = ReadIniFloat(iniPath, "worldcam_stickiness", 15.0f);
+    cfg.worldCamScoreThreshold    = ReadIniFloat(iniPath, "worldcam_score_threshold", 55.0f);
 
     cfg.worldCamZoomStartDist     = ReadIniFloat(iniPath, "worldcam_zoom_start_dist", 25.0f);
     cfg.worldCamZoomMaxDist       = ReadIniFloat(iniPath, "worldcam_zoom_max_dist", 50.0f);
@@ -322,8 +325,8 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.droneLookSmooth           = ReadIniFloat(iniPath, "drone_look_smooth", 0.08f);
     cfg.droneHoldDuration         = ReadIniFloat(iniPath, "drone_hold_duration", 8.0f);
     cfg.droneIdleTimeout          = ReadIniFloat(iniPath, "drone_idle_timeout", 15.0f);
-    cfg.camSharePlayer            = ReadIniFloat(iniPath, "cam_share_player", 0.04f);
-    cfg.camShareWorld             = ReadIniFloat(iniPath, "cam_share_world", 0.88f);
+    cfg.camSharePlayer            = ReadIniFloat(iniPath, "cam_share_player", 0.25f);
+    cfg.camShareWorld             = ReadIniFloat(iniPath, "cam_share_world", 0.67f);
     cfg.camShareDrone             = ReadIniFloat(iniPath, "cam_share_drone", 0.08f);
     cfg.camMinHoldPlayer          = ReadIniFloat(iniPath, "cam_min_hold_player", 8.0f);
     cfg.camMinHoldWorld           = ReadIniFloat(iniPath, "cam_min_hold_world", 12.0f);
@@ -342,5 +345,5 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
 
     cfg.debugMode                 = (ReadIniInt(iniPath, "debug_mode", 0) != 0);
 
-    std::cout << "[CameraDirector] Config loaded from " << iniPath << "\n";
+    DiagnosticsLog_Append("receiver_debug.log", "[CameraDirector] Config loaded from %s\n", iniPath.c_str());
 }

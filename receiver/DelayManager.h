@@ -13,23 +13,33 @@ struct DelayedAction {
     std::chrono::system_clock::time_point executeTime;
     int killerId;
     int victimId;
+    int weaponId;
     int usCarrier;
     int vcCarrier;
+    int leadMs;
 
-    static DelayedAction CreateKillAction(int killer, int victim, int delayMs) {
+    static DelayedAction CreateKillAction(int killer, int victim, int weapon, int delayMs, int eventLeadMs) {
         DelayedAction action;
         action.type = Type::KILL;
         action.killerId = killer;
         action.victimId = victim;
+        action.weaponId = weapon;
+        action.usCarrier = 0;
+        action.vcCarrier = 0;
+        action.leadMs = eventLeadMs;
         action.executeTime = std::chrono::system_clock::now() + std::chrono::milliseconds(delayMs);
         return action;
     }
 
-    static DelayedAction CreateFlagAction(int us, int vc, int delayMs) {
+    static DelayedAction CreateFlagAction(int us, int vc, int delayMs, int eventLeadMs) {
         DelayedAction action;
         action.type = Type::FLAG;
+        action.killerId = 0;
+        action.victimId = 0;
+        action.weaponId = 0;
         action.usCarrier = us;
         action.vcCarrier = vc;
+        action.leadMs = eventLeadMs;
         action.executeTime = std::chrono::system_clock::now() + std::chrono::milliseconds(delayMs);
         return action;
     }

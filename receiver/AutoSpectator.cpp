@@ -1,10 +1,10 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "AutoSpectator.h"
+#include "DiagnosticsLog.h"
 #include "DroneCamera.h"
 #include "OctCollision.h"
 #include "WorldCameraTracker.h"
 #include "minhook/MinHook.h"
-#include <iostream>
 #include <fstream>
 #include <thread>
 #include <atomic>
@@ -31,12 +31,8 @@ void LogDebug(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     if (g_logFile) {
-        vfprintf(g_logFile, fmt, args);
-        fflush(g_logFile);
+        DiagnosticsLog_Write(g_logFile, fmt, args);
     }
-    // Also print to console
-    va_start(args, fmt);
-    vprintf(fmt, args);
     va_end(args);
 }
 

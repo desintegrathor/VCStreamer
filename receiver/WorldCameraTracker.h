@@ -30,7 +30,8 @@ void WorldCameraTracker_SetTuning(float maxDistance,
                                   float switchCooldownSeconds,
                                   float maxHoldSeconds,
                                   float losPenalty,
-                                  float stickiness);
+                                  float stickiness,
+                                  float scoreThreshold);
 
 // True when the current static/dynamic camera can still see the target well enough.
 bool WorldCameraTracker_HasUsableWorldCamera();

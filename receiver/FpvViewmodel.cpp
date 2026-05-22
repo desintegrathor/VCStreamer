@@ -1,10 +1,10 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "FpvViewmodel.h"
+#include "DiagnosticsLog.h"
 #include "minhook/MinHook.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
-#include <iostream>
 #include <windows.h>
 
 static FILE* g_fpvmLog = nullptr;
@@ -15,8 +15,7 @@ static void FpvmLog(const char* fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_fpvmLog, fmt, args);
-    fflush(g_fpvmLog);
+    DiagnosticsLog_Write(g_fpvmLog, fmt, args);
     va_end(args);
 }
 
@@ -101,11 +100,11 @@ static bool LoadHands() {
         }
         *(DWORD*)((char*)g_handsSkel + 8) = 0;
         g_handsLoaded = true;
-        printf("[FpvViewmodel] Hands loaded: node=0x%08X skel=0x%08X\n",
-            (unsigned)(uintptr_t)g_handsNode, (unsigned)(uintptr_t)g_handsSkel);
+        FpvmLog("[FpvViewmodel] Hands loaded: node=0x%08X skel=0x%08X\n",
+                (unsigned)(uintptr_t)g_handsNode, (unsigned)(uintptr_t)g_handsSkel);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        printf("[FpvViewmodel] CRASH loading hands\n");
+        FpvmLog("[FpvViewmodel] CRASH loading hands\n");
         g_initialized = false;
         return false;
     }
@@ -138,13 +137,13 @@ static void __cdecl Hooked_RenderWeapon(int is_mirror_setup, int is_mirror_rende
 
         static int s_ok = 0;
         if (s_ok < 5) {
-            printf("[FpvViewmodel] Rendered frame %d\n", s_ok);
+            FpvmLog("[FpvViewmodel] Rendered frame %d\n", s_ok);
             FpvmLog("[FpvViewmodel] Rendered OK\n");
             s_ok++;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static int s_c = 0;
-        if (s_c++ < 3) printf("[FpvViewmodel] Render crash\n");
+        if (s_c++ < 3) FpvmLog("[FpvViewmodel] Render crash\n");
     }
 
     // Restore
@@ -180,16 +179,16 @@ bool InitFpvViewmodel(uintptr_t gameBase) {
         }
     }
     if (!renderAddr) {
-        printf("[FpvViewmodel] AOB scan for RenderWeapon FAILED\n");
+        FpvmLog("[FpvViewmodel] AOB scan for RenderWeapon FAILED\n");
         return false;
     }
 
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return false;
     st = MH_CreateHook(renderAddr, (void*)&Hooked_RenderWeapon, (void**)&g_origRenderWeapon);
-    if (st != MH_OK) { printf("[FpvViewmodel] Hook create failed: %d\n", st); return false; }
+    if (st != MH_OK) { FpvmLog("[FpvViewmodel] Hook create failed: %d\n", st); return false; }
     MH_EnableHook(renderAddr);
-    printf("[FpvViewmodel] Hooked RenderWeapon at 0x%08X\n", (unsigned)(uintptr_t)renderAddr);
+    FpvmLog("[FpvViewmodel] Hooked RenderWeapon at 0x%08X\n", (unsigned)(uintptr_t)renderAddr);
 
     g_initialized = true;
     return true;

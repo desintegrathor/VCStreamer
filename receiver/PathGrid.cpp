@@ -5,7 +5,6 @@
 #include <cstring>
 #include <cfloat>
 #include <cstdlib>
-#include <iostream>
 #include <windows.h>
 
 extern void LogDebug(const char* fmt, ...);
@@ -122,9 +121,6 @@ void PathGrid_Build(float resolution) {
     LogDebug("[PathGrid] Built: %dx%dx%d = %d voxels, %d solid, %.1f MB, %lu ms\n",
              g_grid.dimX, g_grid.dimY, g_grid.dimZ, totalVoxels, solidCount,
              (float)memSize / (1024.0f * 1024.0f), elapsed);
-    std::cout << "[PathGrid] Built: " << g_grid.dimX << "x" << g_grid.dimY << "x" << g_grid.dimZ
-              << " = " << totalVoxels << " voxels, " << solidCount << " solid, "
-              << (float)memSize / (1024.0f * 1024.0f) << " MB, " << elapsed << " ms\n";
 }
 
 void PathGrid_Destroy() {
@@ -500,9 +496,9 @@ int PathGrid_FindPath(const float from[3], const float to[3],
         }
         if (bestIdx < 0) return 0;
         goalClosedIdx = bestIdx;
-        std::cout << "[PathGrid] Partial path (best effort, " << expansions << " expansions)\n";
+        LogDebug("[PathGrid] Partial path (best effort, %d expansions)\n", expansions);
     } else {
-        std::cout << "[PathGrid] Path found (" << expansions << " expansions)\n";
+        LogDebug("[PathGrid] Path found (%d expansions)\n", expansions);
     }
 
     // Extract path by walking parent pointers

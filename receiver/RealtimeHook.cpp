@@ -1,9 +1,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "RealtimeHook.h"
+#include "DiagnosticsLog.h"
 #include "SpectatorController.h"
 #include "DelayManager.h"
 #include "TickDelayBuffer.h"
-#include <iostream>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -20,8 +20,7 @@ static void KillLog(const char* fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_killLog, fmt, args);
-    fflush(g_killLog);
+    DiagnosticsLog_Write(g_killLog, fmt, args);
     va_end(args);
 }
 
@@ -180,11 +179,14 @@ static void ProcessKillMessage(BYTE* msgData) {
     int waitMs = (totalDelayMs > ADVANCE_MS)
         ? totalDelayMs - ADVANCE_MS
         : 0;
+    int leadMs = totalDelayMs - waitMs;
+    if (leadMs < 0) leadMs = 0;
+    int weaponId = (int)msgData[1];
 
     KillLog("[RealtimeHook] Kill detected: killer=%d victim=%d weapon=%d gameDelay=%ds bufferDelay=%dms scheduling in %dms\n",
-            killerHandle, victimHandle, (int)msgData[1], gameDelaySec, bufferDelayMs, waitMs);
+            killerHandle, victimHandle, weaponId, gameDelaySec, bufferDelayMs, waitMs);
 
-    auto action = DelayedAction::CreateKillAction(killerHandle, victimHandle, waitMs);
+    auto action = DelayedAction::CreateKillAction(killerHandle, victimHandle, weaponId, waitMs, leadMs);
     DelayManager::AddDelayedAction(action);
 }
 
@@ -194,11 +196,12 @@ static void ProcessKillMessage(BYTE* msgData) {
 
 void SetHookReady() {
     g_hookReady = true;
-    std::cout << "[RealtimeHook] Kill scanning activated\n";
+    KillLog("[RealtimeHook] Kill scanning activated\n");
 }
 
 bool InitRealtimeHook(uintptr_t baseGame) {
-    std::cout << "[RealtimeHook] Initialized (scanning via TickDelayBuffer hook)\n";
+    (void)baseGame;
+    KillLog("[RealtimeHook] Initialized (scanning via TickDelayBuffer hook)\n");
     return true;
 }
 
@@ -260,11 +263,13 @@ void ScanBufferForFlags(BYTE* data, DWORD size) {
     int waitMs = (totalDelayMs > ADVANCE_MS)
         ? totalDelayMs - ADVANCE_MS
         : 0;
+    int leadMs = totalDelayMs - waitMs;
+    if (leadMs < 0) leadMs = 0;
 
     KillLog("[RealtimeHook] Flag change: US=%d VC=%d gameDelay=%ds bufferDelay=%dms scheduling in %dms\n",
             newUS, newVC, gameDelaySec, bufferDelayMs, waitMs);
 
-    auto action = DelayedAction::CreateFlagAction(newUS, newVC, waitMs);
+    auto action = DelayedAction::CreateFlagAction(newUS, newVC, waitMs, leadMs);
     DelayManager::AddDelayedAction(action);
 }
 

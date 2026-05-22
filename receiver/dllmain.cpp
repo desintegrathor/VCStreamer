@@ -1,7 +1,9 @@
 #include <Windows.h>
-#include <iostream>
+#include <cstdio>
 #include <thread>
 #include <string>
+#include "CommentatorFeed.h"
+#include "DiagnosticsLog.h"
 #include "SpectatorController.h"
 #include "GameMemoryReader.h"
 #include "DelayManager.h"
@@ -50,11 +52,12 @@ DWORD WINAPI MainThread(LPVOID) {
     AllocConsole();
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
+    CommentatorFeed_Init();
 
     InitLowPlayerOverlay();
 
     // Wait for game.dll to be loaded
-    std::cout << "[VCStreamer] Waiting for game.dll...\n";
+    DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] Waiting for game.dll...\n");
     uintptr_t base = 0;
     for (int i = 0; i < 300; i++) {  // Max 30 seconds
         base = GetModuleBase(L"game.dll");
@@ -63,11 +66,11 @@ DWORD WINAPI MainThread(LPVOID) {
     }
 
     if (base == 0) {
-        std::cout << "[VCStreamer] ERROR: game.dll not found!\n";
+        DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] ERROR: game.dll not found!\n");
         return 1;
     }
 
-    std::cout << "[VCStreamer] game.dll found at 0x" << std::hex << base << std::dec << "\n";
+    DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] game.dll found at 0x%08X\n", (unsigned)base);
 
     // Suppress crash recovery: hook GAM_PTE_RUNS_Set to no-op so the game
     // doesn't write a "crashed" flag to registry. Without this, a crash
@@ -78,7 +81,7 @@ DWORD WINAPI MainThread(LPVOID) {
         if (pteRunsSet) {
             MH_STATUS st = MH_Initialize();
             if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
-                std::cout << "[VCStreamer] MinHook init failed for crash recovery\n";
+                DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] MinHook init failed for crash recovery\n");
             } else {
                 static void* s_origPteRuns = nullptr;
                 auto noop = [](unsigned long) {};  // no-op lambda
@@ -88,11 +91,11 @@ DWORD WINAPI MainThread(LPVOID) {
                 };
                 if (MH_CreateHook(pteRunsSet, (void*)&PteHook::Hook, &s_origPteRuns) == MH_OK) {
                     MH_EnableHook(pteRunsSet);
-                    std::cout << "[VCStreamer] Crash recovery suppressed (GAM_PTE_RUNS_Set hooked)\n";
+                    DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] Crash recovery suppressed (GAM_PTE_RUNS_Set hooked)\n");
                 }
             }
         } else {
-            std::cout << "[VCStreamer] GAM_PTE_RUNS_Set not found (crash recovery not suppressed)\n";
+            DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] GAM_PTE_RUNS_Set not found (crash recovery not suppressed)\n");
         }
 
         // Patch vietcong.exe to skip settings/crash-recovery dialog at startup
@@ -116,13 +119,13 @@ DWORD WINAPI MainThread(LPVOID) {
                 exeBase[0x3AA2] = 0xE9; // JMP rel32 (offset stays same)
                 VirtualProtect(exeBase + 0x3AA1, 2, oldProt, &oldProt);
             }
-            std::cout << "[VCStreamer] Crash recovery dialog bypassed (exe patched)\n";
+            DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] Crash recovery dialog bypassed (exe patched)\n");
         }
     }
 
     // Wait for game.dll to fully initialize.
     // Proxy DLL loads earlier than the old injection method, so we need a longer wait.
-    std::cout << "[VCStreamer] Waiting for game initialization...\n";
+    DiagnosticsLog_Append("receiver_debug.log", "[VCStreamer] Waiting for game initialization...\n");
     std::this_thread::sleep_for(std::chrono::seconds(8));
 
     InitSpectatorController(base);

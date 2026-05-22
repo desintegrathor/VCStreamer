@@ -1,7 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "FlagMonitor.h"
+#include "DiagnosticsLog.h"
 #include "SpectatorController.h"
-#include <iostream>
 #include <thread>
 #include <atomic>
 #include <cstdio>
@@ -17,8 +17,7 @@ static void FlagLog(const char* fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_flagLog, fmt, args);
-    fflush(g_flagLog);
+    DiagnosticsLog_Write(g_flagLog, fmt, args);
     va_end(args);
 }
 
@@ -38,7 +37,7 @@ static int g_lastUSCarrier = 0;
 static int g_lastVCCarrier = 0;
 
 static void FlagPollLoop() {
-    std::cout << "[FlagMonitor] Polling thread started\n";
+    FlagLog("[FlagMonitor] Polling thread started\n");
 
     // Set hardware watchpoints on this thread — but game writes happen on the game thread.
     // We need to set them on the main thread instead.
@@ -50,8 +49,7 @@ static void FlagPollLoop() {
         if (usCarrier != g_lastUSCarrier || vcCarrier != g_lastVCCarrier) {
             FlagLog("[FlagMonitor] TICK=%lu Flag change: US=%d (was %d) VC=%d (was %d)\n",
                     GetTickCount(), usCarrier, g_lastUSCarrier, vcCarrier, g_lastVCCarrier);
-            std::cout << "[FlagMonitor] Flag change: US=" << usCarrier
-                      << " VC=" << vcCarrier << "\n";
+            FlagLog("[FlagMonitor] Flag change: US=%d VC=%d\n", usCarrier, vcCarrier);
 
             g_lastUSCarrier = usCarrier;
             g_lastVCCarrier = vcCarrier;
@@ -62,7 +60,7 @@ static void FlagPollLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    std::cout << "[FlagMonitor] Polling thread stopped\n";
+    FlagLog("[FlagMonitor] Polling thread stopped\n");
 }
 
 void InitFlagMonitor(uintptr_t baseGame) {
@@ -73,11 +71,9 @@ void InitFlagMonitor(uintptr_t baseGame) {
     uintptr_t usAddr = baseGame + OFFSET_US_FLAG_CARRIER;
     uintptr_t vcAddr = baseGame + OFFSET_VC_FLAG_CARRIER;
 
-    std::cout << "[FlagMonitor] Initializing flag monitor...\n";
-    std::cout << "[FlagMonitor] US flag addr: 0x" << std::hex
-              << usAddr << "\n";
-    std::cout << "[FlagMonitor] VC flag addr: 0x"
-              << vcAddr << std::dec << "\n";
+    FlagLog("[FlagMonitor] Initializing flag monitor...\n");
+    FlagLog("[FlagMonitor] US flag addr: 0x%08X\n", (unsigned)usAddr);
+    FlagLog("[FlagMonitor] VC flag addr: 0x%08X\n", (unsigned)vcAddr);
 
     g_running = true;
     g_pollThread = std::thread(FlagPollLoop);
@@ -86,6 +82,6 @@ void InitFlagMonitor(uintptr_t baseGame) {
 
 void ShutdownFlagMonitor() {
     g_running = false;
-    std::cout << "[FlagMonitor] Shutdown requested\n";
+    FlagLog("[FlagMonitor] Shutdown requested\n");
     if (g_flagLog) { fclose(g_flagLog); g_flagLog = nullptr; }
 }

@@ -13,5 +13,5 @@ void InitAutoSpectator(uintptr_t baseGame);
 // Stop the auto-spectator thread.
 void ShutdownAutoSpectator();
 
-// Debug logging (writes to autospectator_debug.log and stdout)
+// Debug logging (writes to autospectator_debug.log only)
 void LogDebug(const char* fmt, ...);

@@ -1,5 +1,5 @@
 #include "GameMemoryReader.h"
-#include <iostream>
+#include "DiagnosticsLog.h"
 #include <thread>
 
 uintptr_t GameMemoryReader::baseGame = 0;
@@ -8,12 +8,12 @@ void GameMemoryReader::Init(uintptr_t baseAddr) {
     // If caller provided a base address, use it. Otherwise wait for game.dll to be loaded
     baseGame = baseAddr;
     if (!baseGame) {
-        std::cout << "[GameMemory] Waiting for game.dll to load...\n";
+        DiagnosticsLog_Append("receiver_debug.log", "[GameMemory] Waiting for game.dll to load...\n");
         while (!baseGame) {
             HMODULE h = GetModuleHandleW(L"game.dll");
             if (h) {
                 baseGame = reinterpret_cast<uintptr_t>(h);
-                std::cout << "[GameMemory] game.dll found, base = 0x" << std::hex << baseGame << std::dec << "\n";
+                DiagnosticsLog_Append("receiver_debug.log", "[GameMemory] game.dll found, base = 0x%08X\n", (unsigned)baseGame);
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

@@ -1,8 +1,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "TickDelayBuffer.h"
 #include "DelayManager.h"
+#include "DiagnosticsLog.h"
 #include "RealtimeHook.h"
-#include <iostream>
 #include <cstring>
 #include <mutex>
 #include <cstdarg>
@@ -18,12 +18,7 @@ static void TickLog(const char* fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    vfprintf(g_tickLog, fmt, args);
-    fflush(g_tickLog);
-    va_end(args);
-    // Also stdout
-    va_start(args, fmt);
-    vprintf(fmt, args);
+    DiagnosticsLog_Write(g_tickLog, fmt, args);
     va_end(args);
 }
 

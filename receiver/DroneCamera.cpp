@@ -1,11 +1,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "DroneCamera.h"
 #include "CameraDirector.h"
+#include "DiagnosticsLog.h"
 #include "OctCollision.h"
 #include "PathGrid.h"
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
-#include <iostream>
 
 // ============================================================================
 // Internal State
@@ -13,6 +15,18 @@
 
 static uintptr_t g_gameBase = 0;
 static bool g_active = false;
+
+static void DroneLog(const char* fmt, ...) {
+    FILE* file = fopen("receiver_debug.log", "a");
+    if (!file) return;
+
+    va_list args;
+    va_start(args, fmt);
+    DiagnosticsLog_Write(file, fmt, args);
+    va_end(args);
+
+    fclose(file);
+}
 
 static float g_pos[3] = {};
 static float g_vel[3] = {};
@@ -250,9 +264,9 @@ static bool FindKillViewpoint(const float* killerPos, const float* victimPos, co
     g_lookAtPos[1] = (killerHead[1] + victimHead[1]) * 0.5f;
     g_lookAtPos[2] = (killerHead[2] + victimHead[2]) * 0.5f;
 
-    std::cout << "[DroneCamera] Kill viewpoint: (" << bestPos[0] << ", " << bestPos[1]
-              << ", " << bestPos[2] << ") dualLOS=" << foundDual
-              << " score=" << (foundDual ? bestScore : bestSingleScore) << "\n";
+    DroneLog("[DroneCamera] Kill viewpoint: (%.2f, %.2f, %.2f) dualLOS=%d score=%.2f\n",
+             bestPos[0], bestPos[1], bestPos[2], foundDual ? 1 : 0,
+             foundDual ? bestScore : bestSingleScore);
 
     return foundDual || bestSingleScore > -1e29f;
 }
@@ -427,8 +441,8 @@ static bool BuildPath(const float* startPos, const float* goalPos, const CameraC
     g_splineDistTraveled = 0.0f;
     g_pathReady = true;
 
-    std::cout << "[DroneCamera] Path ready: " << g_waypointCount << " waypoints, "
-              << PathGrid_GetSplineLength() << " units\n";
+    DroneLog("[DroneCamera] Path ready: %d waypoints, %.2f units\n",
+             g_waypointCount, PathGrid_GetSplineLength());
     return true;
 }
 
@@ -496,7 +510,7 @@ static void ComputeSplineFollowVelocity(float* desiredVel, float speed, float dt
             g_pathReady = false;
             g_splineReady = false;
             g_usingDirectSteering = true;
-            std::cout << "[DroneCamera] Spline follow complete\n";
+            DroneLog("[DroneCamera] Spline follow complete\n");
         }
     }
 }
@@ -510,7 +524,7 @@ static void CheckReplanTriggers(float dt, const float* orbitTarget, const Camera
     if (g_pathReady) {
         float goalDist = Vec3Dist(orbitTarget, g_goalPos);
         if (goalDist > cfg.dronePathReplanDist) {
-            std::cout << "[DroneCamera] Replan: target moved " << goalDist << " units\n";
+            DroneLog("[DroneCamera] Replan: target moved %.2f units\n", goalDist);
             ClearPath();
             g_usingDirectSteering = true;
         }
@@ -521,7 +535,7 @@ static void CheckReplanTriggers(float dt, const float* orbitTarget, const Camera
     if (speed < 0.3f && g_pathReady) {
         g_stuckTimer += dt;
         if (g_stuckTimer > 1.5f) {
-            std::cout << "[DroneCamera] Replan: stuck (speed=" << speed << ")\n";
+            DroneLog("[DroneCamera] Replan: stuck (speed=%.2f)\n", speed);
             ClearPath();
             g_stuckTimer = 0.0f;
             g_usingDirectSteering = true;
@@ -574,15 +588,15 @@ void DroneCamera_Activate(const float startPos[3]) {
     }
 
     g_active = true;
-    std::cout << "[DroneCamera] Activated at (" << startPos[0] << ", "
-              << startPos[1] << ", " << startPos[2] << ")\n";
+    DroneLog("[DroneCamera] Activated at (%.2f, %.2f, %.2f)\n",
+             startPos[0], startPos[1], startPos[2]);
 }
 
 void DroneCamera_Deactivate() {
     if (g_active) {
         g_active = false;
         ClearPath();
-        std::cout << "[DroneCamera] Deactivated\n";
+        DroneLog("[DroneCamera] Deactivated\n");
     }
 }
 
@@ -598,7 +612,7 @@ void DroneCamera_SetTarget(int playerHandle) {
         g_vantageValid = false;
         ClearPath();
         g_usingDirectSteering = true;
-        std::cout << "[DroneCamera] New target: " << playerHandle << "\n";
+        DroneLog("[DroneCamera] New target: %d\n", playerHandle);
     }
 }
 
@@ -633,9 +647,8 @@ void DroneCamera_SetKillTarget(int killerHandle, int victimHandle) {
         g_vantageValid = false;
     }
 
-    std::cout << "[DroneCamera] Kill target: killer=" << killerHandle
-              << " victim=" << victimHandle
-              << " killFrame=" << g_killFrameActive << "\n";
+    DroneLog("[DroneCamera] Kill target: killer=%d victim=%d killFrame=%d\n",
+             killerHandle, victimHandle, g_killFrameActive ? 1 : 0);
 }
 
 int DroneCamera_GetTargetHandle() {
@@ -680,7 +693,7 @@ void DroneCamera_Update(float dt) {
             g_killFrameActive = false;
             g_victimHandle = 0;
             g_vantageValid = false; // force vantage recompute
-            std::cout << "[DroneCamera] Kill frame ended\n";
+            DroneLog("[DroneCamera] Kill frame ended\n");
         }
     }
 
@@ -777,7 +790,7 @@ void DroneCamera_Update(float dt) {
             } else {
                 bool built = BuildPath(g_pos, destPos, cfg);
                 if (built) {
-                    std::cout << "[DroneCamera] Theta* path built to vantage point\n";
+                    DroneLog("[DroneCamera] Theta* path built to vantage point\n");
                 }
 
                 float toDest[3] = { destPos[0] - g_pos[0], destPos[1] - g_pos[1], destPos[2] - g_pos[2] };

@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "WorldCameraTracker.h"
+#include "DiagnosticsLog.h"
 #include <cstdio>
 #include <cmath>
 #include <atomic>
@@ -22,9 +23,11 @@ static int g_holdFrames = 0; // how long current camera has been active
 static float g_maxCamDist = 22.0f;
 static float g_maxCamDistSq = 22.0f * 22.0f;
 static int g_switchCooldownFrameBudget = 720; // ~12 seconds at 60fps
-static int g_maxHoldFrameBudget = 1440; // ~24 seconds at 60fps
+static int g_maxHoldFrameBudget = 720; // ~12 seconds at 60fps
 static float g_losPenalty = 1000.0f;
 static float g_stickiness = 15.0f;
+static float g_worldCamScoreThreshold = 55.0f;
+static float g_effectiveWorldCamScoreThreshold = 60.0f;
 static int g_switchCooldownFrames = 0;
 static bool g_initialized = false;
 
@@ -32,9 +35,7 @@ constexpr uintptr_t SPECT_CAM_UPDATE_OFFSET = 0x148100;
 constexpr uintptr_t PLAYER_TABLE_OFFSET = 0x7AE9C8;
 constexpr uintptr_t CAM_SPLINE_EVALUATE_OFFSET = 0x32460; // 0xDA2460 - 0xD70000
 constexpr int CAM_REEVAL_INTERVAL = 30;
-constexpr float PLAYER_CAM_SCORE = 20.0f;
 static int g_preference = -1; // -1=neutral, 0/1=prefer world cam, 2=prefer player cam
-static float g_effectivePlayerCamScore = 20.0f; // adjusted by preference
 
 static int SecondsToFrames(float seconds) {
     if (seconds < 0.1f) seconds = 0.1f;
@@ -83,14 +84,10 @@ static void LogWC(const char* fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
     if (g_wcLog) {
-        va_start(args, fmt);
-        vfprintf(g_wcLog, fmt, args);
-        va_end(args);
-        fflush(g_wcLog);
+        DiagnosticsLog_Write(g_wcLog, fmt, args);
     }
+    va_end(args);
 }
 
 static bool HasLineOfSight(float* camPos, float* playerPos) {
@@ -143,10 +140,25 @@ struct CamSearchResult {
     int index;
     int type; // 0=static, 1=dynamic
     float score;
+    float rawScore;
 };
 
+static float ThresholdForPreference(int preferType) {
+    if (preferType == 0 || preferType == 1) {
+        return g_worldCamScoreThreshold;
+    }
+    if (preferType == 2) {
+        return g_worldCamScoreThreshold + 20.0f;
+    }
+    return g_worldCamScoreThreshold + 5.0f;
+}
+
+static void ApplyPreferenceThreshold() {
+    g_effectiveWorldCamScoreThreshold = ThresholdForPreference(g_preference);
+}
+
 static CamSearchResult FindBestCamera(int* spectObj, float* playerPos) {
-    CamSearchResult best = { -1, 0, -1e30f };
+    CamSearchResult best = { -1, 0, -1e30f, -1e30f };
 
     for (int type = 0; type < 2; type++) {
         int camCount = (type == 0) ? spectObj[3] : spectObj[6];
@@ -174,7 +186,7 @@ static CamSearchResult FindBestCamera(int* spectObj, float* playerPos) {
             if (distSq > g_maxCamDistSq) continue;
 
             float dist = sqrtf(distSq);
-            float score = 100.0f - (dist / g_maxCamDist) * 80.0f;
+            float rawScore = 100.0f - (dist / g_maxCamDist) * 80.0f;
 
             bool hasLos = HasLineOfSight(camPos, playerPos);
             if (!hasLos) {
@@ -182,6 +194,15 @@ static CamSearchResult FindBestCamera(int* spectObj, float* playerPos) {
                       type == 0 ? "static" : "dyncam", i, dist);
                 continue;
             }
+
+            if (rawScore < g_effectiveWorldCamScoreThreshold) {
+                LogWC("[WorldCam]   %s[%d] d=%.1f rejected: score=%.1f threshold=%.1f\n",
+                      type == 0 ? "static" : "dyncam", i, dist,
+                      rawScore, g_effectiveWorldCamScoreThreshold);
+                continue;
+            }
+
+            float score = rawScore;
 
             // Keep a good current world camera stable while it can still see the target.
             if (i == g_currentCamIndex && type == g_currentCamType) {
@@ -192,15 +213,15 @@ static CamSearchResult FindBestCamera(int* spectObj, float* playerPos) {
                   type == 0 ? "static" : "dyncam", i, dist, score);
 
             if (score > best.score) {
-                best = { i, type, score };
+                best = { i, type, score, rawScore };
             }
         }
     }
 
-    LogWC("[WorldCam] FindBest: player(%.1f,%.1f,%.1f) best=%s[%d] score=%.1f\n",
+    LogWC("[WorldCam] FindBest: player(%.1f,%.1f,%.1f) best=%s[%d] score=%.1f raw=%.1f threshold=%.1f\n",
           playerPos[0], playerPos[1], playerPos[2],
           best.index >= 0 ? (best.type == 0 ? "static" : "dyncam") : "NONE",
-          best.index, best.score);
+          best.index, best.score, best.rawScore, g_effectiveWorldCamScoreThreshold);
 
     // Reject if best score is negative
     if (best.score < 0.0f) best.index = -1;
@@ -255,16 +276,9 @@ void WorldCameraTracker_ClearTarget() {
 
 void WorldCameraTracker_SetPreference(int preferType) {
     g_preference = preferType;
-    if (preferType == 0 || preferType == 1) {
-        // Bias toward world cam, but require a clearly useful view.
-        g_effectivePlayerCamScore = 20.0f;
-    } else if (preferType == 2) {
-        // Bias toward player cam: raise threshold so world cams need higher score
-        g_effectivePlayerCamScore = 40.0f;
-    } else {
-        // Neutral: default threshold
-        g_effectivePlayerCamScore = PLAYER_CAM_SCORE;
-    }
+    ApplyPreferenceThreshold();
+    LogWC("[WorldCam] Preference=%d scoreThreshold=%.1f\n",
+          g_preference, g_effectiveWorldCamScoreThreshold);
 }
 
 int WorldCameraTracker_GetCurrentCamType() {
@@ -326,21 +340,27 @@ void WorldCameraTracker_SetTuning(float maxDistance,
                                   float switchCooldownSeconds,
                                   float maxHoldSeconds,
                                   float losPenalty,
-                                  float stickiness) {
+                                  float stickiness,
+                                  float scoreThreshold) {
     if (maxDistance < 1.0f) maxDistance = 1.0f;
+    if (!(scoreThreshold >= 0.0f)) scoreThreshold = 55.0f;
     g_maxCamDist = maxDistance;
     g_maxCamDistSq = g_maxCamDist * g_maxCamDist;
     g_switchCooldownFrameBudget = SecondsToFrames(switchCooldownSeconds);
     g_maxHoldFrameBudget = SecondsToFrames(maxHoldSeconds);
     g_losPenalty = losPenalty;
     g_stickiness = stickiness;
+    g_worldCamScoreThreshold = scoreThreshold;
+    ApplyPreferenceThreshold();
 
-    LogWC("[WorldCam] Tuning: maxDist=%.1f cooldown=%d frames maxHold=%d frames losPenalty=%.1f stickiness=%.1f\n",
+    LogWC("[WorldCam] Tuning: maxDist=%.1f cooldown=%d frames maxHold=%d frames losPenalty=%.1f stickiness=%.1f scoreThreshold=%.1f effective=%.1f\n",
           g_maxCamDist,
           g_switchCooldownFrameBudget,
           g_maxHoldFrameBudget,
           g_losPenalty,
-          g_stickiness);
+          g_stickiness,
+          g_worldCamScoreThreshold,
+          g_effectiveWorldCamScoreThreshold);
 }
 
 bool WorldCameraTracker_HasUsableWorldCamera() {
@@ -416,6 +436,12 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
         return;
     }
 
+    if ((g_currentCamType == 0 || g_currentCamType == 1)
+        && g_holdFrames >= g_maxHoldFrameBudget) {
+        SwitchToPlayerCamera(spectObj, "world cam max hold reached");
+        return;
+    }
+
     bool needEval = (g_currentCamIndex == -1 && g_currentCamType != 2)
                   || (g_holdFrames >= g_maxHoldFrameBudget)
                   || (g_switchCooldownFrames == 0 && (g_frameCounter % CAM_REEVAL_INTERVAL) == 0);
@@ -424,7 +450,7 @@ void WorldCameraTracker_Update(int* spectObj, uintptr_t baseGame) {
         bool forceSwitch = (g_holdFrames >= g_maxHoldFrameBudget);
         CamSearchResult result = FindBestCamera(spectObj, playerPos);
 
-        if (result.index >= 0 && result.score > g_effectivePlayerCamScore) {
+        if (result.index >= 0) {
             // World cam is good
             bool isNewCam = (result.index != g_currentCamIndex || result.type != g_currentCamType);
             if (isNewCam && (g_currentCamIndex == -1 || g_currentCamType == 2 || g_switchCooldownFrames == 0)) {

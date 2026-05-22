@@ -1,5 +1,5 @@
 #include "SpectatorController.h"
-#include <iostream>
+#include "DiagnosticsLog.h"
 #include <mutex>
 
 static uintptr_t baseGame = 0;
@@ -36,7 +36,7 @@ void SetSpectatorToPlayerId(int playerId) {
             return;
         }
     }
-    std::cout << "[Spectator] Handle " << playerId << " not in spectator list\n";
+    DiagnosticsLog_Append("receiver_debug.log", "[Spectator] Handle %d not in spectator list\n", playerId);
 }
 
 // ---------------------------

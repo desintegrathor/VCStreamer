@@ -50,9 +50,10 @@ struct CameraConfig {
     // World camera
     float worldCamMaxDistance       = 22.0f;
     float worldCamSwitchCooldown   = 12.0f;
-    float worldCamMaxHold          = 24.0f;
+    float worldCamMaxHold          = 12.0f;
     float worldCamLOSPenalty       = 1000.0f;
     float worldCamStickiness       = 15.0f;
+    float worldCamScoreThreshold   = 55.0f;
 
     // World camera auto-zoom
     float worldCamZoomStartDist    = 25.0f;
@@ -79,8 +80,8 @@ struct CameraConfig {
     float droneIdleTimeout         = 2.0f;
 
     // Camera budget shares (normalized at runtime)
-    float camSharePlayer           = 0.04f;  // target share for player/FPV camera
-    float camShareWorld            = 0.88f;  // target share for world cameras
+    float camSharePlayer           = 0.25f;  // target share for player/FPV camera
+    float camShareWorld            = 0.67f;  // target share for world cameras
     float camShareDrone            = 0.08f;  // target share for drone
 
     // Min hold times (seconds) before voluntary switch
@@ -138,8 +139,8 @@ enum class KillCamStyle {
 void InitCameraDirector(uintptr_t gameBase);
 
 // Event input (called by DelayManager when delayed actions fire)
-void CameraDirector_OnKill(int killerHandle, int victimHandle);
-void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier);
+void CameraDirector_OnKill(int killerHandle, int victimHandle, int weaponId, int leadMs);
+void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier, int leadMs);
 
 // Per-frame update (called from main loop)
 void CameraDirector_Update();
