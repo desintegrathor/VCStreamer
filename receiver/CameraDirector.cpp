@@ -57,6 +57,8 @@ static int g_flagKillLookKillerHandle = 0;
 static int g_flagKillLookVictimHandle = 0;
 static DWORD g_flagKillLookStartTick = 0;
 static DWORD g_flagKillLookKillTick = 0;
+static float g_flagKillLookKillerAimPoint[3] = {};
+static bool g_flagKillLookKillerAimPointValid = false;
 struct FlagCarrierMotion {
     int handle = 0;
     bool initialized = false;
@@ -708,6 +710,31 @@ static bool GetFrozenVictimAimPoint(const DirectorEvent& event, float* out) {
     return true;
 }
 
+static bool GetFrozenKillerAimPoint(const DirectorEvent& event, float* out) {
+    if (!out || event.type != DirectorEventType::Kill) return false;
+
+    PlayerSnapshot snapshot = {};
+    if (event.hasKillerSnapshot && event.killerSnapshot.hasPosition) {
+        snapshot = event.killerSnapshot;
+    } else if (!ServerStateSniffer_GetSnapshotAt(event.killerHandle,
+                                                 event.visibleTick,
+                                                 &snapshot)) {
+        if (!GetCurrentPlayerPosition(event.killerHandle, out)) {
+            return false;
+        }
+
+        out[2] += 1.25f;
+        return true;
+    }
+
+    if (!CopySnapshotPosition(snapshot, out)) {
+        return false;
+    }
+
+    out[2] += 1.25f;
+    return true;
+}
+
 static bool GetBestKillPosition(int handle,
                                 DWORD visibleTick,
                                 const PlayerSnapshot* eventSnapshot,
@@ -851,12 +878,14 @@ static void ClearFlagKillLook() {
     g_flagKillLookVictimHandle = 0;
     g_flagKillLookStartTick = 0;
     g_flagKillLookKillTick = 0;
+    g_flagKillLookKillerAimPointValid = false;
 }
 
 static bool MaybeStartVictimKillLook(int killerHandle,
                                      int victimHandle,
                                      DWORD now,
-                                     DWORD visibleKillTick) {
+                                     DWORD visibleKillTick,
+                                     const float* killerAimPoint) {
     bool victimIsFlagCarrier = (victimHandle != 0)
         && (victimHandle == g_flagCarrierUS || victimHandle == g_flagCarrierVC);
     bool watchingVictim = (g_state == CameraState::FlagWatch
@@ -881,11 +910,18 @@ static bool MaybeStartVictimKillLook(int killerHandle,
     g_flagKillLookVictimHandle = victimHandle;
     g_flagKillLookKillTick = visibleKillTick;
     g_flagKillLookStartTick = startTick;
+    g_flagKillLookKillerAimPointValid = killerAimPoint != nullptr;
+    if (g_flagKillLookKillerAimPointValid) {
+        g_flagKillLookKillerAimPoint[0] = killerAimPoint[0];
+        g_flagKillLookKillerAimPoint[1] = killerAimPoint[1];
+        g_flagKillLookKillerAimPoint[2] = killerAimPoint[2];
+    }
 
-    CD_Log("[CameraDirector] Victim death look: victim=%d killer=%d flagCarrier=%s startsIn=%ds, holds until camera changes\n",
+    CD_Log("[CameraDirector] Victim death look: victim=%d killer=%d flagCarrier=%s frozenKillerAim=%s startsIn=%ds, holds until camera changes\n",
            victimHandle,
            killerHandle,
            victimIsFlagCarrier ? "yes" : "no",
+           g_flagKillLookKillerAimPointValid ? "yes" : "no",
            0);
     return true;
 }
@@ -1733,10 +1769,14 @@ static bool ApplyVictimLookForEvent(const DirectorEvent& event, DWORD now) {
     if (event.type != DirectorEventType::Kill) return false;
     if (IsDebugCameraModeActive()) return false;
 
+    float frozenKillerAimPoint[3] = {};
+    bool hasFrozenKillerAimPoint = GetFrozenKillerAimPoint(event, frozenKillerAimPoint);
+
     if (!MaybeStartVictimKillLook(event.killerHandle,
                                   event.victimHandle,
                                   now,
-                                  event.visibleTick)) {
+                                  event.visibleTick,
+                                  hasFrozenKillerAimPoint ? frozenKillerAimPoint : nullptr)) {
         return false;
     }
 
@@ -2501,6 +2541,25 @@ bool CameraDirector_GetFlagCarrierKillLook(int* killerHandle,
     if (victimHandle) *victimHandle = g_flagKillLookVictimHandle;
     if (elapsed) *elapsed = el;
     if (duration) *duration = dur;
+    return true;
+}
+
+bool CameraDirector_GetFlagCarrierKillLookAimPoint(float out[3]) {
+    if (!out || !g_flagKillLookKillerAimPointValid) return false;
+
+    DWORD now = GetTickCount();
+    bool watchingVictim = (g_state == CameraState::FlagWatch
+        || g_state == CameraState::FollowPlayer)
+        && g_currentTargetHandle == g_flagKillLookVictimHandle;
+    if (g_flagKillLookStartTick == 0
+        || !watchingVictim
+        || !TickReached(now, g_flagKillLookStartTick)) {
+        return false;
+    }
+
+    out[0] = g_flagKillLookKillerAimPoint[0];
+    out[1] = g_flagKillLookKillerAimPoint[1];
+    out[2] = g_flagKillLookKillerAimPoint[2];
     return true;
 }
 

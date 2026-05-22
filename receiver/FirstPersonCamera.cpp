@@ -1454,6 +1454,18 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 }
                 if (lookLockActive
                     && !lookLockApplied
+                    && (dirState == CameraState::FlagWatch
+                        || dirState == CameraState::FollowPlayer)) {
+                    float frozenKillerAim[3];
+                    if (CameraDirector_GetFlagCarrierKillLookAimPoint(frozenKillerAim)
+                        && Get3pvOrbitYawToPoint(playerEntity, frozenKillerAim, &lookLockYaw)) {
+                        desiredYaw = NormalizeAngle(lookLockYaw);
+                        lookLockApplied = true;
+                        tpvDebug.lookLockFrozenTarget = true;
+                    }
+                }
+                if (lookLockActive
+                    && !lookLockApplied
                     && Get3pvOrbitYawToTarget(playerEntity, lookLockTarget, &lookLockYaw)) {
                     desiredYaw = NormalizeAngle(lookLockYaw);
                     lookLockApplied = true;
@@ -1679,7 +1691,12 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
             float targetPos[3] = {};
             bool haveTarget = false;
             if (lookLockActive && tpvDebug.lookLockFrozenTarget) {
-                haveTarget = CameraDirector_GetKillCamVictimAimPoint(targetPos);
+                if (dirState == CameraState::KillCam) {
+                    haveTarget = CameraDirector_GetKillCamVictimAimPoint(targetPos);
+                } else if (dirState == CameraState::FlagWatch
+                           || dirState == CameraState::FollowPlayer) {
+                    haveTarget = CameraDirector_GetFlagCarrierKillLookAimPoint(targetPos);
+                }
             }
             if (lookLockActive && !haveTarget) {
                 haveTarget = GetPlayerAimPoint(lookLockTarget, targetPos);
