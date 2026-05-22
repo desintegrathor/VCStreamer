@@ -36,9 +36,6 @@ static float g_yaw = 0.0f;
 // Current target the drone is flying toward
 static int g_targetHandle = 0;
 
-// Auto-pick timer: when no director target, pick interesting players ourselves
-static int g_autoPickCounter = 0;
-
 // Player visibility: LOS from drone to player head
 static bool g_canSeePlayer = false;
 
@@ -145,32 +142,6 @@ static void GetEntityPos(void* entity, float* out) {
     out[0] = *(float*)((uintptr_t)entity + 0xD0);
     out[1] = *(float*)((uintptr_t)entity + 0xD4);
     out[2] = *(float*)((uintptr_t)entity + 0xD8);
-}
-
-// ============================================================================
-// Auto-pick: choose a random alive player when we have no director target
-// ============================================================================
-
-static int AutoPickPlayer() {
-    void** playerTable = (void**)(g_gameBase + 0x7AE9C8);
-
-    int handles[64];
-    int count = 0;
-    for (int i = 0; i < 64; i++) {
-        if (!playerTable[i]) continue;
-        uintptr_t entity = *(uintptr_t*)((uintptr_t)playerTable[i] + 244);
-        if (!entity) continue;
-        handles[count++] = *(int*)playerTable[i];
-    }
-
-    if (count == 0) return 0;
-    if (count == 1) return handles[0];
-
-    for (int attempt = 0; attempt < 5; attempt++) {
-        int pick = handles[rand() % count];
-        if (pick != g_targetHandle) return pick;
-    }
-    return handles[rand() % count];
 }
 
 // ============================================================================
@@ -564,7 +535,6 @@ void DroneCamera_Activate(const float startPos[3]) {
     g_pitch = 0.0f;
     g_yaw = 0.0f;
     g_targetHandle = 0;
-    g_autoPickCounter = 0;
     ClearPath();
     g_usingDirectSteering = true;
     g_stuckTimer = 0.0f;
@@ -669,20 +639,11 @@ void DroneCamera_Update(float dt) {
 
     const CameraConfig& cfg = CameraDirector_GetConfig();
 
-    // Auto-pick a new player if we have no target or current target is gone
+    // Target ownership belongs to CameraDirector. If the current target is
+    // unavailable, hold position until the director commits a fallback.
     void* targetEntity = (g_targetHandle != 0) ? FindEntityByHandle(g_targetHandle) : nullptr;
     if (!targetEntity) {
-        g_autoPickCounter++;
-        if (g_autoPickCounter >= 180) {
-            g_autoPickCounter = 0;
-            int picked = AutoPickPlayer();
-            if (picked != 0) {
-                DroneCamera_SetTarget(picked);
-                targetEntity = FindEntityByHandle(picked);
-            }
-        }
-    } else {
-        g_autoPickCounter = 0;
+        return;
     }
 
     // Check kill-frame expiry

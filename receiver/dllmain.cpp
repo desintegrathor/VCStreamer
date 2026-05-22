@@ -27,16 +27,11 @@ uintptr_t GetModuleBase(const wchar_t* moduleName) {
 }
 
 // ---------------------------
-// Main loop: scoreboard polling + delayed action processing + camera director update
+// Main loop: background scoreboard polling only. Camera timing runs on the
+// spectator-frame hook so target changes happen on the game thread.
 // ---------------------------
 void MainLoop() {
     while (true) {
-        // Process scheduled actions (kills/flags with delay timing)
-        DelayManager::ProcessActions();
-
-        // Update camera director state machine
-        CameraDirector_Update();
-
         // Read scoreboard from game memory and update SpectatorController
         auto players = GameMemoryReader::ReadPlayerList();
         LowPlayerOverlay_SetActivePlayerCount((int)players.size());
@@ -134,10 +129,10 @@ DWORD WINAPI MainThread(LPVOID) {
     DelayManager::Init();
 
     InitCameraDirector(base);
+    InitRealtimeHook(base);
     InitTickDelayBuffer(base);
     InitFirstPersonCamera(base);
     InitFpvViewmodel(base);
-    InitRealtimeHook(base);
     InitAutoSpectator(base);
     InitWorldCameraTracker(base);
     SetHookReady();

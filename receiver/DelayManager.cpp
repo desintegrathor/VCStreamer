@@ -1,16 +1,11 @@
 #include "DelayManager.h"
 #include "CameraDirector.h"
 #include "DiagnosticsLog.h"
-#include "TickDelayBuffer.h"
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <mutex>
 #include <Windows.h>
 
-static std::mutex g_actionsMutex;
-
-std::queue<DelayedAction> DelayManager::actions;
 uintptr_t DelayManager::gameBase = 0;
 float DelayManager::fpvOffsetBack = 0.8f;
 float DelayManager::fpvOffsetLeft = 0.3f;
@@ -18,7 +13,11 @@ float DelayManager::fpvOffsetUp = 0.3f;
 float DelayManager::fpvPitchOffset = 0.785f;
 int DelayManager::fpvChance = 0;
 bool DelayManager::debugMode = false;
+int DelayManager::minGameDelaySeconds = 10;
 DWORD DelayManager::lastConfigReload = 0;
+DWORD DelayManager::lastMinDelayLog = 0;
+
+static constexpr uintptr_t SPECT_DELAY_OFFSET = 0x20DB48;
 
 int DelayManager::LoadDelayFromINI() {
     // Get the directory where the DLL is located
@@ -72,9 +71,12 @@ int DelayManager::LoadDelayFromINI() {
                         try { fpvChance = std::stoi(value); } catch (...) {}
                     } else if (key == "debug_mode") {
                         try { debugMode = (std::stoi(value) != 0); } catch (...) {}
+                    } else if (key == "min_game_delay_seconds") {
+                        try { minGameDelaySeconds = std::stoi(value); } catch (...) {}
                     }
                 }
             }
+            if (minGameDelaySeconds < 0) minGameDelaySeconds = 0;
             iniFile.close();
             return 0;
         } else {
@@ -96,6 +98,10 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "\n";
                 outFile << "; Debug mode (0=normal, 1=reload config periodically for live tuning)\n";
                 outFile << "debug_mode=0\n";
+                outFile << "\n";
+                outFile << "; Clamp the game-applied spectator delay when the server value is lower.\n";
+                outFile << "; Set to 0 to use the server value exactly.\n";
+                outFile << "min_game_delay_seconds=10\n";
                 outFile << "\n";
                 outFile << "; Auto-connect / restart target (set auto_connect=0 to wait for manual connection)\n";
                 outFile << "auto_connect=1\n";
@@ -137,6 +143,7 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "detached_killcam_max_radius=22.0\n";
                 outFile << "detached_killcam_min_clearance=1.0\n";
                 outFile << "kill_look_lock_advance=3.0\n";
+                outFile << "director_pre_roll=5.0\n";
                 outFile.close();
                 return 0;
             }
@@ -149,13 +156,15 @@ int DelayManager::LoadDelayFromINI() {
 
 void DelayManager::Init() {
     LoadDelayFromINI();
+    EnsureMinimumGameDelaySeconds();
 }
 
 int DelayManager::GetGameDelaySeconds() {
-    // Read server-configured spectator delay from game memory
-    // dword_F7DB48 (IDA addr), RVA = 0x20DB48
+    EnsureMinimumGameDelaySeconds();
+
+    // Read server-configured spectator delay from game memory.
+    // dword_F7DB48 (IDA addr), runtime gameBase + 0x20DB48.
     if (!gameBase) return 0;
-    constexpr uintptr_t SPECT_DELAY_OFFSET = 0x20DB48;
     __try {
         return *(int*)(gameBase + SPECT_DELAY_OFFSET);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -163,47 +172,32 @@ int DelayManager::GetGameDelaySeconds() {
     }
 }
 
-void DelayManager::AddDelayedAction(const DelayedAction& action) {
-    // If total delay (game + buffer) is 6s or less, execute immediately
-    int totalDelayMs = GetGameDelaySeconds() * 1000 + GetTickDelayMs();
-    if (totalDelayMs <= 6000) {
-        switch (action.type) {
-            case DelayedAction::Type::KILL:
-                CameraDirector_OnKill(action.killerId, action.victimId, action.weaponId, action.leadMs);
-                break;
+void DelayManager::EnsureMinimumGameDelaySeconds() {
+    if (!gameBase || minGameDelaySeconds <= 0) return;
 
-            case DelayedAction::Type::FLAG:
-                CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier, action.leadMs);
-                break;
+    __try {
+        int* delayPtr = (int*)(gameBase + SPECT_DELAY_OFFSET);
+        int currentDelay = *delayPtr;
+        if (currentDelay >= minGameDelaySeconds) {
+            return;
         }
-        return;
-    }
 
-    std::lock_guard<std::mutex> lock(g_actionsMutex);
-    actions.push(action);
-}
+        DWORD oldProtect = 0;
+        if (VirtualProtect(delayPtr, sizeof(int), PAGE_READWRITE, &oldProtect)) {
+            *delayPtr = minGameDelaySeconds;
+            VirtualProtect(delayPtr, sizeof(int), oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), delayPtr, sizeof(int));
 
-void DelayManager::ProcessActions() {
-    std::lock_guard<std::mutex> lock(g_actionsMutex);
-    auto now = std::chrono::system_clock::now();
-
-    while (!actions.empty()) {
-        const auto& action = actions.front();
-
-        if (action.executeTime <= now) {
-            switch (action.type) {
-                case DelayedAction::Type::KILL:
-                    CameraDirector_OnKill(action.killerId, action.victimId, action.weaponId, action.leadMs);
-                    break;
-
-                case DelayedAction::Type::FLAG:
-                    CameraDirector_OnFlagChanged(action.usCarrier, action.vcCarrier, action.leadMs);
-                    break;
+            DWORD now = GetTickCount();
+            if (now - lastMinDelayLog > 10000) {
+                DiagnosticsLog_Append("receiver_debug.log",
+                                      "[DelayManager] Game spectator delay clamped %ds -> %ds\n",
+                                      currentDelay,
+                                      minGameDelaySeconds);
+                lastMinDelayLog = now;
             }
-            actions.pop();
-        } else {
-            break;
         }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
 
@@ -289,6 +283,7 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.detachedKillCamMaxRadius          = ReadIniFloat(iniPath, "detached_killcam_max_radius", 22.0f);
     cfg.detachedKillCamMinClearance       = ReadIniFloat(iniPath, "detached_killcam_min_clearance", 1.0f);
     cfg.killLookLockAdvance               = ReadIniFloat(iniPath, "kill_look_lock_advance", 3.0f);
+    cfg.directorPreRollSeconds            = ReadIniFloat(iniPath, "director_pre_roll", 5.0f);
 
     cfg.killCooldown              = ReadIniFloat(iniPath, "kill_cooldown", 6.0f);
     cfg.killInterruptMinHold      = ReadIniFloat(iniPath, "kill_interrupt_min_hold", 4.0f);

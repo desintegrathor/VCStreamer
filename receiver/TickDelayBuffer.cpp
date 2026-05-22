@@ -2,7 +2,7 @@
 #include "TickDelayBuffer.h"
 #include "DelayManager.h"
 #include "DiagnosticsLog.h"
-#include "RealtimeHook.h"
+#include "ServerStateSniffer.h"
 #include <cstring>
 #include <mutex>
 #include <cstdarg>
@@ -23,7 +23,7 @@ static void TickLog(const char* fmt, ...) {
 }
 
 // ============================================================================
-// NET_ReadMessages IAT hook for packet-level delay
+// NET_ReadMessages IAT hook for raw packet sniffing and optional local delay
 // ============================================================================
 //
 // NET_ReadMessages is imported by game.dll from logs.dll.
@@ -44,7 +44,7 @@ static void TickLog(const char* fmt, ...) {
 // Configuration
 // ============================================================================
 
-static const int g_tickDelayMs = 5000;  // Fixed 5-second safety buffer
+static const int g_tickDelayMs = 0;  // No local replay buffer by default.
 
 // ============================================================================
 // Original function pointer
@@ -135,26 +135,36 @@ static unsigned int __cdecl Hooked_NET_ReadMessages(
         void* senderHandle = outData ? *outData : nullptr;
         void* messageType = outData2 ? *outData2 : nullptr;
 
-        // Scan raw buffer for kill/flag messages before any splitting
-        ScanBufferForKills(rawBuf, rawSize);
-        ScanBufferForFlags(rawBuf, rawSize);
-        ScanBufferForPlayerPositions(rawBuf, rawSize);
-
         // Pass through ALL messages until spectator has fully spawned
-        // mpSubState must reach 10 (spectator spawned) before we start buffering
+        // mpSubState must reach 10 (spectator spawned) before any optional buffering
         // Otherwise join/spawn confirmations get delayed and mpSubState stays at 9
+        bool spectatorSpawned = true;
         if (g_gameBase) {
             constexpr uintptr_t MP_SUBSTATE_OFFSET = 0x7C0F58;
             int mpSubState = *(int*)(g_gameBase + MP_SUBSTATE_OFFSET);
+            spectatorSpawned = (mpSubState == 10);
             if (mpSubState != 10) {
+                ServerStateSniffer_OnRawMessage(rawBuf, rawSize);
                 return 0;  // Pass through immediately
             }
         }
+
+        if (spectatorSpawned) {
+            DelayManager::EnsureMinimumGameDelaySeconds();
+        }
+
+        // Sniff authoritative server state before the game queues/applies it.
+        // The min-delay clamp above makes sniffer visibleTick match game playback.
+        ServerStateSniffer_OnRawMessage(rawBuf, rawSize);
 
         // Log first intercepted packet
         if (!g_firstPacketLogged) {
             TickLog("[TickDelay] First packet intercepted! size=%lu\n", rawSize);
             g_firstPacketLogged = true;
+        }
+
+        if (g_tickDelayMs <= 0) {
+            return 0;
         }
 
         // 2. Buffer the entire message with timestamp for delayed replay
@@ -253,11 +263,15 @@ void InitTickDelayBuffer(uintptr_t gameBase) {
     g_playerArray   = (void**)(gameBase + 0x7AE9C8);
     g_ppLocalPlayer = (void***)(gameBase + 0x80D458);
 
-    TickLog("[TickDelay] Fixed buffer delay: %dms (%ds)\n", g_tickDelayMs, g_tickDelayMs / 1000);
+    TickLog("[TickDelay] Local buffer delay: %dms\n", g_tickDelayMs);
 
-    // Allocate ring buffer
-    g_ring = new BufferedChunk[RING_SIZE];
-    memset(g_ring, 0, sizeof(BufferedChunk) * RING_SIZE);
+    // Allocate the replay ring only when local buffering is enabled.
+    if (g_tickDelayMs > 0) {
+        g_ring = new BufferedChunk[RING_SIZE];
+        memset(g_ring, 0, sizeof(BufferedChunk) * RING_SIZE);
+    } else {
+        g_ring = nullptr;
+    }
     g_ringHead = 0;
     g_ringTail = 0;
     g_ringCount = 0;
@@ -271,7 +285,7 @@ void InitTickDelayBuffer(uintptr_t gameBase) {
     DWORD oldProtect;
     if (!VirtualProtect((LPVOID)g_iatAddr, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
         TickLog("[TickDelay] ERROR: Failed to unprotect IAT entry at 0x%08X\n", (unsigned)g_iatAddr);
-        delete[] g_ring;
+        if (g_ring) delete[] g_ring;
         g_ring = nullptr;
         return;
     }
@@ -287,7 +301,11 @@ void InitTickDelayBuffer(uintptr_t gameBase) {
 
     g_hookInstalled = true;
     TickLog("[TickDelay] IAT hook installed successfully!\n");
-    TickLog("[TickDelay] Ring buffer: %d slots allocated\n", RING_SIZE);
+    if (g_ring) {
+        TickLog("[TickDelay] Ring buffer: %d slots allocated\n", RING_SIZE);
+    } else {
+        TickLog("[TickDelay] Ring buffer disabled; packets pass through immediately after sniffing\n");
+    }
 }
 
 void ShutdownTickDelayBuffer() {

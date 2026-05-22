@@ -5,7 +5,7 @@
 #include "DiagnosticsLog.h"
 #include "DroneCamera.h"
 #include "PathGrid.h"
-#include "RealtimeHook.h"
+#include "ServerStateSniffer.h"
 #include "SpectatedPlayerData.h"
 #include "SpectatorController.h"
 #include "WorldCameraTracker.h"
@@ -116,11 +116,41 @@ struct ShotRequest {
     const char* reason;
 };
 
+struct PendingDirectorEvent {
+    DirectorEvent event;
+    DWORD plannedStartTick;
+    bool dueLogged;
+};
+
 static ShotKind g_committedShotKind = ShotKind::None;
 static CamBudgetType g_committedPreference = CAM_WORLD;
+static std::vector<PendingDirectorEvent> g_eventQueue;
+static DWORD g_currentInvalidSince = 0;
+static unsigned long long g_compatEventSequence = 0;
+
+constexpr DWORD KILL_EVENT_STALE_GRACE_MS = 3000;
+constexpr DWORD FLAG_EVENT_STALE_GRACE_MS = 30000;
+constexpr DWORD TARGET_INVALID_GRACE_MS = 1000;
+constexpr size_t MAX_DIRECTOR_EVENT_QUEUE = 128;
 
 static void CD_Log(const char* fmt, ...) {
     FILE* file = fopen("receiver_debug.log", "a");
+    if (!file) return;
+
+    va_list args;
+    va_start(args, fmt);
+    DiagnosticsLog_Write(file, fmt, args);
+    va_end(args);
+
+    fclose(file);
+}
+
+static const char* DirectorEventTypeName(DirectorEventType type) {
+    return type == DirectorEventType::Flag ? "flag" : "kill";
+}
+
+static void TimingLog(const char* fmt, ...) {
+    FILE* file = fopen("camera_timing_debug.log", "a");
     if (!file) return;
 
     va_list args;
@@ -640,27 +670,62 @@ static bool GetCurrentPlayerPosition(int handle, float* out) {
     return !(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f);
 }
 
-static bool GetBestKillPosition(int handle, float* out, bool* usedPredicted) {
-    if (usedPredicted) *usedPredicted = false;
+static bool CopySnapshotPosition(const PlayerSnapshot& snapshot, float* out) {
+    if (!snapshot.hasPosition) return false;
 
-    if (RealtimeHook_GetPredictedPlayerPosition(handle, out, 7000)) {
-        if (usedPredicted) *usedPredicted = true;
+    out[0] = snapshot.pos[0];
+    out[1] = snapshot.pos[1];
+    out[2] = snapshot.pos[2];
+    return true;
+}
+
+static bool GetBestKillPosition(int handle,
+                                DWORD visibleTick,
+                                const PlayerSnapshot* eventSnapshot,
+                                float* out,
+                                bool* usedLiveAhead) {
+    if (usedLiveAhead) *usedLiveAhead = false;
+
+    if (eventSnapshot && eventSnapshot->hasPosition) {
+        if (CopySnapshotPosition(*eventSnapshot, out)) {
+            if (usedLiveAhead) *usedLiveAhead = true;
+            return true;
+        }
+    }
+
+    PlayerSnapshot snapshot = {};
+    if (ServerStateSniffer_GetSnapshotAt(handle, visibleTick, &snapshot)
+        && CopySnapshotPosition(snapshot, out)) {
+        if (usedLiveAhead) *usedLiveAhead = true;
         return true;
     }
 
     return GetCurrentPlayerPosition(handle, out);
 }
 
-static float GetKillDistance(int killerHandle, int victimHandle, bool* usedPredicted) {
-    if (usedPredicted) *usedPredicted = false;
+static float GetKillDistanceFromEvent(const DirectorEvent& event, bool* usedLiveAhead) {
+    if (usedLiveAhead) *usedLiveAhead = false;
 
-    bool killerPredicted = false;
-    bool victimPredicted = false;
+    bool killerLiveAhead = false;
+    bool victimLiveAhead = false;
     float kp[3], vp[3];
-    if (!GetBestKillPosition(killerHandle, kp, &killerPredicted)) return 0.0f;
-    if (!GetBestKillPosition(victimHandle, vp, &victimPredicted)) return 0.0f;
+    if (!GetBestKillPosition(event.killerHandle,
+                             event.visibleTick,
+                             event.hasKillerSnapshot ? &event.killerSnapshot : nullptr,
+                             kp,
+                             &killerLiveAhead)) {
+        return 0.0f;
+    }
 
-    if (usedPredicted) *usedPredicted = killerPredicted || victimPredicted;
+    if (!GetBestKillPosition(event.victimHandle,
+                             event.visibleTick,
+                             event.hasVictimSnapshot ? &event.victimSnapshot : nullptr,
+                             vp,
+                             &victimLiveAhead)) {
+        return 0.0f;
+    }
+
+    if (usedLiveAhead) *usedLiveAhead = killerLiveAhead || victimLiveAhead;
 
     float dx = kp[0] - vp[0];
     float dy = kp[1] - vp[1];
@@ -733,17 +798,6 @@ static float GetKillCamTotalDuration() {
     return GetKillCamTotalDuration(g_kcStyle);
 }
 
-static bool IsKillCamInterruptible() {
-    float elapsed = GetKillCamElapsedInternal();
-    float waitEnd = GetKillCamWaitDuration(g_kcStyle);
-    float transEnd = waitEnd + GetKillCamTransitionDuration(g_kcStyle);
-
-    if (elapsed < waitEnd) return true;
-    if (elapsed < transEnd) return false;
-    if (elapsed > transEnd + 1.0f) return true;
-    return false;
-}
-
 static bool TickReached(DWORD now, DWORD tick) {
     return (LONG)(now - tick) >= 0;
 }
@@ -770,7 +824,10 @@ static void ClearFlagKillLook() {
     g_flagKillLookKillTick = 0;
 }
 
-static bool MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD now) {
+static bool MaybeStartVictimKillLook(int killerHandle,
+                                     int victimHandle,
+                                     DWORD now,
+                                     DWORD visibleKillTick) {
     bool victimIsFlagCarrier = (victimHandle != 0)
         && (victimHandle == g_flagCarrierUS || victimHandle == g_flagCarrierVC);
     bool watchingVictim = (g_state == CameraState::FlagWatch
@@ -781,22 +838,26 @@ static bool MaybeStartVictimKillLook(int killerHandle, int victimHandle, DWORD n
         return false;
     }
 
-    float leadSeconds = GetKillLookLeadDuration();
     float advanceSeconds = GetKillLookAdvanceDuration();
-    DWORD leadMs = (DWORD)(leadSeconds * 1000.0f + 0.5f);
     DWORD advanceMs = (DWORD)(advanceSeconds * 1000.0f + 0.5f);
-    if (leadMs < advanceMs) leadMs = advanceMs;
+    DWORD startTick = visibleKillTick >= advanceMs
+        ? visibleKillTick - advanceMs
+        : now;
+    if (!TickReached(now, startTick)) {
+        // Not time to apply the look lock yet; keep the queued event alive.
+        return false;
+    }
 
     g_flagKillLookKillerHandle = killerHandle;
     g_flagKillLookVictimHandle = victimHandle;
-    g_flagKillLookKillTick = now + leadMs;
-    g_flagKillLookStartTick = g_flagKillLookKillTick - advanceMs;
+    g_flagKillLookKillTick = visibleKillTick;
+    g_flagKillLookStartTick = startTick;
 
     CD_Log("[CameraDirector] Victim death look: victim=%d killer=%d flagCarrier=%s startsIn=%ds, holds until camera changes\n",
            victimHandle,
            killerHandle,
            victimIsFlagCarrier ? "yes" : "no",
-           (int)((leadMs - advanceMs) / 1000));
+           0);
     return true;
 }
 
@@ -855,7 +916,12 @@ static const char* ViewNameForRequest(const ShotRequest& request) {
 
 static std::string HoldTextForRequest(const ShotRequest& request, DWORD now) {
     if (request.kind == ShotKind::FlagWatch) {
-        return "until-change";
+        char buf[64];
+        if (g_shotHoldUntil != 0 && g_shotHoldUntil > now) {
+            sprintf(buf, "%ds", (int)((g_shotHoldUntil - now) / 1000));
+            return std::string(buf);
+        }
+        return "expired";
     }
     if (g_shotHoldUntil != 0 && g_shotHoldUntil > now) {
         return std::to_string((int)((g_shotHoldUntil - now) / 1000)) + "s";
@@ -923,24 +989,42 @@ static void FeedNextFlagLost(const char* flagName) {
     CommentatorFeed_Line("NEXT now %s no longer carried; holding flag view briefly", flagName);
 }
 
-static bool CurrentCommittedShotUsable() {
+static bool CurrentCommittedShotUsable(DWORD now) {
+    bool usable = false;
+
     switch (g_state) {
         case CameraState::FollowPlayer:
-            return CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            usable = CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            break;
         case CameraState::FlagWatch:
-            return g_currentTargetHandle != 0 && CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            usable = g_currentTargetHandle != 0 && CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            break;
         case CameraState::Drone:
-            return DroneCamera_IsActive() && CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            usable = DroneCamera_IsActive() && CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            break;
         case CameraState::KillCam:
-            return g_kcKillerHandle != 0;
+            usable = g_kcKillerHandle != 0;
+            break;
         default:
-            return false;
+            usable = false;
+            break;
     }
+
+    if (usable) {
+        g_currentInvalidSince = 0;
+        return true;
+    }
+
+    if (g_currentInvalidSince == 0) {
+        g_currentInvalidSince = now;
+        return true;
+    }
+
+    return now - g_currentInvalidSince <= TARGET_INVALID_GRACE_MS;
 }
 
 static bool IsCommittedShotLocked(DWORD now) {
-    if (g_state == CameraState::FlagWatch) return CurrentCommittedShotUsable();
-    return IsShotHoldActive(now) && CurrentCommittedShotUsable();
+    return IsShotHoldActive(now) && CurrentCommittedShotUsable(now);
 }
 
 static void ClearCommittedShot(DWORD now, const char* reason) {
@@ -955,6 +1039,7 @@ static void ClearCommittedShot(DWORD now, const char* reason) {
     g_currentHoldStart = now;
     g_shotHoldUntil = 0;
     g_currentShotUseFpv = false;
+    g_currentInvalidSince = 0;
     g_kcStyle = KillCamStyle::BulletTravel;
     g_kcKillerHandle = 0;
     g_kcVictimHandle = 0;
@@ -969,6 +1054,8 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
     if (request.kind != ShotKind::Drone && DroneCamera_IsActive()) {
         DroneCamera_Deactivate();
     }
+
+    g_currentInvalidSince = 0;
 
     switch (request.kind) {
         case ShotKind::FollowPlayer: {
@@ -1042,7 +1129,7 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_committedPreference = CAM_WORLD;
             g_currentTargetHandle = request.targetHandle;
             g_currentHoldStart = now;
-            g_shotHoldUntil = 0;
+            g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
             g_currentShotUseFpv = RollFpvForShot();
             g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
@@ -1061,8 +1148,9 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
                 g_lastFlagWatchTargetSwitch = now;
             }
 
-            CD_Log("[CameraDirector] Commit flag target=%d fpv=%s reason=%s\n",
+            CD_Log("[CameraDirector] Commit flag target=%d hold=%ds fpv=%s reason=%s\n",
                    request.targetHandle,
+                   (int)((g_shotHoldUntil - now) / 1000),
                    g_currentShotUseFpv ? "yes" : "no",
                    request.reason ? request.reason : "none");
             FeedCurrentWatching(request, now);
@@ -1118,21 +1206,11 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
 
 static bool RequestShot(const ShotRequest& request, DWORD now) {
     if (!request.force) {
-        if (g_state == CameraState::FlagWatch) {
-            CD_Log("[CameraDirector] Shot request ignored during flag watch: %s\n",
-                   ShotKindName(request.kind));
-            return false;
-        }
-
         if (IsCommittedShotLocked(now)) {
             CD_Log("[CameraDirector] Shot request ignored: locked %s remaining=%ds request=%s\n",
                    ShotKindName(g_committedShotKind),
                    (int)((g_shotHoldUntil - now) / 1000),
                    ShotKindName(request.kind));
-            return false;
-        }
-
-        if (g_state == CameraState::KillCam && !IsKillCamInterruptible()) {
             return false;
         }
     }
@@ -1193,8 +1271,8 @@ static bool RequestFlagWatchShot(int carrierHandle,
         0,
         KillCamStyle::BulletTravel,
         CAM_WORLD,
-        0.0f,
-        true,
+        NormalFollowHoldSeconds(CAM_WORLD),
+        false,
         reason
     };
     return RequestShot(request, now);
@@ -1213,6 +1291,7 @@ static bool RequestFlagCampingGlimpse(int carrierHandle, DWORD now) {
         return false;
     }
 
+    g_shotHoldUntil = g_flagCampingGlimpseUntil;
     return true;
 }
 
@@ -1364,47 +1443,178 @@ static void UpdateKillCamPhase() {
 }
 
 // ============================================================================
-// Event Processing
+// Server event planning
 // ============================================================================
 
-void CameraDirector_OnKill(int killerHandle, int victimHandle, int weaponId, int leadMs) {
-    std::lock_guard<std::mutex> lock(g_directorMutex);
+static DWORD DirectorPreRollMsForEvent(const DirectorEvent& event) {
+    float preRollSeconds = g_config.directorPreRollSeconds;
+    if (!std::isfinite(preRollSeconds) || preRollSeconds < 0.0f) {
+        preRollSeconds = 5.0f;
+    }
 
-    DWORD now = GetTickCount();
+    DWORD preRollMs = (DWORD)(preRollSeconds * 1000.0f + 0.5f);
+    DWORD availableLead = event.availableLeadMs > 0
+        ? (DWORD)event.availableLeadMs
+        : 0;
+
+    if (preRollMs > availableLead) {
+        preRollMs = availableLead;
+    }
+    return preRollMs;
+}
+
+static DWORD PlannedStartTickForEvent(const DirectorEvent& event) {
+    DWORD preRollMs = DirectorPreRollMsForEvent(event);
+    DWORD plannedStart = event.visibleTick >= preRollMs
+        ? event.visibleTick - preRollMs
+        : event.rawTick;
+
+    if (!TickReached(plannedStart, event.rawTick)) {
+        plannedStart = event.rawTick;
+    }
+
+    return plannedStart;
+}
+
+static bool IsEventStale(const DirectorEvent& event, DWORD now) {
+    DWORD grace = event.type == DirectorEventType::Flag
+        ? FLAG_EVENT_STALE_GRACE_MS
+        : KILL_EVENT_STALE_GRACE_MS;
+    return TickReached(now, event.visibleTick + grace);
+}
+
+static int EventScore(const DirectorEvent& event) {
+    return event.type == DirectorEventType::Flag ? 200 : 100;
+}
+
+static void AttachEventSnapshots(DirectorEvent& event) {
+    if (event.type == DirectorEventType::Kill) {
+        if (!event.hasKillerSnapshot) {
+            event.hasKillerSnapshot = ServerStateSniffer_GetSnapshotAt(
+                event.killerHandle,
+                event.visibleTick,
+                &event.killerSnapshot);
+        }
+        if (!event.hasVictimSnapshot) {
+            event.hasVictimSnapshot = ServerStateSniffer_GetSnapshotAt(
+                event.victimHandle,
+                event.visibleTick,
+                &event.victimSnapshot);
+        }
+    } else {
+        if (!event.hasUSCarrierSnapshot) {
+            event.hasUSCarrierSnapshot = ServerStateSniffer_GetSnapshotAt(
+                event.usCarrier,
+                event.visibleTick,
+                &event.usCarrierSnapshot);
+        }
+        if (!event.hasVCCarrierSnapshot) {
+            event.hasVCCarrierSnapshot = ServerStateSniffer_GetSnapshotAt(
+                event.vcCarrier,
+                event.visibleTick,
+                &event.vcCarrierSnapshot);
+        }
+    }
+}
+
+static void QueueDirectorEvent(DirectorEvent event, const char* reason) {
+    AttachEventSnapshots(event);
+
+    if (event.type == DirectorEventType::Flag) {
+        for (size_t i = 0; i < g_eventQueue.size();) {
+            if (g_eventQueue[i].event.type == DirectorEventType::Flag) {
+                TimingLog("[Plan] seq=%llu type=flag raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=drop-superseded-by-flag-%llu\n",
+                          g_eventQueue[i].event.sequence,
+                          g_eventQueue[i].event.rawTick,
+                          g_eventQueue[i].event.playbackDelayMs,
+                          g_eventQueue[i].event.visibleTick,
+                          g_eventQueue[i].plannedStartTick,
+                          g_eventQueue[i].event.availableLeadMs,
+                          event.sequence);
+                g_eventQueue.erase(g_eventQueue.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    if (g_eventQueue.size() >= MAX_DIRECTOR_EVENT_QUEUE) {
+        TimingLog("[Plan] seq=%llu type=%s raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=drop-director-queue-full\n",
+                  g_eventQueue.front().event.sequence,
+                  DirectorEventTypeName(g_eventQueue.front().event.type),
+                  g_eventQueue.front().event.rawTick,
+                  g_eventQueue.front().event.playbackDelayMs,
+                  g_eventQueue.front().event.visibleTick,
+                  g_eventQueue.front().plannedStartTick,
+                  g_eventQueue.front().event.availableLeadMs);
+        g_eventQueue.erase(g_eventQueue.begin());
+    }
+
+    PendingDirectorEvent pending = {};
+    pending.event = event;
+    pending.plannedStartTick = PlannedStartTickForEvent(event);
+    pending.dueLogged = false;
+    g_eventQueue.push_back(pending);
+
+    TimingLog("[Plan] seq=%llu type=%s raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=%s\n",
+              event.sequence,
+              DirectorEventTypeName(event.type),
+              event.rawTick,
+              event.playbackDelayMs,
+              event.visibleTick,
+              pending.plannedStartTick,
+              event.availableLeadMs,
+              reason ? reason : "queued");
+}
+
+static void DrainSnifferEvents() {
+    std::vector<DirectorEvent> events;
+    ServerStateSniffer_DrainEvents(events);
+
+    for (size_t i = 0; i < events.size(); ++i) {
+        QueueDirectorEvent(events[i], "queued-from-sniffer");
+    }
+}
+
+static bool ApplyVictimLookForEvent(const DirectorEvent& event, DWORD now) {
+    if (event.type != DirectorEventType::Kill) return false;
+
+    if (!MaybeStartVictimKillLook(event.killerHandle,
+                                  event.victimHandle,
+                                  now,
+                                  event.visibleTick)) {
+        return false;
+    }
+
+    if (g_state == CameraState::FollowPlayer
+        && (g_shotHoldUntil == 0 || TickReached(event.visibleTick, g_shotHoldUntil))) {
+        g_shotHoldUntil = event.visibleTick;
+    }
+
+    CD_Log("[CameraDirector] Kill preserved: victim death look target=%d killer=%d seq=%llu\n",
+           event.victimHandle,
+           event.killerHandle,
+           event.sequence);
+    return true;
+}
+
+static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
     g_lastEventTick = now;
     UpdatePlayerActivity(now);
-    BumpPlayerActivity(killerHandle, 0.8f);
-    BumpPlayerActivity(victimHandle, 0.4f);
+    BumpPlayerActivity(event.killerHandle, 0.8f);
+    BumpPlayerActivity(event.victimHandle, 0.4f);
 
-    bool usedPredictedPosition = false;
-    float distance = GetKillDistance(killerHandle, victimHandle, &usedPredictedPosition);
+    bool usedLiveAheadPosition = false;
+    float distance = GetKillDistanceFromEvent(event, &usedLiveAheadPosition);
 
-    bool preservingVictimLook = MaybeStartVictimKillLook(killerHandle, victimHandle, now);
-    if (preservingVictimLook) {
-        if (g_state == CameraState::FollowPlayer
-            && (g_shotHoldUntil == 0 || TickReached(g_flagKillLookKillTick, g_shotHoldUntil))) {
-            g_shotHoldUntil = g_flagKillLookKillTick;
-        }
-
-        CD_Log("[CameraDirector] Kill preserved: victim death look target=%d killer=%d\n",
-               victimHandle, killerHandle);
-        FeedNextKill(killerHandle, victimHandle, weaponId, leadMs, distance, "victim-look");
-        return;
-    }
-
-    if (g_state == CameraState::FlagWatch) {
-        CD_Log("[CameraDirector] Kill ignored: flag shot committed\n");
-        return;
-    }
-
-    // Respect cooldown
-    if (now - g_lastKillSwitch < (DWORD)(g_config.killCooldown * 1000)) {
-        return;
-    }
-
-    // Don't interrupt non-interruptible KillCam
-    if (g_state == CameraState::KillCam && !IsKillCamInterruptible()) {
-        return;
+    if (ApplyVictimLookForEvent(event, now)) {
+        FeedNextKill(event.killerHandle,
+                     event.victimHandle,
+                     event.weaponId,
+                     event.availableLeadMs,
+                     distance,
+                     "victim-look");
+        return true;
     }
 
     KillCamStyle style = (distance >= g_config.killCamLongRangeDistance)
@@ -1415,52 +1625,323 @@ void CameraDirector_OnKill(int killerHandle, int victimHandle, int weaponId, int
         ? g_config.bulletKillCamChance
         : g_config.detachedKillCamChance;
     bool cinematic = RollCinematic(chance);
-    bool locked = IsCommittedShotLocked(now);
-    float heldSeconds = (now - g_currentHoldStart) / 1000.0f;
-    bool canInterruptHold = locked
-        && cinematic
-        && heldSeconds >= g_config.killInterruptMinHold;
 
-    CD_Log("[CameraDirector] Kill: killer=%d victim=%d weapon=%d distance=%.2fm predicted=%s style=%s chance=%d%% locked=%s result=%s\n",
-           killerHandle,
-           victimHandle,
-           weaponId,
+    CD_Log("[CameraDirector] Kill plan commit: seq=%llu killer=%d victim=%d weapon=%d distance=%.2fm liveAhead=%s style=%s chance=%d%% result=%s\n",
+           event.sequence,
+           event.killerHandle,
+           event.victimHandle,
+           event.weaponId,
            distance,
-           usedPredictedPosition ? "yes" : "no",
+           usedLiveAheadPosition ? "yes" : "no",
            KillCamStyleName(style),
            (int)(chance * 100),
-           locked ? "yes" : "no",
-           cinematic ? "CINEMATIC" : "NORMAL");
+           cinematic ? "killcam" : "follow");
 
-    if (locked && !canInterruptHold) {
-        CD_Log("[CameraDirector] Kill ignored: committed shot hold active\n");
-        return;
-    }
-
+    bool committed = false;
     if (cinematic) {
-        bool force = canInterruptHold;
-        if (RequestKillCamShot(killerHandle, victimHandle, style, force,
-                               force ? "cinematic kill interrupt" : "cinematic kill",
-                               now)) {
-            g_lastKillSwitch = now;
-            FeedNextKill(killerHandle, victimHandle, weaponId, leadMs, distance, "killcam");
+        committed = RequestKillCamShot(event.killerHandle,
+                                       event.victimHandle,
+                                       style,
+                                       false,
+                                       "queued kill",
+                                       now);
+    } else if (CD_IsUsablePlayerHandle(event.killerHandle)) {
+        committed = RequestFollowPlayerShot(event.killerHandle,
+                                            CAM_WORLD,
+                                            false,
+                                            "queued kill follow",
+                                            now);
+    }
+
+    if (committed) {
+        g_lastKillSwitch = now;
+        FeedNextKill(event.killerHandle,
+                     event.victimHandle,
+                     event.weaponId,
+                     event.availableLeadMs,
+                     distance,
+                     cinematic ? "killcam" : "follow");
+    }
+
+    return committed;
+}
+
+static int PickFlagTargetForEvent(const DirectorEvent& event, bool wasDualFlag) {
+    int usCarrier = event.usCarrier;
+    int vcCarrier = event.vcCarrier;
+
+    if (usCarrier != 0 && vcCarrier == 0) return usCarrier;
+    if (vcCarrier != 0 && usCarrier == 0) return vcCarrier;
+    if (usCarrier == 0 && vcCarrier == 0) return 0;
+
+    if (IsUsableActiveFlagCarrier(g_currentTargetHandle)) {
+        return g_currentTargetHandle;
+    }
+    if (IsUsableActiveFlagCarrier(usCarrier)) {
+        return usCarrier;
+    }
+    if (IsUsableActiveFlagCarrier(vcCarrier)) {
+        return vcCarrier;
+    }
+    return wasDualFlag ? g_currentTargetHandle : usCarrier;
+}
+
+static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
+    int previousUSCarrier = g_flagCarrierUS;
+    int previousVCCarrier = g_flagCarrierVC;
+    bool wasDualFlag = (g_flagCarrierUS != 0 && g_flagCarrierVC != 0);
+
+    g_flagCarrierUS = event.usCarrier;
+    g_flagCarrierVC = event.vcCarrier;
+    g_lastEventTick = now;
+    UpdatePlayerActivity(now);
+    BumpPlayerActivity(event.usCarrier, 0.6f);
+    BumpPlayerActivity(event.vcCarrier, 0.6f);
+    UpdateFlagCarrierMotion(now);
+
+    bool anyFlag = (event.usCarrier != 0 || event.vcCarrier != 0);
+    bool dualFlag = (event.usCarrier != 0 && event.vcCarrier != 0);
+
+    if (anyFlag) {
+        g_flagLostGraceActive = false;
+        int target = PickFlagTargetForEvent(event, wasDualFlag);
+
+        if (dualFlag && !wasDualFlag) {
+            g_flagAlternateTimer = now;
+            g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
         }
-    } else if (CD_IsUsablePlayerHandle(killerHandle)) {
-        if (RequestFollowPlayerShot(killerHandle, CAM_WORLD, false, "normal kill", now)) {
-            g_lastKillSwitch = now;
-            FeedNextKill(killerHandle, victimHandle, weaponId, leadMs, distance, "follow");
+
+        bool committed = target != 0
+            && RequestFlagWatchShot(target,
+                                    dualFlag ? "queued dual flag" : "queued flag",
+                                    now);
+        if (committed) {
+            FeedNextFlagCarry(target,
+                              FlagNameForCarrier(target, event.usCarrier, event.vcCarrier),
+                              event.availableLeadMs);
+        }
+        return committed;
+    }
+
+    if (g_state == CameraState::FlagWatch && !g_flagLostGraceActive) {
+        g_flagLostGraceActive = true;
+        g_flagLostTimestamp = now;
+        CD_Log("[CameraDirector] Flag lost queued - grace period started\n");
+
+        const char* lostFlag = "flag";
+        if (previousUSCarrier != 0 && previousVCCarrier != 0) {
+            lostFlag = "US and VC flags";
+        } else if (previousUSCarrier != 0) {
+            lostFlag = "US flag";
+        } else if (previousVCCarrier != 0) {
+            lostFlag = "VC flag";
+        }
+        FeedNextFlagLost(lostFlag);
+        return true;
+    }
+
+    return true;
+}
+
+static bool CommitDirectorEvent(const DirectorEvent& event, DWORD now) {
+    if (event.type == DirectorEventType::Kill) {
+        return CommitKillEvent(event, now);
+    }
+    return CommitFlagEvent(event, now);
+}
+
+static bool TryApplyQueuedVictimLook(DWORD now) {
+    for (size_t i = 0; i < g_eventQueue.size(); ++i) {
+        PendingDirectorEvent& pending = g_eventQueue[i];
+        if (pending.event.type != DirectorEventType::Kill) continue;
+        if (!TickReached(now, pending.plannedStartTick)) continue;
+        if (g_currentTargetHandle != pending.event.victimHandle) continue;
+
+        if (ApplyVictimLookForEvent(pending.event, now)) {
+            TimingLog("[Plan] seq=%llu type=kill raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=%lu lead=%d reason=commit-victim-look-locked-shot\n",
+                      pending.event.sequence,
+                      pending.event.rawTick,
+                      pending.event.playbackDelayMs,
+                      pending.event.visibleTick,
+                      pending.plannedStartTick,
+                      now,
+                      pending.event.availableLeadMs);
+            g_eventQueue.erase(g_eventQueue.begin() + i);
+            return true;
         }
     }
+
+    return false;
+}
+
+static bool PromoteQueuedEvents(DWORD now) {
+    bool changed = false;
+
+    for (;;) {
+        for (size_t i = 0; i < g_eventQueue.size();) {
+            if (IsEventStale(g_eventQueue[i].event, now)) {
+                TimingLog("[Plan] seq=%llu type=%s raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=drop-stale\n",
+                          g_eventQueue[i].event.sequence,
+                          DirectorEventTypeName(g_eventQueue[i].event.type),
+                          g_eventQueue[i].event.rawTick,
+                          g_eventQueue[i].event.playbackDelayMs,
+                          g_eventQueue[i].event.visibleTick,
+                          g_eventQueue[i].plannedStartTick,
+                          g_eventQueue[i].event.availableLeadMs);
+                CD_Log("[CameraDirector] Stale event dropped seq=%llu type=%s\n",
+                       g_eventQueue[i].event.sequence,
+                       DirectorEventTypeName(g_eventQueue[i].event.type));
+                g_eventQueue.erase(g_eventQueue.begin() + i);
+                changed = true;
+            } else {
+                ++i;
+            }
+        }
+
+        int bestIndex = -1;
+        int bestScore = -1;
+        for (size_t i = 0; i < g_eventQueue.size(); ++i) {
+            PendingDirectorEvent& pending = g_eventQueue[i];
+            if (!TickReached(now, pending.plannedStartTick)) continue;
+
+            int score = EventScore(pending.event);
+            if (bestIndex < 0 || score > bestScore) {
+                bestIndex = (int)i;
+                bestScore = score;
+            }
+        }
+
+        if (bestIndex < 0) {
+            return changed;
+        }
+
+        if (IsCommittedShotLocked(now)) {
+            bool appliedVictimLook = TryApplyQueuedVictimLook(now);
+            if (appliedVictimLook) {
+                return true;
+            }
+
+            PendingDirectorEvent& pending = g_eventQueue[bestIndex];
+            if (!pending.dueLogged) {
+                TimingLog("[Plan] seq=%llu type=%s raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=waiting-for-lock-%s\n",
+                          pending.event.sequence,
+                          DirectorEventTypeName(pending.event.type),
+                          pending.event.rawTick,
+                          pending.event.playbackDelayMs,
+                          pending.event.visibleTick,
+                          pending.plannedStartTick,
+                          pending.event.availableLeadMs,
+                          ShotKindName(g_committedShotKind));
+                CD_Log("[CameraDirector] Event queued behind locked shot seq=%llu type=%s lockRemaining=%ds\n",
+                       pending.event.sequence,
+                       DirectorEventTypeName(pending.event.type),
+                       (int)((g_shotHoldUntil - now) / 1000));
+                pending.dueLogged = true;
+            }
+            return changed;
+        }
+
+        PendingDirectorEvent pending = g_eventQueue[bestIndex];
+
+        if (pending.event.type == DirectorEventType::Kill
+            && g_currentTargetHandle == pending.event.victimHandle
+            && !TickReached(now, pending.event.visibleTick)) {
+            if (ApplyVictimLookForEvent(pending.event, now)) {
+                TimingLog("[Plan] seq=%llu type=kill raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=%lu lead=%d reason=commit-victim-look-current-shot\n",
+                          pending.event.sequence,
+                          pending.event.rawTick,
+                          pending.event.playbackDelayMs,
+                          pending.event.visibleTick,
+                          pending.plannedStartTick,
+                          now,
+                          pending.event.availableLeadMs);
+                g_eventQueue.erase(g_eventQueue.begin() + bestIndex);
+                return true;
+            }
+
+            if (g_shotHoldUntil == 0 || TickReached(pending.event.visibleTick, g_shotHoldUntil)) {
+                g_shotHoldUntil = pending.event.visibleTick;
+            }
+            if (!pending.dueLogged) {
+                TimingLog("[Plan] seq=%llu type=kill raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=waiting-for-victim-look-start\n",
+                          pending.event.sequence,
+                          pending.event.rawTick,
+                          pending.event.playbackDelayMs,
+                          pending.event.visibleTick,
+                          pending.plannedStartTick,
+                          pending.event.availableLeadMs);
+                g_eventQueue[bestIndex].dueLogged = true;
+            }
+            return changed;
+        }
+
+        g_eventQueue.erase(g_eventQueue.begin() + bestIndex);
+
+        bool committed = CommitDirectorEvent(pending.event, now);
+        TimingLog("[Plan] seq=%llu type=%s raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=%lu lead=%d reason=%s\n",
+                  pending.event.sequence,
+                  DirectorEventTypeName(pending.event.type),
+                  pending.event.rawTick,
+                  pending.event.playbackDelayMs,
+                  pending.event.visibleTick,
+                  pending.plannedStartTick,
+                  now,
+                  pending.event.availableLeadMs,
+                  committed ? "commit" : "drop-target-invalid");
+
+        if (committed) {
+            CD_Log("[CameraDirector] Queued event promoted seq=%llu type=%s\n",
+                   pending.event.sequence,
+                   DirectorEventTypeName(pending.event.type));
+            return true;
+        }
+
+        changed = true;
+    }
+}
+
+// ============================================================================
+// Event Processing
+// ============================================================================
+
+void CameraDirector_OnKill(int killerHandle, int victimHandle, int weaponId, int leadMs) {
+    std::lock_guard<std::mutex> lock(g_directorMutex);
+
+    DWORD now = GetTickCount();
+    if (leadMs < 0) leadMs = 0;
+
+    DirectorEvent event = {};
+    event.type = DirectorEventType::Kill;
+    event.sequence = ++g_compatEventSequence;
+    event.rawTick = now;
+    event.visibleTick = now + (DWORD)leadMs;
+    event.playbackDelayMs = leadMs;
+    event.availableLeadMs = leadMs;
+    event.killerHandle = killerHandle;
+    event.victimHandle = victimHandle;
+    event.weaponId = weaponId;
+    QueueDirectorEvent(event, "compat-kill");
 }
 
 void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier, int leadMs) {
     std::lock_guard<std::mutex> lock(g_directorMutex);
 
-    int previousUSCarrier = g_flagCarrierUS;
-    int previousVCCarrier = g_flagCarrierVC;
-    bool wasDualFlag = (g_flagCarrierUS != 0 && g_flagCarrierVC != 0);
     DWORD now = GetTickCount();
+    if (leadMs < 0) leadMs = 0;
 
+    DirectorEvent event = {};
+    event.type = DirectorEventType::Flag;
+    event.sequence = ++g_compatEventSequence;
+    event.rawTick = now;
+    event.visibleTick = now + (DWORD)leadMs;
+    event.playbackDelayMs = leadMs;
+    event.availableLeadMs = leadMs;
+    event.usCarrier = usCarrier;
+    event.vcCarrier = vcCarrier;
+    QueueDirectorEvent(event, "compat-flag");
+    return;
+
+#if 0
     g_flagCarrierUS = usCarrier;
     g_flagCarrierVC = vcCarrier;
     g_lastEventTick = now;
@@ -1532,6 +2013,7 @@ void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier, int leadMs) {
             FeedNextFlagLost(lostFlag);
         }
     }
+#endif
 }
 
 // ============================================================================
@@ -1542,6 +2024,9 @@ void CameraDirector_Update() {
     std::lock_guard<std::mutex> lock(g_directorMutex);
 
     DWORD now = GetTickCount();
+    DrainSnifferEvents();
+    PromoteQueuedEvents(now);
+
     UpdatePlayerActivity(now);
     UpdateFlagCarrierMotion(now);
 
@@ -1551,6 +2036,7 @@ void CameraDirector_Update() {
         ClearFlagCampingGlimpse();
         if (g_state == CameraState::FlagWatch
             && g_currentTargetHandle == glimpseHandle
+            && !IsShotHoldActive(now)
             && IsCampingFlagCarrier(glimpseHandle)) {
             ClearCommittedShot(now, "flag camper glimpse complete");
             StartNextScheduledShot(now, "flag camper glimpse complete");
@@ -1558,10 +2044,7 @@ void CameraDirector_Update() {
     }
 
     int movingFlagTarget = PickMovingFlagCarrierTarget();
-    bool canInterruptForMovingFlag = !(g_state == CameraState::KillCam
-        && !IsKillCamInterruptible());
     if (movingFlagTarget != 0
-        && canInterruptForMovingFlag
         && (g_state != CameraState::FlagWatch
             || g_currentTargetHandle != movingFlagTarget)) {
         ClearFlagCampingGlimpse();
@@ -1620,7 +2103,7 @@ void CameraDirector_Update() {
             // Handle flag lost grace period
             if (g_flagLostGraceActive) {
                 float elapsed = (now - g_flagLostTimestamp) / 1000.0f;
-                if (elapsed > g_config.flagLostGracePeriod) {
+                if (elapsed > g_config.flagLostGracePeriod && !IsShotHoldActive(now)) {
                     g_flagLostGraceActive = false;
                     ClearCommittedShot(now, "flag grace expired");
                     StartNextScheduledShot(now, "flag grace expired");
@@ -1631,6 +2114,9 @@ void CameraDirector_Update() {
 
             bool dualFlagActive = (g_flagCarrierUS != 0 && g_flagCarrierVC != 0);
             if (dualFlagActive && !IsUsableActiveFlagCarrier(g_currentTargetHandle)) {
+                if (CurrentCommittedShotUsable(now)) {
+                    break;
+                }
                 int replacement = OtherFlagCarrierHandle(g_currentTargetHandle);
                 if (IsUsableActiveFlagCarrier(replacement)
                     && RequestFlagWatchShot(replacement, "dual flag current invalid", now)) {
@@ -1644,9 +2130,11 @@ void CameraDirector_Update() {
                     && g_flagCampingGlimpseUntil != 0
                     && !TickReached(now, g_flagCampingGlimpseUntil);
                 if (!inGlimpse) {
-                    ClearFlagCampingGlimpse();
-                    ClearCommittedShot(now, "flag carrier camping");
-                    StartNextScheduledShot(now, "flag carrier camping");
+                    if (!IsShotHoldActive(now)) {
+                        ClearFlagCampingGlimpse();
+                        ClearCommittedShot(now, "flag carrier camping");
+                        StartNextScheduledShot(now, "flag carrier camping");
+                    }
                 }
                 break;
             }
@@ -1671,6 +2159,9 @@ void CameraDirector_Update() {
 
         case CameraState::Drone: {
             if (!CD_IsUsablePlayerHandle(g_currentTargetHandle)) {
+                if (CurrentCommittedShotUsable(now)) {
+                    break;
+                }
                 ClearCommittedShot(now, "drone target lost");
                 StartNextScheduledShot(now, "drone target lost");
                 break;
@@ -1688,6 +2179,9 @@ void CameraDirector_Update() {
             bool currentTargetUsable = CD_IsUsablePlayerHandle(g_currentTargetHandle);
 
             if (noFlagPriority && !currentTargetUsable) {
+                if (CurrentCommittedShotUsable(now)) {
+                    break;
+                }
                 int picked = PickRandomActivePlayer(0);
                 if (picked != 0) {
                     RequestFollowPlayerShot(picked, CAM_WORLD, true, "target lost", now);
@@ -1695,19 +2189,6 @@ void CameraDirector_Update() {
                     ClearCommittedShot(now, "target lost and no active players");
                 }
                 break;
-            }
-
-            if (noFlagPriority && g_state == CameraState::FollowPlayer && currentTargetUsable) {
-                float heldSeconds = (now - g_currentHoldStart) / 1000.0f;
-                float currentActivity = ActivityScoreForHandle(g_currentTargetHandle);
-                if (heldSeconds >= 8.0f
-                    && currentActivity < 0.04f
-                    && HasActiveAlternative(g_currentTargetHandle)) {
-                    g_shotHoldUntil = 0;
-                    if (StartNextScheduledShot(now, "target idle")) {
-                        break;
-                    }
-                }
             }
 
             if (noFlagPriority && !IsShotHoldActive(now)) {
@@ -1721,6 +2202,18 @@ void CameraDirector_Update() {
             */
             break;
         }
+    }
+}
+
+void CameraDirector_OnSpectatorFrame(int* spectObj, float deltaTime) {
+    CameraDirector_Update();
+
+    if (spectObj) {
+        WorldCameraTracker_Update(spectObj, g_gameBase);
+    }
+
+    if (DroneCamera_IsActive()) {
+        DroneCamera_Update(deltaTime);
     }
 }
 
@@ -1787,6 +2280,9 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_shotHoldUntil = 0;
     g_committedShotKind = ShotKind::None;
     g_committedPreference = CAM_WORLD;
+    g_eventQueue.clear();
+    g_currentInvalidSince = 0;
+    g_compatEventSequence = 0;
     g_currentShotUseFpv = false;
     g_kcStyle = KillCamStyle::BulletTravel;
     g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
@@ -1808,4 +2304,6 @@ void InitCameraDirector(uintptr_t gameBase) {
            (int)(g_config.camShareWorld * 100),
            (int)(g_config.camShareDrone * 100),
            g_config.droneMinAreaClearance);
+    TimingLog("[Director] initialized preRollMs=%d\n",
+              (int)(g_config.directorPreRollSeconds * 1000.0f));
 }

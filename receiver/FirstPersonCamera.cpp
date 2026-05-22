@@ -336,11 +336,11 @@ static void AddKillCamSample(KillCamTargetView& view, const float* pos) {
     ++view.sampleCount;
 }
 
-static bool GetKillCamBasePosition(int handle, float out[3], bool* usedPredicted) {
-    if (usedPredicted) *usedPredicted = false;
+static bool GetKillCamBasePosition(int handle, float out[3], bool* usedLiveAhead) {
+    if (usedLiveAhead) *usedLiveAhead = false;
 
     if (RealtimeHook_GetPredictedPlayerPosition(handle, out, 7000)) {
-        if (usedPredicted) *usedPredicted = true;
+        if (usedLiveAhead) *usedLiveAhead = true;
         return true;
     }
 
@@ -354,12 +354,12 @@ static bool GetKillCamBasePosition(int handle, float out[3], bool* usedPredicted
 static bool GetKillCamTargetView(int handle, KillCamTargetView& out) {
     memset(&out, 0, sizeof(out));
 
-    bool usedPredicted = false;
-    if (!GetKillCamBasePosition(handle, out.base, &usedPredicted)) {
+    bool usedLiveAhead = false;
+    if (!GetKillCamBasePosition(handle, out.base, &usedLiveAhead)) {
         return false;
     }
 
-    if (usedPredicted) {
+    if (usedLiveAhead) {
         float neck[3], chest[3];
         Vec3AtHeight(out.base, 1.45f, neck);
         Vec3AtHeight(out.base, 1.05f, chest);

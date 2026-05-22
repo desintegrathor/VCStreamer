@@ -35,6 +35,7 @@ struct CameraConfig {
     float detachedKillCamMaxRadius          = 22.0f;
     float detachedKillCamMinClearance       = 1.0f;
     float killLookLockAdvance               = 3.0f;
+    float directorPreRollSeconds            = 5.0f;
 
     // Cooldowns (seconds)
     float killCooldown             = 6.0f;
@@ -138,12 +139,13 @@ enum class KillCamStyle {
 // Lifecycle
 void InitCameraDirector(uintptr_t gameBase);
 
-// Event input (called by DelayManager when delayed actions fire)
+// Compatibility event input. Normal event flow drains ServerStateSniffer.
 void CameraDirector_OnKill(int killerHandle, int victimHandle, int weaponId, int leadMs);
 void CameraDirector_OnFlagChanged(int usCarrier, int vcCarrier, int leadMs);
 
-// Per-frame update (called from main loop)
+// Per-frame update. Prefer CameraDirector_OnSpectatorFrame on the spectator hook.
 void CameraDirector_Update();
+void CameraDirector_OnSpectatorFrame(int* spectObj, float deltaTime);
 
 // State query (called by Hooked_FillCamera to know what to render)
 CameraState CameraDirector_GetState();

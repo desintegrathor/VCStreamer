@@ -27,6 +27,9 @@
     <ClInclude Include="nlohmann\json.hpp">
       <Filter>Hlavičkové soubory</Filter>
     </ClInclude>
+    <ClInclude Include="ServerStateSniffer.h">
+      <Filter>Hlavičkové soubory</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -42,6 +45,9 @@
       <Filter>Hlavičkové soubory</Filter>
     </ClCompile>
     <ClCompile Include="SpectatorController.cpp">
+      <Filter>Zdrojové soubory</Filter>
+    </ClCompile>
+    <ClCompile Include="ServerStateSniffer.cpp">
       <Filter>Zdrojové soubory</Filter>
     </ClCompile>
   </ItemGroup>
