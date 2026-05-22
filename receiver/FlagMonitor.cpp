@@ -11,6 +11,8 @@
 static FILE* g_flagLog = nullptr;
 
 static void FlagLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_flagLog) {
         g_flagLog = fopen("flag_debug.log", "w");
         if (!g_flagLog) return;

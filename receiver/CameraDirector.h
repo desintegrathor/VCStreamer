@@ -13,6 +13,7 @@ enum class DebugCameraMode {
     World,
     Drone,
     VictimLook3pv,
+    VantageKillcam,
     BulletKillcam
 };
 
@@ -47,6 +48,7 @@ struct CameraConfig {
     float detachedKillCamMaxRadius          = 22.0f;
     float detachedKillCamMinClearance       = 1.0f;
     float killLookLockAdvance               = 3.0f;
+    float killLookLockPostKillDuration      = 1.5f;
     float directorPreRollSeconds            = 5.0f;
 
     // Cooldowns (seconds)

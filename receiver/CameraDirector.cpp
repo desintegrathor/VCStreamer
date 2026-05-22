@@ -140,6 +140,8 @@ constexpr DWORD TARGET_INVALID_GRACE_MS = 1000;
 constexpr size_t MAX_DIRECTOR_EVENT_QUEUE = 128;
 
 static void CD_Log(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     FILE* file = fopen("receiver_debug.log", "a");
     if (!file) return;
 
@@ -156,6 +158,8 @@ static const char* DirectorEventTypeName(DirectorEventType type) {
 }
 
 static void TimingLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     FILE* file = fopen("camera_timing_debug.log", "a");
     if (!file) return;
 
@@ -888,11 +892,10 @@ static bool MaybeStartVictimKillLook(int killerHandle,
                                      const float* killerAimPoint) {
     bool victimIsFlagCarrier = (victimHandle != 0)
         && (victimHandle == g_flagCarrierUS || victimHandle == g_flagCarrierVC);
-    bool watchingVictim = (g_state == CameraState::FlagWatch
-        || g_state == CameraState::FollowPlayer)
+    bool watchingVictim = g_state == CameraState::FlagWatch
         && g_currentTargetHandle == victimHandle;
 
-    if (!watchingVictim || killerHandle == 0) {
+    if (!watchingVictim || !victimIsFlagCarrier || killerHandle == 0) {
         return false;
     }
 
@@ -978,6 +981,7 @@ static const char* DebugCameraModeName(DebugCameraMode mode) {
         case DebugCameraMode::World: return "world";
         case DebugCameraMode::Drone: return "drone";
         case DebugCameraMode::VictimLook3pv: return "victim_look_3pv";
+        case DebugCameraMode::VantageKillcam: return "vantage_killcam";
         case DebugCameraMode::BulletKillcam: return "bullet_killcam";
         case DebugCameraMode::Auto:
         default: return "auto";
@@ -1008,6 +1012,7 @@ static bool DebugModeForcesPlayerCamera() {
     return mode == DebugCameraMode::Player3pv
         || mode == DebugCameraMode::Fpv
         || mode == DebugCameraMode::VictimLook3pv
+        || mode == DebugCameraMode::VantageKillcam
         || mode == DebugCameraMode::BulletKillcam;
 }
 
@@ -1035,6 +1040,7 @@ static bool ShouldUseFpvForFollowShot() {
         || mode == DebugCameraMode::World
         || mode == DebugCameraMode::Drone
         || mode == DebugCameraMode::VictimLook3pv
+        || mode == DebugCameraMode::VantageKillcam
         || mode == DebugCameraMode::BulletKillcam) {
         return false;
     }
@@ -1780,7 +1786,7 @@ static bool ApplyVictimLookForEvent(const DirectorEvent& event, DWORD now) {
         return false;
     }
 
-    if (g_state == CameraState::FollowPlayer
+    if ((g_state == CameraState::FlagWatch || g_state == CameraState::FollowPlayer)
         && (g_shotHoldUntil == 0 || TickReached(event.visibleTick, g_shotHoldUntil))) {
         g_shotHoldUntil = event.visibleTick;
     }
@@ -1813,6 +1819,15 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
                                                KillCamStyle::DetachedVantage,
                                                true,
                                                "debug victim-look 3pv",
+                                               now,
+                                               hasFrozenVictimAimPoint ? frozenVictimAimPoint : nullptr);
+                break;
+            case DebugCameraMode::VantageKillcam:
+                committed = RequestKillCamShot(event.killerHandle,
+                                               event.victimHandle,
+                                               KillCamStyle::DetachedVantage,
+                                               true,
+                                               "debug vantage killcam",
                                                now,
                                                hasFrozenVictimAimPoint ? frozenVictimAimPoint : nullptr);
                 break;
@@ -2112,7 +2127,9 @@ static bool PromoteQueuedEvents(DWORD now) {
 
         if (!IsDebugCameraModeActive()
             && pending.event.type == DirectorEventType::Kill
+            && g_state == CameraState::FlagWatch
             && g_currentTargetHandle == pending.event.victimHandle
+            && IsCurrentFlagCarrierHandle(pending.event.victimHandle)
             && !TickReached(now, pending.event.visibleTick)) {
             if (ApplyVictimLookForEvent(pending.event, now)) {
                 TimingLog("[Plan] seq=%llu type=kill raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=%lu lead=%d reason=commit-victim-look-current-shot\n",
@@ -2324,8 +2341,7 @@ void CameraDirector_Update() {
     }
 
     if (g_flagKillLookKillTick != 0) {
-        bool watchingVictim = (g_state == CameraState::FlagWatch
-            || g_state == CameraState::FollowPlayer)
+        bool watchingVictim = g_state == CameraState::FlagWatch
             && g_currentTargetHandle == g_flagKillLookVictimHandle;
         if (!watchingVictim) {
             ClearFlagKillLook();
@@ -2526,8 +2542,7 @@ bool CameraDirector_GetFlagCarrierKillLook(int* killerHandle,
         return false;
     }
 
-    bool watchingVictim = (g_state == CameraState::FlagWatch
-        || g_state == CameraState::FollowPlayer)
+    bool watchingVictim = g_state == CameraState::FlagWatch
         && g_currentTargetHandle == g_flagKillLookVictimHandle;
     if (!watchingVictim || !TickReached(now, g_flagKillLookStartTick)) {
         return false;
@@ -2548,8 +2563,7 @@ bool CameraDirector_GetFlagCarrierKillLookAimPoint(float out[3]) {
     if (!out || !g_flagKillLookKillerAimPointValid) return false;
 
     DWORD now = GetTickCount();
-    bool watchingVictim = (g_state == CameraState::FlagWatch
-        || g_state == CameraState::FollowPlayer)
+    bool watchingVictim = g_state == CameraState::FlagWatch
         && g_currentTargetHandle == g_flagKillLookVictimHandle;
     if (g_flagKillLookStartTick == 0
         || !watchingVictim
@@ -2598,13 +2612,14 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_droneCamTime = 0.0f;
 
     CD_Log("[CameraDirector] Initialized\n");
-    CD_Log("[CameraDirector] KillCam split: victim-lock 3PV < %.2fm (%d%%), vertical detach %d%%, bullet >= %.2fm (%d%%), look-lock %.2fs before kill\n",
+    CD_Log("[CameraDirector] KillCam split: victim-lock 3PV < %.2fm (%d%%), vertical detach %d%%, bullet >= %.2fm (%d%%), look-lock %.2fs before kill %.2fs after kill\n",
            g_config.killCamLongRangeDistance,
            (int)(g_config.detachedKillCamChance * 100),
            (int)(g_config.detachedKillCamVantageChance * 100),
            g_config.killCamLongRangeDistance,
            (int)(g_config.bulletKillCamChance * 100),
-           g_config.killLookLockAdvance);
+           g_config.killLookLockAdvance,
+           g_config.killLookLockPostKillDuration);
     CD_Log("[CameraDirector] Budget: P=%d%% W=%d%% D=%d%% droneMinClearance=%.2f\n",
            (int)(g_config.camSharePlayer * 100),
            (int)(g_config.camShareWorld * 100),

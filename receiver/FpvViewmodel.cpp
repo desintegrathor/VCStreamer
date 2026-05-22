@@ -9,6 +9,8 @@
 
 static FILE* g_fpvmLog = nullptr;
 static void FpvmLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_fpvmLog) {
         g_fpvmLog = fopen("autospectator_debug.log", "a");
         if (!g_fpvmLog) return;

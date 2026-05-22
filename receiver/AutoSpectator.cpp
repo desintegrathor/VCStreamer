@@ -27,11 +27,16 @@ static bool SafeReadDword(uintptr_t addr, uintptr_t* outVal) {
 }
 
 void LogDebug(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
+    if (!g_logFile) {
+        g_logFile = fopen("autospectator_debug.log", "a");
+        if (!g_logFile) return;
+    }
+
     va_list args;
     va_start(args, fmt);
-    if (g_logFile) {
-        DiagnosticsLog_Write(g_logFile, fmt, args);
-    }
+    DiagnosticsLog_Write(g_logFile, fmt, args);
     va_end(args);
 }
 
@@ -441,9 +446,6 @@ static void AutoSpectatorLoop() {
 
 void InitAutoSpectator(uintptr_t baseGame) {
     g_baseGame = baseGame;
-
-    // Open debug log file next to the game exe
-    g_logFile = fopen("autospectator_debug.log", "w");
 
     LogDebug("[AutoSpectator] Initializing auto-spectator...\n");
     LogDebug("[AutoSpectator] game.dll base: 0x%08X\n", baseGame);

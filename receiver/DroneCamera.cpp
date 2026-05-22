@@ -17,6 +17,8 @@ static uintptr_t g_gameBase = 0;
 static bool g_active = false;
 
 static void DroneLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     FILE* file = fopen("receiver_debug.log", "a");
     if (!file) return;
 

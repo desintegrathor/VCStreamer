@@ -15,6 +15,8 @@ constexpr BYTE MSG_STATE_VAR = 0x5A;
 constexpr BYTE MSG_PLAYER_STATUS = 0x17;
 
 static void HookLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_hookLog) {
         g_hookLog = fopen("killdetect_debug.log", "w");
         if (!g_hookLog) return;

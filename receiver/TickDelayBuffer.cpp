@@ -12,6 +12,8 @@
 static FILE* g_tickLog = nullptr;
 
 static void TickLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_tickLog) {
         g_tickLog = fopen("tickdelay_debug.log", "w");
         if (!g_tickLog) return;

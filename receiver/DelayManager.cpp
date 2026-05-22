@@ -147,8 +147,9 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "detached_killcam_max_radius=22.0\n";
                 outFile << "detached_killcam_min_clearance=1.0\n";
                 outFile << "kill_look_lock_advance=3.0\n";
+                outFile << "kill_look_lock_post_kill_duration=1.5\n";
                 outFile << "director_pre_roll=5.0\n";
-                outFile << "; Debug override: auto, player_3pv, fpv, world, drone, victim_look_3pv, bullet_killcam\n";
+                outFile << "; Debug override: auto, player_3pv, fpv, world, drone, victim_look_3pv, vantage_killcam, bullet_killcam\n";
                 outFile << "debug_camera_mode=auto\n";
                 outFile << "debug_only_victim_look_3pv=0\n";
                 outFile.close();
@@ -297,6 +298,10 @@ static DebugCameraMode ParseDebugCameraMode(std::string value) {
         || value == "looklock" || value == "killcam_victim") {
         return DebugCameraMode::VictimLook3pv;
     }
+    if (value == "vantage" || value == "vantage_killcam" || value == "detached_vantage"
+        || value == "vertical_vantage" || value == "killcam_vantage") {
+        return DebugCameraMode::VantageKillcam;
+    }
     if (value == "bullet" || value == "bullet_killcam" || value == "bullet_travel") {
         return DebugCameraMode::BulletKillcam;
     }
@@ -338,6 +343,7 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.detachedKillCamMaxRadius          = ReadIniFloat(iniPath, "detached_killcam_max_radius", 22.0f);
     cfg.detachedKillCamMinClearance       = ReadIniFloat(iniPath, "detached_killcam_min_clearance", 1.0f);
     cfg.killLookLockAdvance               = ReadIniFloat(iniPath, "kill_look_lock_advance", 3.0f);
+    cfg.killLookLockPostKillDuration      = ReadIniFloat(iniPath, "kill_look_lock_post_kill_duration", 1.5f);
     cfg.directorPreRollSeconds            = ReadIniFloat(iniPath, "director_pre_roll", 5.0f);
 
     cfg.killCooldown              = ReadIniFloat(iniPath, "kill_cooldown", 6.0f);
@@ -401,5 +407,6 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
         cfg.debugCameraMode = DebugCameraMode::VictimLook3pv;
     }
 
+    DiagnosticsLog_SetEnabled(cfg.debugMode || cfg.debugCameraMode != DebugCameraMode::Auto);
     DiagnosticsLog_Append("receiver_debug.log", "[CameraDirector] Config loaded from %s\n", iniPath.c_str());
 }

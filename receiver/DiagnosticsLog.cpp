@@ -1,13 +1,24 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "DiagnosticsLog.h"
 #include <Windows.h>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <strsafe.h>
 
+static std::atomic<bool> g_diagnosticsEnabled{ false };
 static std::mutex g_appendLogMutex;
 
+void DiagnosticsLog_SetEnabled(bool enabled) {
+    g_diagnosticsEnabled.store(enabled);
+}
+
+bool DiagnosticsLog_IsEnabled() {
+    return g_diagnosticsEnabled.load();
+}
+
 void DiagnosticsLog_Write(FILE* file, const char* fmt, va_list args) {
+    if (!DiagnosticsLog_IsEnabled()) return;
     if (!file || !fmt) return;
 
     char line[4096];
@@ -25,6 +36,7 @@ void DiagnosticsLog_Write(FILE* file, const char* fmt, va_list args) {
 }
 
 void DiagnosticsLog_Append(const char* fileName, const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
     if (!fileName || !fmt) return;
 
     std::lock_guard<std::mutex> lock(g_appendLogMutex);

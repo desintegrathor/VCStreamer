@@ -79,6 +79,8 @@ static bool g_dynCamPosResolved = false;
 static FILE* g_wcLog = nullptr;
 
 static void LogWC(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_wcLog) {
         g_wcLog = fopen("worldcam_debug.log", "w");
     }

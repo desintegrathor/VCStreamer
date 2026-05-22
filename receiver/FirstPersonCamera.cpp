@@ -112,6 +112,7 @@ static bool g_killCamVantageValid = false;
 static bool g_killCamVantageAttempted = false;
 static bool g_killCamVantageRollDecided = false;
 static bool g_killCamVantageRollPassed = false;
+static bool g_killCamFocusReleased = false;
 static float g_killCamMoveStartPos[3] = {};
 static bool g_killCamMoveStartValid = false;
 static KillCamStyle g_killCamStyle = KillCamStyle::BulletTravel;
@@ -127,6 +128,8 @@ static int g_fpvLogCounter = 0;
 static FILE* g_fpvLog = nullptr;
 
 static void FpvLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_fpvLog) {
         g_fpvLog = fopen("autospectator_debug.log", "a");
         if (!g_fpvLog) return;
@@ -140,6 +143,8 @@ static void FpvLog(const char* fmt, ...) {
 static FILE* g_tpvDebugLog = nullptr;
 
 static void TpvDebugLog(const char* fmt, ...) {
+    if (!DiagnosticsLog_IsEnabled()) return;
+
     if (!g_tpvDebugLog) {
         g_tpvDebugLog = fopen("camera_3pv_debug.log", "a");
         if (!g_tpvDebugLog) return;
@@ -182,6 +187,7 @@ static const char* DebugCameraModeName(DebugCameraMode mode) {
         case DebugCameraMode::World: return "world";
         case DebugCameraMode::Drone: return "drone";
         case DebugCameraMode::VictimLook3pv: return "victim_look_3pv";
+        case DebugCameraMode::VantageKillcam: return "vantage_killcam";
         case DebugCameraMode::BulletKillcam: return "bullet_killcam";
         case DebugCameraMode::Auto:
         default: return "auto";
@@ -977,12 +983,21 @@ static bool SolveVerticalKillCamVantage(int killerHandle,
                                         float outPos[3],
                                         float outLookAt[3]) {
     if (!currentCam || !OctCollision_IsLoaded()) {
+        FpvLog("[Camera] KillCam vertical lift unavailable: currentCam=%s oct=%s\n",
+               currentCam ? "yes" : "no",
+               OctCollision_IsLoaded() ? "yes" : "no");
         return false;
     }
 
     KillCamTargetView killer, victim;
-    if (!GetKillCamTargetView(killerHandle, killer)
-        || !GetKillCamTargetView(victimHandle, victim)) {
+    bool haveKiller = GetKillCamTargetView(killerHandle, killer);
+    bool haveVictim = GetKillCamTargetView(victimHandle, victim);
+    if (!haveKiller || !haveVictim) {
+        FpvLog("[Camera] KillCam vertical lift unavailable: killerView=%s victimView=%s killer=%d victim=%d\n",
+               haveKiller ? "yes" : "no",
+               haveVictim ? "yes" : "no",
+               killerHandle,
+               victimHandle);
         return false;
     }
 
@@ -1006,6 +1021,12 @@ static bool SolveVerticalKillCamVantage(int killerHandle,
 
     float bestScore = -1.0e30f;
     float bestPos[3] = {};
+    int attempts = 0;
+    int accepted = 0;
+
+    FpvLog("[Camera] KillCam vertical lift solve: current=(%.2f, %.2f, %.2f) minLift=%.2f maxLift=%.2f minScore=%.2f\n",
+           currentCam[0], currentCam[1], currentCam[2],
+           minLift, maxLift, cfg.detachedKillCamMinVantageScore);
 
     for (int i = 0; i < 5; ++i) {
         bool duplicate = false;
@@ -1027,28 +1048,40 @@ static bool SolveVerticalKillCamVantage(int killerHandle,
             currentCam[2] + lift
         };
 
-        TryScoreVerticalKillCamCandidate(candidate, killer, victim,
-                                         currentCam, lift, cfg,
-                                         &bestScore, bestPos);
+        ++attempts;
+        if (TryScoreVerticalKillCamCandidate(candidate, killer, victim,
+                                             currentCam, lift, cfg,
+                                             &bestScore, bestPos)) {
+            ++accepted;
+        }
     }
 
     float minScore = cfg.detachedKillCamMinVantageScore;
     if (minScore < 0.0f) minScore = 0.0f;
     if (bestScore < minScore) {
-        FpvLog("[Camera] KillCam vertical lift rejected: score=%.2f min=%.2f\n",
-               bestScore, minScore);
+        FpvLog("[Camera] KillCam vertical lift rejected: score=%.2f min=%.2f attempts=%d accepted=%d\n",
+               bestScore, minScore, attempts, accepted);
         return false;
     }
 
     CopyVec3(bestPos, outPos);
-    FpvLog("[Camera] KillCam vertical lift pos=(%.2f, %.2f, %.2f) lift=%.2f score=%.2f\n",
-           outPos[0], outPos[1], outPos[2], outPos[2] - currentCam[2], bestScore);
+    FpvLog("[Camera] KillCam vertical lift pos=(%.2f, %.2f, %.2f) lift=%.2f score=%.2f attempts=%d accepted=%d\n",
+           outPos[0], outPos[1], outPos[2],
+           outPos[2] - currentCam[2], bestScore, attempts, accepted);
     return true;
 }
 
 static bool ShouldAttemptDetachedKillCamVantage(const CameraConfig& cfg) {
     if (cfg.debugCameraMode == DebugCameraMode::VictimLook3pv) {
         return false;
+    }
+    if (cfg.debugCameraMode == DebugCameraMode::VantageKillcam) {
+        if (!g_killCamVantageRollDecided) {
+            g_killCamVantageRollDecided = true;
+            g_killCamVantageRollPassed = true;
+            FpvLog("[Camera] KillCam vertical lift forced by debug mode\n");
+        }
+        return true;
     }
     if (g_killCamVantageRollDecided) {
         return g_killCamVantageRollPassed;
@@ -1105,12 +1138,36 @@ static bool EnsureKillCamVantage(int killerHandle,
     return g_killCamVantageValid;
 }
 
-static bool IsCloseKillCamLookLockActive(const CameraConfig& cfg) {
+static float GetCloseKillCamKillElapsed(const CameraConfig& cfg) {
     float killTime = cfg.detachedKillCamFollowDuration
                    + cfg.detachedKillCamRepositionDuration;
     if (killTime < 0.1f) killTime = 0.1f;
-    float releaseTime = killTime + cfg.detachedKillCamHoldDuration;
-    if (releaseTime < killTime + 0.1f) releaseTime = killTime + 0.1f;
+    return killTime;
+}
+
+static float GetCloseKillCamFocusReleaseElapsed(const CameraConfig& cfg) {
+    float postKillFocus = cfg.killLookLockPostKillDuration;
+    if (postKillFocus < 0.0f) postKillFocus = 0.0f;
+    return GetCloseKillCamKillElapsed(cfg) + postKillFocus;
+}
+
+static bool IsCloseKillCamFocusActive(const CameraConfig& cfg) {
+    return CameraDirector_GetKillCamElapsed() < GetCloseKillCamFocusReleaseElapsed(cfg);
+}
+
+static bool IsCloseKillCamVictimTarget() {
+    int currentTarget = CameraDirector_GetTargetHandle();
+    int victim = CameraDirector_GetKillCamVictimHandle();
+    return currentTarget != 0 && currentTarget == victim;
+}
+
+static bool IsCloseKillCamLookLockActive(const CameraConfig& cfg) {
+    if (IsCloseKillCamVictimTarget()) {
+        return true;
+    }
+
+    float killTime = GetCloseKillCamKillElapsed(cfg);
+    float releaseTime = GetCloseKillCamFocusReleaseElapsed(cfg);
 
     float advance = cfg.killLookLockAdvance;
     if (advance < 0.1f) advance = 0.1f;
@@ -1129,8 +1186,7 @@ static bool Get3pvLookLockTarget(CameraState dirState,
         return false;
     }
 
-    if (dirState == CameraState::FlagWatch
-        || dirState == CameraState::FollowPlayer) {
+    if (dirState == CameraState::FlagWatch) {
         int killer = 0;
         if (CameraDirector_GetFlagCarrierKillLook(&killer, nullptr, nullptr, nullptr)) {
             if (outTarget) *outTarget = killer;
@@ -1146,10 +1202,19 @@ static bool Get3pvLookLockTarget(CameraState dirState,
     if (dirState == CameraState::KillCam
         && kcStyle == KillCamStyle::DetachedVantage
         && IsCloseKillCamLookLockActive(cfg)) {
+        int currentTarget = CameraDirector_GetTargetHandle();
         int victim = CameraDirector_GetKillCamVictimHandle();
-        if (outTarget) *outTarget = victim;
-        if (outReason) *outReason = "killcam";
-        return victim != 0;
+        int killer = CameraDirector_GetKillCamKillerHandle();
+        int target = (currentTarget != 0 && currentTarget == victim)
+            ? killer
+            : victim;
+        if (outTarget) *outTarget = target;
+        if (outReason) {
+            *outReason = (currentTarget != 0 && currentTarget == victim)
+                ? "killcam-victim"
+                : "killcam";
+        }
+        return target != 0;
     }
 
     return false;
@@ -1394,13 +1459,15 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         g_killCamVantageAttempted = false;
         g_killCamVantageRollDecided = false;
         g_killCamVantageRollPassed = false;
+        g_killCamFocusReleased = false;
         g_killCamMoveStartValid = false;
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
             g_yawInitialized = false;
-            FpvLog("[Camera] Close KillCam: victim look-lock with optional vertical lift killer=%d victim=%d\n",
+            FpvLog("[Camera] Close KillCam: victim look-lock with optional vertical lift killer=%d victim=%d postFocus=%.2fs\n",
                    killerHandle,
-                   victimHandle);
+                   victimHandle,
+                   cfg.killLookLockPostKillDuration);
         }
     }
 
@@ -1801,39 +1868,48 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         float* liveCamPos = (float*)cameraProp;
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
-            bool canLiftNow = (kcPhase == KillCamPhase::Transition
-                            || kcPhase == KillCamPhase::Attached);
-            bool hasSolvedVantage = canLiftNow
-                && EnsureKillCamVantage(killerHandle, victimHandle,
-                                        liveCamPos, cfg, true);
-
-            if (hasSolvedVantage) {
-                float waitEnd = cfg.detachedKillCamFollowDuration;
-                float transEnd = waitEnd + cfg.detachedKillCamRepositionDuration;
-
-                if (kcPhase == KillCamPhase::Transition) {
-                    if (!g_killCamMoveStartValid) {
-                        CopyVec3(liveCamPos, g_killCamMoveStartPos);
-                        g_killCamMoveStartValid = true;
-                        FpvLog("[Camera] KillCam lifting vertically\n");
-                    }
-
-                    float denom = transEnd - waitEnd;
-                    float t = denom > 0.001f ? SmoothStep((elapsed - waitEnd) / denom) : 1.0f;
-                    liveCamPos[0] = g_killCamMoveStartPos[0] + (g_killCamVantagePos[0] - g_killCamMoveStartPos[0]) * t;
-                    liveCamPos[1] = g_killCamMoveStartPos[1] + (g_killCamVantagePos[1] - g_killCamMoveStartPos[1]) * t;
-                    liveCamPos[2] = g_killCamMoveStartPos[2] + (g_killCamVantagePos[2] - g_killCamMoveStartPos[2]) * t;
-                    AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
+            bool focusActive = IsCloseKillCamVictimTarget()
+                || IsCloseKillCamFocusActive(cfg);
+            if (!focusActive) {
+                if (!g_killCamFocusReleased) {
+                    g_killCamFocusReleased = true;
+                    FpvLog("[Camera] KillCam victim focus released; returning to forward 3PV\n");
                 }
+            } else {
+                bool canLiftNow = (kcPhase == KillCamPhase::Transition
+                                || kcPhase == KillCamPhase::Attached);
+                bool hasSolvedVantage = canLiftNow
+                    && EnsureKillCamVantage(killerHandle, victimHandle,
+                                            liveCamPos, cfg, true);
 
-                if (kcPhase == KillCamPhase::Attached) {
-                    if (!g_killCamPhase2Entered) {
-                        g_killCamPhase2Entered = true;
-                        FpvLog("[Camera] KillCam fixed vertical hold\n");
+                if (hasSolvedVantage) {
+                    float waitEnd = cfg.detachedKillCamFollowDuration;
+                    float transEnd = waitEnd + cfg.detachedKillCamRepositionDuration;
+
+                    if (kcPhase == KillCamPhase::Transition) {
+                        if (!g_killCamMoveStartValid) {
+                            CopyVec3(liveCamPos, g_killCamMoveStartPos);
+                            g_killCamMoveStartValid = true;
+                            FpvLog("[Camera] KillCam lifting vertically\n");
+                        }
+
+                        float denom = transEnd - waitEnd;
+                        float t = denom > 0.001f ? SmoothStep((elapsed - waitEnd) / denom) : 1.0f;
+                        liveCamPos[0] = g_killCamMoveStartPos[0] + (g_killCamVantagePos[0] - g_killCamMoveStartPos[0]) * t;
+                        liveCamPos[1] = g_killCamMoveStartPos[1] + (g_killCamVantagePos[1] - g_killCamMoveStartPos[1]) * t;
+                        liveCamPos[2] = g_killCamMoveStartPos[2] + (g_killCamVantagePos[2] - g_killCamMoveStartPos[2]) * t;
+                        AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
                     }
 
-                    CopyVec3(g_killCamVantagePos, liveCamPos);
-                    AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
+                    if (kcPhase == KillCamPhase::Attached) {
+                        if (!g_killCamPhase2Entered) {
+                            g_killCamPhase2Entered = true;
+                            FpvLog("[Camera] KillCam fixed vertical hold\n");
+                        }
+
+                        CopyVec3(g_killCamVantagePos, liveCamPos);
+                        AimCameraAt(cameraProp, liveCamPos, g_killCamVantageLookAt);
+                    }
                 }
             }
         } else {
