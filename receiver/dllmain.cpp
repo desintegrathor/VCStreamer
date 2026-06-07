@@ -17,6 +17,7 @@
 #include "LowPlayerOverlay.h"
 #include "YoutubeChatBridge.h"
 #include "SpectatorChatRelay.h"
+#include "ServerTelemetry.h"
 #include "dsound_proxy.h"
 #include "minhook/MinHook.h"
 
@@ -36,6 +37,7 @@ void MainLoop() {
     while (true) {
         // Read scoreboard from game memory and update SpectatorController
         auto players = GameMemoryReader::ReadPlayerList();
+        ServerTelemetry_Poll();
         LowPlayerOverlay_SetActivePlayerCount((int)players.size());
         if (!players.empty()) {
             UpdateScoreboard(players);
@@ -132,6 +134,7 @@ DWORD WINAPI MainThread(LPVOID) {
 
     InitCameraDirector(base);
     InitRealtimeHook(base);
+    InitServerTelemetry(base);
     InitTickDelayBuffer(base);
     InitFirstPersonCamera(base);
     InitFpvViewmodel(base);

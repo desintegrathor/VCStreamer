@@ -27,6 +27,9 @@ struct DirectorEvent {
     int killerHandle = 0;
     int victimHandle = 0;
     int weaponId = 0;
+    bool hasServerTelemetry = false;
+    char serverWeaponName[32] = {};
+    unsigned int serverTelemetryFlags = 0;
 
     int usCarrier = 0;
     int vcCarrier = 0;

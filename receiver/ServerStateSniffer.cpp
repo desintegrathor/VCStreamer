@@ -2,6 +2,7 @@
 #include "ServerStateSniffer.h"
 #include "DelayManager.h"
 #include "DiagnosticsLog.h"
+#include "ServerTelemetry.h"
 #include "TickDelayBuffer.h"
 #include <cstring>
 #include <mutex>
@@ -364,6 +365,15 @@ static void ProcessKill(BYTE* data, DWORD size, DWORD rawTick) {
     event.killerHandle = killerHandle;
     event.victimHandle = victimHandle;
     event.weaponId = (int)data[1];
+    ServerTelemetryKillEvent telemetry = {};
+    if (ServerTelemetry_TryFindKill(killerHandle, victimHandle, rawTick, &telemetry)) {
+        event.hasServerTelemetry = true;
+        event.serverTelemetryFlags = telemetry.flags;
+        if (telemetry.weaponId > 0) {
+            event.weaponId = telemetry.weaponId;
+        }
+        strncpy_s(event.serverWeaponName, telemetry.weaponName, _TRUNCATE);
+    }
     PushEventLocked(event);
 }
 
