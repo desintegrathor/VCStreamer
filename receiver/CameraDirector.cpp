@@ -37,6 +37,7 @@ static constexpr float NORMAL_SHOT_MIN_HOLD_SEC = 12.0f;
 static constexpr float NORMAL_SHOT_MAX_HOLD_SEC = 18.0f;
 static constexpr float FLAG_ALTERNATE_MIN_SEC = 8.0f;
 static constexpr float FLAG_ALTERNATE_MAX_SEC = 12.0f;
+static constexpr DWORD FLAG_SCORE_POST_HOLD_MS = 3000;
 
 // KillCam state
 static KillCamPhase g_killCamPhase = KillCamPhase::Wait;
@@ -53,6 +54,8 @@ static int g_flagCarrierVC = 0;
 static DWORD g_flagAlternateTimer = 0;
 static float g_flagAlternateDelay = 10.0f;
 static DWORD g_lastFlagWatchTargetSwitch = 0;
+static int g_flagScoreHoldTarget = 0;
+static DWORD g_flagScoreHoldUntil = 0;
 static int g_flagKillLookKillerHandle = 0;
 static int g_flagKillLookVictimHandle = 0;
 static DWORD g_flagKillLookStartTick = 0;
@@ -862,6 +865,30 @@ static bool TickReached(DWORD now, DWORD tick) {
     return (LONG)(now - tick) >= 0;
 }
 
+static bool IsFlagScoreHoldActive(DWORD now) {
+    return g_flagScoreHoldTarget != 0
+        && g_flagScoreHoldUntil != 0
+        && !TickReached(now, g_flagScoreHoldUntil);
+}
+
+static void ExtendShotHoldTo(DWORD holdUntil) {
+    if (holdUntil == 0) return;
+    if (g_shotHoldUntil == 0 || TickReached(holdUntil, g_shotHoldUntil)) {
+        g_shotHoldUntil = holdUntil;
+    }
+}
+
+static void ClearFlagScoreHold(DWORD now, const char* reason) {
+    if (g_flagScoreHoldTarget != 0) {
+        CD_Log("[CameraDirector] Flag score hold cleared target=%d reason=%s now=%lu\n",
+               g_flagScoreHoldTarget,
+               reason ? reason : "none",
+               now);
+    }
+    g_flagScoreHoldTarget = 0;
+    g_flagScoreHoldUntil = 0;
+}
+
 static float GetKillLookLeadDuration() {
     return g_config.detachedKillCamFollowDuration
          + g_config.detachedKillCamRepositionDuration;
@@ -997,14 +1024,15 @@ static bool IsDebugCameraModeActive() {
 }
 
 static bool ShouldDropDirectorEventForDebug(const DirectorEvent& event) {
-    return IsDebugCameraModeActive()
-        && event.type == DirectorEventType::Flag;
+    (void)event;
+    return false;
 }
 
 static bool DebugKillEventCanPreemptLock(const PendingDirectorEvent& pending) {
     return IsDebugCameraModeActive()
         && pending.event.type == DirectorEventType::Kill
-        && g_committedShotKind != ShotKind::KillCam;
+        && g_committedShotKind != ShotKind::KillCam
+        && g_committedShotKind != ShotKind::FlagWatch;
 }
 
 static bool DebugModeForcesPlayerCamera() {
@@ -1280,6 +1308,10 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
             g_currentTargetHandle = request.targetHandle;
             g_currentHoldStart = now;
             g_shotHoldUntil = HoldUntil(now, request.holdSeconds);
+            if (IsFlagScoreHoldActive(now)
+                && request.targetHandle == g_flagScoreHoldTarget) {
+                ExtendShotHoldTo(g_flagScoreHoldUntil);
+            }
             g_currentShotUseFpv = ShouldUseFpvForFollowShot();
             g_kcStyle = KillCamStyle::BulletTravel;
             g_kcKillerHandle = 0;
@@ -1357,6 +1389,27 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
 }
 
 static bool RequestShot(const ShotRequest& request, DWORD now) {
+    if (request.kind != ShotKind::FlagWatch
+        && g_state == CameraState::FlagWatch
+        && IsCurrentFlagCarrierHandle(g_currentTargetHandle)) {
+        CD_Log("[CameraDirector] Shot request ignored: active flag run target=%d request=%s target=%d\n",
+               g_currentTargetHandle,
+               ShotKindName(request.kind),
+               request.targetHandle);
+        return false;
+    }
+
+    if (IsFlagScoreHoldActive(now)
+        && (request.kind != ShotKind::FlagWatch
+            || request.targetHandle != g_flagScoreHoldTarget)) {
+        CD_Log("[CameraDirector] Shot request ignored: flag score hold target=%d remaining=%ds request=%s target=%d\n",
+               g_flagScoreHoldTarget,
+               (int)((g_flagScoreHoldUntil - now) / 1000),
+               ShotKindName(request.kind),
+               request.targetHandle);
+        return false;
+    }
+
     if (!request.force) {
         if (IsCommittedShotLocked(now)) {
             CD_Log("[CameraDirector] Shot request ignored: locked %s remaining=%ds request=%s\n",
@@ -1416,7 +1469,8 @@ static bool RequestKillCamShot(int killerHandle,
 
 static bool RequestFlagWatchShot(int carrierHandle,
                                  const char* reason,
-                                 DWORD now) {
+                                 DWORD now,
+                                 bool force = false) {
     if (carrierHandle != 0
         && g_state == CameraState::FlagWatch
         && g_currentTargetHandle == carrierHandle
@@ -1431,10 +1485,33 @@ static bool RequestFlagWatchShot(int carrierHandle,
         KillCamStyle::BulletTravel,
         CAM_WORLD,
         NormalFollowHoldSeconds(CAM_WORLD),
-        false,
+        force,
         reason
     };
     return RequestShot(request, now);
+}
+
+static bool EnsureFlagScoreHoldCamera(DWORD now) {
+    if (g_flagScoreHoldTarget == 0) return false;
+
+    if (!IsFlagScoreHoldActive(now)) {
+        ClearFlagScoreHold(now, "expired");
+        return false;
+    }
+
+    ClearFlagCampingGlimpse();
+    ExtendShotHoldTo(g_flagScoreHoldUntil);
+
+    if (g_state != CameraState::FlagWatch
+        || g_currentTargetHandle != g_flagScoreHoldTarget) {
+        RequestFlagWatchShot(g_flagScoreHoldTarget,
+                             "flag score hold enforce",
+                             now,
+                             true);
+        ExtendShotHoldTo(g_flagScoreHoldUntil);
+    }
+
+    return true;
 }
 
 static bool RequestFlagCampingGlimpse(int carrierHandle, DWORD now) {
@@ -1625,6 +1702,15 @@ static void UpdateKillCamPhase() {
 // ============================================================================
 
 static DWORD DirectorPreRollMsForEvent(const DirectorEvent& event) {
+    // Starting flag-lost/capture events early makes the camera abandon the
+    // carrier before the spectator-visible score. Flag pickup events still
+    // use pre-roll so the view can catch the start of a run.
+    if (event.type == DirectorEventType::Flag
+        && event.usCarrier == 0
+        && event.vcCarrier == 0) {
+        return 0;
+    }
+
     float preRollSeconds = g_config.directorPreRollSeconds;
     if (!std::isfinite(preRollSeconds) || preRollSeconds < 0.0f) {
         preRollSeconds = 5.0f;
@@ -1662,10 +1748,10 @@ static bool IsEventStale(const DirectorEvent& event, DWORD now) {
 }
 
 static int EventScore(const DirectorEvent& event) {
-    if (IsDebugCameraModeActive()) {
-        return event.type == DirectorEventType::Kill ? 200 : 0;
+    if (event.type == DirectorEventType::Flag) {
+        return 300;
     }
-    return event.type == DirectorEventType::Flag ? 200 : 100;
+    return IsDebugCameraModeActive() ? 200 : 100;
 }
 
 static void AttachEventSnapshots(DirectorEvent& event) {
@@ -1961,6 +2047,7 @@ static int PickFlagTargetForEvent(const DirectorEvent& event, bool wasDualFlag) 
 static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
     int previousUSCarrier = g_flagCarrierUS;
     int previousVCCarrier = g_flagCarrierVC;
+    int previousWatchedCarrier = g_currentTargetHandle;
     bool wasDualFlag = (g_flagCarrierUS != 0 && g_flagCarrierVC != 0);
 
     g_flagCarrierUS = event.usCarrier;
@@ -1971,14 +2058,11 @@ static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
     BumpPlayerActivity(event.vcCarrier, 0.6f);
     UpdateFlagCarrierMotion(now);
 
-    if (IsDebugCameraModeActive()) {
-        return true;
-    }
-
     bool anyFlag = (event.usCarrier != 0 || event.vcCarrier != 0);
     bool dualFlag = (event.usCarrier != 0 && event.vcCarrier != 0);
 
     if (anyFlag) {
+        ClearFlagScoreHold(now, "new flag carrier");
         g_flagLostGraceActive = false;
         int target = PickFlagTargetForEvent(event, wasDualFlag);
 
@@ -1990,13 +2074,61 @@ static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
         bool committed = target != 0
             && RequestFlagWatchShot(target,
                                     dualFlag ? "queued dual flag" : "queued flag",
-                                    now);
+                                    now,
+                                    true);
         if (committed) {
             FeedNextFlagCarry(target,
                               FlagNameForCarrier(target, event.usCarrier, event.vcCarrier),
                               event.availableLeadMs);
         }
         return committed;
+    }
+
+    int scoreHoldTarget = 0;
+    if (previousWatchedCarrier != 0
+        && (previousWatchedCarrier == previousUSCarrier
+            || previousWatchedCarrier == previousVCCarrier)) {
+        scoreHoldTarget = previousWatchedCarrier;
+    } else if (previousUSCarrier != 0) {
+        scoreHoldTarget = previousUSCarrier;
+    } else if (previousVCCarrier != 0) {
+        scoreHoldTarget = previousVCCarrier;
+    }
+
+    if (scoreHoldTarget != 0) {
+        DWORD scoreHoldUntil = event.visibleTick + FLAG_SCORE_POST_HOLD_MS;
+        if (TickReached(now, scoreHoldUntil)) {
+            scoreHoldUntil = now + FLAG_SCORE_POST_HOLD_MS;
+        }
+
+        g_flagScoreHoldTarget = scoreHoldTarget;
+        g_flagScoreHoldUntil = scoreHoldUntil;
+        g_flagLostGraceActive = true;
+        g_flagLostTimestamp = now;
+        ClearFlagCampingGlimpse();
+
+        RequestFlagWatchShot(scoreHoldTarget, "flag score hold", now, true);
+        ExtendShotHoldTo(g_flagScoreHoldUntil);
+
+        CD_Log("[CameraDirector] Flag score hold target=%d until=%lu post=%dms visible=%lu now=%lu previousUS=%d previousVC=%d watched=%d\n",
+               g_flagScoreHoldTarget,
+               g_flagScoreHoldUntil,
+               (int)FLAG_SCORE_POST_HOLD_MS,
+               event.visibleTick,
+               now,
+               previousUSCarrier,
+               previousVCCarrier,
+               previousWatchedCarrier);
+
+        const char* lostFlag = "flag";
+        if (previousUSCarrier != 0 && previousVCCarrier != 0) {
+            lostFlag = "US and VC flags";
+        } else if (previousUSCarrier != 0) {
+            lostFlag = "US flag";
+        } else if (previousVCCarrier != 0) {
+            lostFlag = "VC flag";
+        }
+        FeedNextFlagLost(lostFlag);
     }
 
     if (g_state == CameraState::FlagWatch && !g_flagLostGraceActive) {
@@ -2072,6 +2204,10 @@ static bool PromoteQueuedEvents(DWORD now) {
             } else {
                 ++i;
             }
+        }
+
+        if (IsFlagScoreHoldActive(now)) {
+            return changed;
         }
 
         int bestIndex = -1;
@@ -2310,10 +2446,18 @@ void CameraDirector_Update() {
 
     DWORD now = GetTickCount();
     DrainSnifferEvents();
+    if (g_flagScoreHoldTarget != 0 && !IsFlagScoreHoldActive(now)) {
+        ClearFlagScoreHold(now, "expired");
+    }
     PromoteQueuedEvents(now);
 
     UpdatePlayerActivity(now);
     UpdateFlagCarrierMotion(now);
+
+    if (EnsureFlagScoreHoldCamera(now)) {
+        g_lastUpdateTick = now;
+        return;
+    }
 
     if (g_flagCampingGlimpseHandle != 0
         && TickReached(now, g_flagCampingGlimpseUntil)) {
@@ -2415,13 +2559,13 @@ void CameraDirector_Update() {
                 bool inGlimpse = g_flagCampingGlimpseHandle == g_currentTargetHandle
                     && g_flagCampingGlimpseUntil != 0
                     && !TickReached(now, g_flagCampingGlimpseUntil);
-                if (!inGlimpse) {
-                    if (!IsShotHoldActive(now)) {
-                        ClearFlagCampingGlimpse();
-                        ClearCommittedShot(now, "flag carrier camping");
-                        StartNextScheduledShot(now, "flag carrier camping");
-                    }
+                if (inGlimpse) {
+                    break;
                 }
+                // If we are already watching an active flag carrier, do not cut
+                // away merely because they paused or slowed near the base.
+                // The camera should stay with the run until the flag is dropped,
+                // captured, or replaced by another valid flag carrier.
                 break;
             }
 
@@ -2604,6 +2748,8 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_compatEventSequence = 0;
     g_currentShotUseFpv = false;
     g_kcStyle = KillCamStyle::BulletTravel;
+    g_flagScoreHoldTarget = 0;
+    g_flagScoreHoldUntil = 0;
     g_flagAlternateDelay = RandomRange(FLAG_ALTERNATE_MIN_SEC, FLAG_ALTERNATE_MAX_SEC);
     g_lastFlagWatchTargetSwitch = 0;
     g_lastScreenTimeLog = GetTickCount();

@@ -15,6 +15,8 @@
 #include "TickDelayBuffer.h"
 #include "FpvViewmodel.h"
 #include "LowPlayerOverlay.h"
+#include "YoutubeChatBridge.h"
+#include "SpectatorChatRelay.h"
 #include "dsound_proxy.h"
 #include "minhook/MinHook.h"
 
@@ -135,6 +137,8 @@ DWORD WINAPI MainThread(LPVOID) {
     InitFpvViewmodel(base);
     InitAutoSpectator(base);
     InitWorldCameraTracker(base);
+    InitYoutubeChatBridge(base);
+    InitSpectatorChatRelay(base);
     SetHookReady();
 
     std::thread mainThread(MainLoop);

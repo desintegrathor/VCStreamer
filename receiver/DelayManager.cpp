@@ -152,6 +152,22 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "; Debug override: auto, player_3pv, fpv, world, drone, victim_look_3pv, vantage_killcam, bullet_killcam\n";
                 outFile << "debug_camera_mode=auto\n";
                 outFile << "debug_only_victim_look_3pv=0\n";
+                outFile << "\n";
+                outFile << "[YouTubeChat]\n";
+                outFile << "; Mirror YouTube live chat through authenticated VCHD streamer frames (0=off, 1=on)\n";
+                outFile << "enabled=0\n";
+                outFile << "auth_mode=web\n";
+                outFile << "stream_url=https://youtube.com/live/xd1t2lS0Xb4?feature=share\n";
+                outFile << "live_chat_id=\n";
+                outFile << "video_id=\n";
+                outFile << "oauth_client_secret=tools\\youtube_client_secret.json\n";
+                outFile << "oauth_token_cache=tools\\youtube_token.json\n";
+                outFile << "max_chars=480\n";
+                outFile << "min_send_interval_ms=1500\n";
+                outFile << "queue_limit=50\n";
+                outFile << "drop_own_messages=1\n";
+                outFile << "fallback_polling=1\n";
+                outFile << "send_initial_history=0\n";
                 outFile.close();
                 return 0;
             }
