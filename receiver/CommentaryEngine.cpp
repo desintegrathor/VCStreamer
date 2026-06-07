@@ -732,6 +732,55 @@ int MetricRank(unsigned int value, unsigned int ServerTelemetryStatsDelta::*memb
     return rank;
 }
 
+int MetricTeamRank(int handle, int team, unsigned int value, unsigned int ServerTelemetryStatsDelta::*member, int* outCount) {
+    if (outCount) *outCount = 0;
+    if (team != 0 && team != 1) return 0;
+    if (value == 0) return 0;
+
+    int rank = 1;
+    int count = 0;
+    for (const auto& item : g_latestStats) {
+        const ServerTelemetryStatsDelta& other = item.second;
+        int otherTeam = (other.team == 0 || other.team == 1) ? other.team : IdentityTeamForHandle(other.playerId);
+        if (otherTeam != team) continue;
+        if (other.*member == 0 && item.first != handle) continue;
+        ++count;
+        if (other.*member > value) {
+            ++rank;
+        }
+    }
+    if (outCount) *outCount = count;
+    return count > 0 ? rank : 0;
+}
+
+int MetricTeamWorstRank(int handle, int team, unsigned int value, unsigned int ServerTelemetryStatsDelta::*member, int* outCount) {
+    if (outCount) *outCount = 0;
+    if (team != 0 && team != 1) return 0;
+
+    int rank = 1;
+    int count = 0;
+    for (const auto& item : g_latestStats) {
+        const ServerTelemetryStatsDelta& other = item.second;
+        int otherTeam = (other.team == 0 || other.team == 1) ? other.team : IdentityTeamForHandle(other.playerId);
+        if (otherTeam != team) continue;
+        if (other.*member == 0 && item.first != handle) continue;
+        ++count;
+        if (other.*member < value) {
+            ++rank;
+        }
+    }
+    if (outCount) *outCount = count;
+    return count > 0 ? rank : 0;
+}
+
+const char* RankingPhrase(int rank, bool worst) {
+    if (rank <= 0) return "unranked";
+    if (rank == 1) return worst ? "worst" : "best";
+    if (rank == 2) return worst ? "second worst" : "second best";
+    if (rank == 3) return worst ? "third worst" : "third best";
+    return worst ? "painfully average" : "respectable";
+}
+
 const char* RankPhrase(int rank) {
     if (rank == 1) return "Best";
     if (rank == 2) return "Second best";
@@ -839,6 +888,146 @@ bool ShouldAppendInlineStat(unsigned long long sequence, DWORD now, int handle) 
     return ((sequence + static_cast<unsigned long long>(now / 1000) + static_cast<unsigned long long>(handle)) % 2) == 0;
 }
 
+bool BuildTeamRankStatLine(int handle,
+                           int team,
+                           const ResolvedName& name,
+                           const ServerTelemetryStatsDelta& stat,
+                           unsigned int kills,
+                           unsigned int deaths,
+                           unsigned int cursor,
+                           char* buffer,
+                           size_t bufferLen) {
+    if (!buffer || bufferLen == 0 || team != 0 && team != 1) return false;
+
+    struct RankChoice {
+        int id;
+        bool worst;
+    };
+    std::vector<RankChoice> choices;
+
+    int count = 0;
+    int damageRank = MetricTeamRank(handle, team, stat.totalDamage, &ServerTelemetryStatsDelta::totalDamage, &count);
+    if (count >= 3 && stat.totalDamage >= 100 && damageRank > 0) {
+        choices.push_back({0, false});
+    }
+
+    int distanceRank = MetricTeamRank(handle, team, stat.distanceMeters, &ServerTelemetryStatsDelta::distanceMeters, &count);
+    int distanceWorstRank = MetricTeamWorstRank(handle, team, stat.distanceMeters, &ServerTelemetryStatsDelta::distanceMeters, &count);
+    if (count >= 3 && stat.distanceMeters >= 150 && distanceRank > 0) {
+        choices.push_back({1, false});
+    }
+    if (count >= 3 && distanceWorstRank > 0 && distanceWorstRank <= 2) {
+        choices.push_back({2, true});
+    }
+
+    unsigned int accuracy = AccuracyPercent(stat);
+    int accuracyRank = 0;
+    int accuracyWorstRank = 0;
+    if (stat.accuracyShots >= 10) {
+        int better = 0;
+        int worse = 0;
+        count = 0;
+        for (const auto& item : g_latestStats) {
+            const ServerTelemetryStatsDelta& other = item.second;
+            int otherTeam = (other.team == 0 || other.team == 1) ? other.team : IdentityTeamForHandle(other.playerId);
+            if (otherTeam != team || other.accuracyShots < 10) continue;
+            ++count;
+            unsigned int otherAccuracy = AccuracyPercent(other);
+            if (otherAccuracy > accuracy) ++better;
+            if (otherAccuracy < accuracy) ++worse;
+        }
+        accuracyRank = better + 1;
+        accuracyWorstRank = worse + 1;
+        if (count >= 3) {
+            choices.push_back({3, false});
+            if (accuracyWorstRank <= 2) {
+                choices.push_back({4, true});
+            }
+        }
+    }
+
+    float kd = deaths == 0 ? static_cast<float>(kills) : static_cast<float>(kills) / static_cast<float>(deaths);
+    if (kills + deaths >= 3) {
+        choices.push_back({5, kd < 0.75f});
+    }
+
+    if (choices.empty()) return false;
+
+    RankChoice choice = choices[cursor % choices.size()];
+    switch (choice.id) {
+        case 0:
+            sprintf_s(buffer,
+                      bufferLen,
+                      "We are watching %s. %s is the %s damage dealer on the %s team with %u damage. Do with that information what you will.",
+                      name.name,
+                      name.name,
+                      RankingPhrase(damageRank, false),
+                      TeamName(team),
+                      stat.totalDamage);
+            break;
+        case 1:
+            sprintf_s(buffer,
+                      bufferLen,
+                      "We are watching %s. %s has the %s legs on the %s team at %u m. Cardio propaganda is working.",
+                      name.name,
+                      name.name,
+                      RankingPhrase(distanceRank, false),
+                      TeamName(team),
+                      stat.distanceMeters);
+            break;
+        case 2:
+            sprintf_s(buffer,
+                      bufferLen,
+                      "We are watching %s. %s is the %s mover on the %s team. Tactical standing around, apparently.",
+                      name.name,
+                      name.name,
+                      RankingPhrase(distanceWorstRank, true),
+                      TeamName(team));
+            break;
+        case 3:
+            sprintf_s(buffer,
+                      bufferLen,
+                      "We are watching %s. %s has the %s accuracy on the %s team at %u%%. Annoying, but measurable.",
+                      name.name,
+                      name.name,
+                      RankingPhrase(accuracyRank, false),
+                      TeamName(team),
+                      accuracy);
+            break;
+        case 4:
+            sprintf_s(buffer,
+                      bufferLen,
+                      "We are watching %s. %s has the %s accuracy on the %s team at %u%%. The walls are terrified.",
+                      name.name,
+                      name.name,
+                      RankingPhrase(accuracyWorstRank, true),
+                      TeamName(team),
+                      accuracy);
+            break;
+        case 5:
+            if (choice.worst) {
+                sprintf_s(buffer,
+                          bufferLen,
+                          "We are watching %s. %.1f KD on the %s team. This is less a performance, more a cry for help.",
+                          name.name,
+                          kd,
+                          TeamName(team));
+            } else {
+                sprintf_s(buffer,
+                          bufferLen,
+                          "We are watching %s. %.1f KD for the %s team. Useful, which is rude to everyone else.",
+                          name.name,
+                          kd,
+                          TeamName(team));
+            }
+            break;
+        default:
+            return false;
+    }
+
+    return buffer[0] != '\0';
+}
+
 bool BuildStatLine(int handle, std::string& outText, const char** outNameSource) {
     auto it = g_latestStats.find(handle);
     if (it == g_latestStats.end()) return false;
@@ -870,7 +1059,23 @@ bool BuildStatLine(int handle, std::string& outText, const char** outNameSource)
     int choice = choices[cursor % choices.size()];
     ++cursor;
 
-    char buffer[220] = {};
+    char buffer[260] = {};
+    if ((cursor % 3) == 0
+        && BuildTeamRankStatLine(handle,
+                                 team,
+                                 name,
+                                 stat,
+                                 kills,
+                                 deaths,
+                                 cursor / 3,
+                                 buffer,
+                                 sizeof(buffer))) {
+        outText = buffer;
+        if (outNameSource) *outNameSource = name.source;
+        return !outText.empty();
+    }
+
+    buffer[0] = '\0';
     switch (choice) {
         case 0: {
             int rank = MetricRank(stat.distanceMeters, &ServerTelemetryStatsDelta::distanceMeters);
