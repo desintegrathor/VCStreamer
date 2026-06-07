@@ -43,6 +43,55 @@ constexpr DWORD KILL_CLEANUP_INTERVAL_MS = 10000;
 static int g_lastRawUSCarrier = 0;
 static int g_lastRawVCCarrier = 0;
 
+static void ApplyFlagTelemetry(DirectorEvent& event, const ServerTelemetryFlagEvent& telemetry) {
+    event.hasFlagTelemetry = true;
+    event.flagAction = telemetry.action;
+    event.flagSide = telemetry.flagSide;
+    event.flagReasonFlags = telemetry.flags;
+    event.flagCarryTimeMs = telemetry.carryTimeMs;
+    event.flagCarryDistanceMeters = telemetry.carryDistanceMeters;
+    event.flagPlayerHandle = telemetry.playerId;
+    event.flagPlayerTeam = telemetry.playerTeam;
+    strncpy_s(event.flagPlayerName, telemetry.playerName, _TRUNCATE);
+}
+
+static unsigned int InferFlagAction(const DirectorEvent& event, int* playerHandle) {
+    if (playerHandle) *playerHandle = 0;
+
+    if (event.previousUSCarrier == 0 && event.usCarrier != 0) {
+        if (playerHandle) *playerHandle = event.usCarrier;
+        return 1;
+    }
+    if (event.previousVCCarrier == 0 && event.vcCarrier != 0) {
+        if (playerHandle) *playerHandle = event.vcCarrier;
+        return 1;
+    }
+    if (event.previousUSCarrier != 0 && event.usCarrier == 0) {
+        if (playerHandle) *playerHandle = event.previousUSCarrier;
+        return 2;
+    }
+    if (event.previousVCCarrier != 0 && event.vcCarrier == 0) {
+        if (playerHandle) *playerHandle = event.previousVCCarrier;
+        return 2;
+    }
+    return 0;
+}
+
+static void EnrichFlagEvent(DirectorEvent& event) {
+    int playerHandle = 0;
+    unsigned int action = InferFlagAction(event, &playerHandle);
+
+    ServerTelemetryFlagEvent telemetry = {};
+    if (ServerTelemetry_TryFindFlag(playerHandle, action, event.rawTick, &telemetry) ||
+        ServerTelemetry_TryFindFlag(0, action, event.rawTick, &telemetry) ||
+        ServerTelemetry_TryFindFlag(0, 0, event.rawTick, &telemetry)) {
+        ApplyFlagTelemetry(event, telemetry);
+    } else {
+        event.flagAction = action;
+        event.flagPlayerHandle = playerHandle;
+    }
+}
+
 // ============================================================================
 // Logging
 // ============================================================================
@@ -393,14 +442,18 @@ static void ProcessFlag(BYTE* data, DWORD size, DWORD rawTick) {
         return;
     }
 
-    g_lastRawUSCarrier = newUS;
-    g_lastRawVCCarrier = newVC;
-
     DirectorEvent event = {};
     event.type = DirectorEventType::Flag;
     FillEventTiming(event, rawTick);
+    event.previousUSCarrier = g_lastRawUSCarrier;
+    event.previousVCCarrier = g_lastRawVCCarrier;
     event.usCarrier = newUS;
     event.vcCarrier = newVC;
+
+    EnrichFlagEvent(event);
+
+    g_lastRawUSCarrier = newUS;
+    g_lastRawVCCarrier = newVC;
     PushEventLocked(event);
 }
 

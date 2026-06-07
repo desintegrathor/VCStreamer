@@ -18,6 +18,12 @@
     <ClInclude Include="framework.h">
       <Filter>Hlavičkové soubory</Filter>
     </ClInclude>
+    <ClInclude Include="CommentaryEngine.h">
+      <Filter>Hlavičkové soubory</Filter>
+    </ClInclude>
+    <ClInclude Include="PlayerIdentityCache.h">
+      <Filter>Hlavičkové soubory</Filter>
+    </ClInclude>
     <ClInclude Include="CommentatorFeed.h">
       <Filter>Hlavičkové soubory</Filter>
     </ClInclude>
@@ -45,6 +51,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
+      <Filter>Zdrojové soubory</Filter>
+    </ClCompile>
+    <ClCompile Include="CommentaryEngine.cpp">
+      <Filter>Zdrojové soubory</Filter>
+    </ClCompile>
+    <ClCompile Include="PlayerIdentityCache.cpp">
       <Filter>Zdrojové soubory</Filter>
     </ClCompile>
     <ClCompile Include="CommentatorFeed.cpp">

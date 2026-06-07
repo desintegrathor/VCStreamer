@@ -65,6 +65,7 @@ std::vector<PlayerInfo> GameMemoryReader::ReadPlayerList() {
         PlayerInfo player;
         player.id = *(int*)entry;
         player.name = playerName;
+        player.teamId = *((int*)entry + 5);
         player.kills = *((int*)entry + 2912);
         player.deaths = *((int*)entry + 2913);
         player.score = *((int*)entry + 2914);

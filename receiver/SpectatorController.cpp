@@ -1,4 +1,5 @@
 #include "SpectatorController.h"
+#include "CommentaryEngine.h"
 #include "DiagnosticsLog.h"
 #include <mutex>
 
@@ -51,6 +52,7 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
             continue;
         currentPlayers.push_back(p);
     }
+    CommentaryEngine_UpdateScoreboard(currentPlayers);
 }
 
 // ---------------------------

@@ -1,10 +1,12 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "CameraDirector.h"
+#include "CommentaryEngine.h"
 #include "CommentatorFeed.h"
 #include "DelayManager.h"
 #include "DiagnosticsLog.h"
 #include "DroneCamera.h"
 #include "PathGrid.h"
+#include "ServerTelemetry.h"
 #include "ServerStateSniffer.h"
 #include "SpectatedPlayerData.h"
 #include "SpectatorController.h"
@@ -997,6 +999,26 @@ static const char* ShotKindName(ShotKind kind) {
     }
 }
 
+static CommentaryCameraContext BuildCommentaryContext(DWORD now) {
+    CommentaryCameraContext context = {};
+    context.currentTick = now;
+    context.activeCameraTarget = g_currentTargetHandle;
+    context.shotKind = ShotKindName(g_committedShotKind);
+    context.usCarrier = g_flagCarrierUS;
+    context.vcCarrier = g_flagCarrierVC;
+    context.usCarrierCamping = IsCampingFlagCarrier(g_flagCarrierUS);
+    context.vcCarrierCamping = IsCampingFlagCarrier(g_flagCarrierVC);
+    context.usCarrierMoving = g_flagCarrierUS != 0 && !context.usCarrierCamping;
+    context.vcCarrierMoving = g_flagCarrierVC != 0 && !context.vcCarrierCamping;
+    context.flagScoreHoldTarget = IsFlagScoreHoldActive(now) ? g_flagScoreHoldTarget : 0;
+    context.flagScoreHoldUntil = IsFlagScoreHoldActive(now) ? g_flagScoreHoldUntil : 0;
+    context.flagKillLookKillerHandle = g_flagKillLookKillerHandle;
+    context.flagKillLookVictimHandle = g_flagKillLookVictimHandle;
+    context.flagKillLookStartTick = g_flagKillLookStartTick;
+    context.flagKillLookKillTick = g_flagKillLookKillTick;
+    return context;
+}
+
 static const char* KillCamStyleName(KillCamStyle style) {
     return style == KillCamStyle::DetachedVantage ? "victim-lock-3pv" : "bullet";
 }
@@ -1784,7 +1806,82 @@ static void AttachEventSnapshots(DirectorEvent& event) {
     }
 }
 
+static void ApplyFlagTelemetryToEvent(DirectorEvent& event, const ServerTelemetryFlagEvent& telemetry) {
+    event.hasFlagTelemetry = true;
+    event.flagAction = telemetry.action;
+    event.flagSide = telemetry.flagSide;
+    event.flagReasonFlags = telemetry.flags;
+    event.flagCarryTimeMs = telemetry.carryTimeMs;
+    event.flagCarryDistanceMeters = telemetry.carryDistanceMeters;
+    event.flagPlayerHandle = telemetry.playerId;
+    event.flagPlayerTeam = telemetry.playerTeam;
+    strncpy_s(event.flagPlayerName, telemetry.playerName, _TRUNCATE);
+}
+
+static unsigned int InferFlagActionForEvent(const DirectorEvent& event, int* playerHandle) {
+    if (playerHandle) *playerHandle = 0;
+    if (event.previousUSCarrier == 0 && event.usCarrier != 0) {
+        if (playerHandle) *playerHandle = event.usCarrier;
+        return 1;
+    }
+    if (event.previousVCCarrier == 0 && event.vcCarrier != 0) {
+        if (playerHandle) *playerHandle = event.vcCarrier;
+        return 1;
+    }
+    if (event.previousUSCarrier != 0 && event.usCarrier == 0) {
+        if (playerHandle) *playerHandle = event.previousUSCarrier;
+        return 2;
+    }
+    if (event.previousVCCarrier != 0 && event.vcCarrier == 0) {
+        if (playerHandle) *playerHandle = event.previousVCCarrier;
+        return 2;
+    }
+    return event.flagAction;
+}
+
+static void EnrichFlagEventForPlanning(DirectorEvent& event) {
+    if (event.type != DirectorEventType::Flag || event.hasFlagTelemetry) return;
+
+    int playerHandle = event.flagPlayerHandle;
+    unsigned int action = event.flagAction;
+    if (action == 0) {
+        action = InferFlagActionForEvent(event, &playerHandle);
+    }
+
+    ServerTelemetryFlagEvent telemetry = {};
+    if (ServerTelemetry_TryFindFlag(playerHandle, action, event.rawTick, &telemetry) ||
+        ServerTelemetry_TryFindFlag(0, action, event.rawTick, &telemetry) ||
+        ServerTelemetry_TryFindFlag(0, 0, event.rawTick, &telemetry)) {
+        ApplyFlagTelemetryToEvent(event, telemetry);
+    } else {
+        event.flagAction = action;
+        event.flagPlayerHandle = playerHandle;
+    }
+}
+
+static bool ShouldSupersedePendingFlagEvent(const DirectorEvent& pending, const DirectorEvent& incoming) {
+    if (pending.type != DirectorEventType::Flag || incoming.type != DirectorEventType::Flag) {
+        return false;
+    }
+
+    bool incomingGenericZeroCarrier = !incoming.hasFlagTelemetry
+        && incoming.usCarrier == 0
+        && incoming.vcCarrier == 0;
+    bool pendingSemanticTake = pending.hasFlagTelemetry && pending.flagAction == 1;
+    if (incomingGenericZeroCarrier && pendingSemanticTake) {
+        return false;
+    }
+
+    if (incoming.hasFlagTelemetry && pending.hasFlagTelemetry) {
+        return incoming.flagAction >= pending.flagAction
+            || (incoming.flagReasonFlags & STREAMER_FLAG_REASON_SCORE) != 0;
+    }
+
+    return incoming.hasFlagTelemetry || !pending.hasFlagTelemetry;
+}
+
 static void QueueDirectorEvent(DirectorEvent event, const char* reason) {
+    EnrichFlagEventForPlanning(event);
     AttachEventSnapshots(event);
 
     if (ShouldDropDirectorEventForDebug(event)) {
@@ -1803,7 +1900,7 @@ static void QueueDirectorEvent(DirectorEvent event, const char* reason) {
 
     if (event.type == DirectorEventType::Flag) {
         for (size_t i = 0; i < g_eventQueue.size();) {
-            if (g_eventQueue[i].event.type == DirectorEventType::Flag) {
+            if (ShouldSupersedePendingFlagEvent(g_eventQueue[i].event, event)) {
                 TimingLog("[Plan] seq=%llu type=flag raw=%lu playbackDelay=%d visible=%lu plannedStart=%lu actualCommit=0 lead=%d reason=drop-superseded-by-flag-%llu\n",
                           g_eventQueue[i].event.sequence,
                           g_eventQueue[i].event.rawTick,
@@ -1958,6 +2055,10 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
                          event.availableLeadMs,
                          distance,
                          DebugCameraModeName(debugMode));
+            CommentaryEngine_OnCommittedDirectorEvent(event,
+                                                      now,
+                                                      g_currentTargetHandle,
+                                                      ShotKindName(g_committedShotKind));
         }
         return committed;
     }
@@ -1969,6 +2070,10 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
                      event.availableLeadMs,
                      distance,
                      "victim-look");
+        CommentaryEngine_OnCommittedDirectorEvent(event,
+                                                  now,
+                                                  g_currentTargetHandle,
+                                                  ShotKindName(g_committedShotKind));
         return true;
     }
 
@@ -2019,6 +2124,10 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
                      event.availableLeadMs,
                      distance,
                      cinematic ? "killcam" : "follow");
+        CommentaryEngine_OnCommittedDirectorEvent(event,
+                                                  now,
+                                                  g_currentTargetHandle,
+                                                  ShotKindName(g_committedShotKind));
     }
 
     return committed;
@@ -2080,6 +2189,10 @@ static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
             FeedNextFlagCarry(target,
                               FlagNameForCarrier(target, event.usCarrier, event.vcCarrier),
                               event.availableLeadMs);
+            CommentaryEngine_OnCommittedDirectorEvent(event,
+                                                      now,
+                                                      g_currentTargetHandle,
+                                                      ShotKindName(g_committedShotKind));
         }
         return committed;
     }
@@ -2107,7 +2220,7 @@ static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
         g_flagLostTimestamp = now;
         ClearFlagCampingGlimpse();
 
-        RequestFlagWatchShot(scoreHoldTarget, "flag score hold", now, true);
+        bool scoreHoldCommitted = RequestFlagWatchShot(scoreHoldTarget, "flag score hold", now, true);
         ExtendShotHoldTo(g_flagScoreHoldUntil);
 
         CD_Log("[CameraDirector] Flag score hold target=%d until=%lu post=%dms visible=%lu now=%lu previousUS=%d previousVC=%d watched=%d\n",
@@ -2129,6 +2242,12 @@ static bool CommitFlagEvent(const DirectorEvent& event, DWORD now) {
             lostFlag = "VC flag";
         }
         FeedNextFlagLost(lostFlag);
+        if (scoreHoldCommitted) {
+            CommentaryEngine_OnCommittedDirectorEvent(event,
+                                                      now,
+                                                      g_currentTargetHandle,
+                                                      ShotKindName(g_committedShotKind));
+        }
     }
 
     if (g_state == CameraState::FlagWatch && !g_flagLostGraceActive) {
@@ -2453,6 +2572,7 @@ void CameraDirector_Update() {
 
     UpdatePlayerActivity(now);
     UpdateFlagCarrierMotion(now);
+    CommentaryEngine_Update(BuildCommentaryContext(now));
 
     if (EnsureFlagScoreHoldCamera(now)) {
         g_lastUpdateTick = now;
@@ -2727,6 +2847,7 @@ bool CameraDirector_GetFlagCarrierKillLookAimPoint(float out[3]) {
 
 void InitCameraDirector(uintptr_t gameBase) {
     g_gameBase = gameBase;
+    CommentaryEngine_Init(gameBase);
     srand((unsigned int)time(nullptr));
 
     DroneCamera_Init(gameBase);

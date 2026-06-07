@@ -33,6 +33,17 @@ struct DirectorEvent {
 
     int usCarrier = 0;
     int vcCarrier = 0;
+    int previousUSCarrier = 0;
+    int previousVCCarrier = 0;
+    bool hasFlagTelemetry = false;
+    unsigned int flagAction = 0; // 1=take, 2=drop, 3=return
+    unsigned int flagSide = 255;
+    unsigned int flagReasonFlags = 0;
+    unsigned int flagCarryTimeMs = 0;
+    float flagCarryDistanceMeters = 0.0f;
+    int flagPlayerHandle = 0;
+    int flagPlayerTeam = -1;
+    char flagPlayerName[24] = {};
 
     PlayerSnapshot killerSnapshot;
     PlayerSnapshot victimSnapshot;

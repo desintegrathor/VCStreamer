@@ -191,6 +191,7 @@ void ReleaseTexture() {
     }
     g_textureWidth = 0;
     g_textureHeight = 0;
+
 }
 
 bool LoadBmpPixels(const std::string& path, BitmapPixels& out) {
@@ -281,6 +282,7 @@ bool EnsureTexture(IDirect3DDevice8* device) {
     g_textureHeight = pixels.height;
     return true;
 }
+
 
 void DrawQuad(IDirect3DDevice8* device,
               float x, float y, float w, float h,
