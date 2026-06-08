@@ -48,6 +48,9 @@ constexpr unsigned int BONE_CHEST = 0x15;
 constexpr float PI_F = 3.14159265f;
 constexpr float YAW_OFFSET_3PV = PI_F - 0.35f;
 constexpr float MAX_PITCH_3PV = 0.175f;
+constexpr float KILL_LOOK_MAX_EXTRA_DISTANCE = 1.5f;
+constexpr float KILL_LOOK_HARD_MAX_DISTANCE = 4.0f;
+constexpr float KILL_LOOK_COLLISION_CLEARANCE = 0.35f;
 
 // NOD struct offsets — verified from NOD_FindByNameAndType @ 0xf429b0:
 //   +8  name[], +0x58 flags (bit 0 = hidden, bit 3 = has_children),
@@ -97,6 +100,7 @@ static bool g_yawInitialized = false;
 // 3PV distance smoothing
 static float g_smoothedDistance = 2.5f;
 static bool g_distanceInitialized = false;
+static bool g_killLookDistanceWasActive = false;
 static bool g_lookLockWasActive = false;
 static int g_lastLookLockTarget = 0;
 
@@ -208,6 +212,13 @@ struct TpvYawDebugFrame {
     float lookLockYaw = 0.0f;
     float smoothedYaw = 0.0f;
     int cameraIndex = -1;
+    bool killLookDistanceActive = false;
+    bool killLookDistanceBlocked = false;
+    float distanceOriginal = 0.0f;
+    float distanceDesired = 0.0f;
+    float distanceCollisionCap = 0.0f;
+    float distanceSmoothed = 0.0f;
+    float targetSeparation = 0.0f;
 };
 
 static int TpvDebugFrontClass(float dot) {
@@ -422,6 +433,85 @@ static float ClampFloat(float value, float minValue, float maxValue) {
     if (value < minValue) return minValue;
     if (value > maxValue) return maxValue;
     return value;
+}
+
+struct KillLookZoomAllowance {
+    bool active = false;
+    bool blockedByCollision = false;
+    float baselineDistance = 0.0f;
+    float desiredDistance = 0.0f;
+    float collisionCap = 0.0f;
+    float targetSeparation = 0.0f;
+};
+
+static KillLookZoomAllowance ComputeKillLookZoomAllowance(CameraState dirState,
+                                                          KillCamStyle kcStyle,
+                                                          bool lookLockApplied,
+                                                          const CameraConfig& cfg,
+                                                          const float* playerPos,
+                                                          const float* camDir,
+                                                          float originalDistance) {
+    KillLookZoomAllowance result;
+    result.baselineDistance = ClampFloat(originalDistance, 0.0f, cfg.tpvMaxDistance);
+    result.desiredDistance = result.baselineDistance;
+    result.collisionCap = result.baselineDistance;
+
+    if (dirState != CameraState::KillCam
+        || kcStyle != KillCamStyle::DetachedVantage
+        || !lookLockApplied
+        || !playerPos
+        || !camDir) {
+        return result;
+    }
+
+    result.active = true;
+
+    float victimAim[3] = {};
+    if (!CameraDirector_GetKillCamVictimAimPoint(victimAim)) {
+        return result;
+    }
+
+    float sepX = victimAim[0] - playerPos[0];
+    float sepY = victimAim[1] - playerPos[1];
+    result.targetSeparation = sqrtf(sepX * sepX + sepY * sepY);
+
+    float maxKillLookDistance = cfg.tpvMaxDistance + KILL_LOOK_MAX_EXTRA_DISTANCE;
+    if (maxKillLookDistance > KILL_LOOK_HARD_MAX_DISTANCE) {
+        maxKillLookDistance = KILL_LOOK_HARD_MAX_DISTANCE;
+    }
+    if (maxKillLookDistance < result.baselineDistance) {
+        maxKillLookDistance = result.baselineDistance;
+    }
+
+    result.collisionCap = maxKillLookDistance;
+    result.desiredDistance = ClampFloat(result.targetSeparation,
+                                        result.baselineDistance,
+                                        maxKillLookDistance);
+
+    if (result.desiredDistance <= result.baselineDistance + 0.001f) {
+        return result;
+    }
+
+    float dirLenSq = camDir[0] * camDir[0] + camDir[1] * camDir[1] + camDir[2] * camDir[2];
+    if (dirLenSq < 0.0001f) {
+        result.desiredDistance = result.baselineDistance;
+        result.blockedByCollision = true;
+        return result;
+    }
+
+    float hitDistance = OctCollision_Raycast(playerPos, camDir, nullptr);
+    if (hitDistance > 0.0f && hitDistance < result.collisionCap + KILL_LOOK_COLLISION_CLEARANCE) {
+        result.collisionCap = hitDistance - KILL_LOOK_COLLISION_CLEARANCE;
+        if (result.collisionCap < 0.0f) {
+            result.collisionCap = 0.0f;
+        }
+    }
+    if (result.collisionCap < result.desiredDistance) {
+        result.desiredDistance = result.baselineDistance;
+        result.blockedByCollision = true;
+    }
+
+    return result;
 }
 
 static void CopyVec3(const float* src, float* dst) {
@@ -1395,6 +1485,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
     if (playerEntity && playerEntity != g_lastPlayerEntity) {
         g_yawInitialized = false;
         g_distanceInitialized = false;
+        g_killLookDistanceWasActive = false;
         g_lastPlayerEntity = playerEntity;
         g_fpvLogCounter = 0; // force immediate log on target switch
 
@@ -1461,6 +1552,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         g_killCamVantageRollPassed = false;
         g_killCamFocusReleased = false;
         g_killCamMoveStartValid = false;
+        g_killLookDistanceWasActive = false;
 
         if (g_killCamStyle == KillCamStyle::DetachedVantage) {
             g_yawInitialized = false;
@@ -1685,22 +1777,66 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
         float dz = camPos[2] - playerPos[2];
         float originalDistance = sqrtf(dx * dx + dy * dy + dz * dz);
 
-        float targetDistance = originalDistance;
-        if (targetDistance > cfg.tpvMaxDistance)
-            targetDistance = cfg.tpvMaxDistance;
+        float maxAllowedDistance = cfg.tpvMaxDistance;
+        float targetDistance = ClampFloat(originalDistance, 0.0f, maxAllowedDistance);
+
+        float camDir[3] = { 0.0f, 0.0f, 0.0f };
+        if (originalDistance > 0.01f) {
+            camDir[0] = dx / originalDistance;
+            camDir[1] = dy / originalDistance;
+            camDir[2] = dz / originalDistance;
+        }
+
+        KillLookZoomAllowance killLookZoom =
+            ComputeKillLookZoomAllowance(dirState,
+                                         kcStyle,
+                                         lookLockApplied,
+                                         cfg,
+                                         playerPos,
+                                         camDir,
+                                         originalDistance);
+        if (killLookZoom.active) {
+            maxAllowedDistance = cfg.tpvMaxDistance + KILL_LOOK_MAX_EXTRA_DISTANCE;
+            if (maxAllowedDistance > KILL_LOOK_HARD_MAX_DISTANCE) {
+                maxAllowedDistance = KILL_LOOK_HARD_MAX_DISTANCE;
+            }
+            if (maxAllowedDistance < killLookZoom.baselineDistance) {
+                maxAllowedDistance = killLookZoom.baselineDistance;
+            }
+            targetDistance = killLookZoom.desiredDistance;
+        }
+
+        tpvDebug.killLookDistanceActive = killLookZoom.active;
+        tpvDebug.killLookDistanceBlocked = killLookZoom.blockedByCollision;
+        tpvDebug.distanceOriginal = originalDistance;
+        tpvDebug.distanceDesired = targetDistance;
+        tpvDebug.distanceCollisionCap = killLookZoom.collisionCap;
+        tpvDebug.targetSeparation = killLookZoom.targetSeparation;
+
+        if (targetDistance > maxAllowedDistance)
+            targetDistance = maxAllowedDistance;
+        tpvDebug.distanceDesired = targetDistance;
 
         if (!g_distanceInitialized) {
-            g_smoothedDistance = targetDistance;
+            g_smoothedDistance = killLookZoom.active
+                ? killLookZoom.baselineDistance
+                : targetDistance;
             g_distanceInitialized = true;
+        } else if (killLookZoom.active && !g_killLookDistanceWasActive) {
+            if (g_smoothedDistance > killLookZoom.baselineDistance) {
+                g_smoothedDistance = killLookZoom.baselineDistance;
+            }
         } else {
             float factor = (targetDistance < g_smoothedDistance)
                 ? cfg.tpvZoomInFactor
                 : cfg.tpvZoomOutFactor;
             g_smoothedDistance += (targetDistance - g_smoothedDistance) * factor;
         }
+        g_killLookDistanceWasActive = killLookZoom.active;
 
-        if (g_smoothedDistance > cfg.tpvMaxDistance)
-            g_smoothedDistance = cfg.tpvMaxDistance;
+        if (g_smoothedDistance > maxAllowedDistance)
+            g_smoothedDistance = maxAllowedDistance;
+        tpvDebug.distanceSmoothed = g_smoothedDistance;
 
         if (originalDistance > 0.01f) {
             float scale = g_smoothedDistance / originalDistance;
@@ -1708,6 +1844,8 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
             camPos[1] = playerPos[1] + dy * scale;
             camPos[2] = playerPos[2] + dz * scale + 0.5f;
         }
+    } else {
+        g_killLookDistanceWasActive = false;
     }
 
     if (do3pvPreprocess && result && playerEntity && WorldCameraTracker_GetCurrentCamType() == 2) {
@@ -1778,6 +1916,7 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 "[3PV] tick=%lu dbg=%s state=%s phase=%s style=%s target=%d wcType=%d "
                 "source=%s lookActive=%d lookApplied=%d lookFrozen=%d lookTarget=%d reason=%s "
                 "class=%s dot=%.3f horiz=%.2f dist=%.2f dz=%.2f "
+                "zoomActive=%d zoomBlocked=%d zoomOrig=%.2f zoomDesired=%.2f zoomCap=%.2f zoomSmooth=%.2f targetSep=%.2f "
                 "player=(%.2f,%.2f,%.2f) cam=(%.2f,%.2f,%.2f) "
                 "fwd=(%.3f,%.3f) camDir=(%.3f,%.3f) "
                 "boneYaw=%.4f fwdYaw=%.4f desired=%.4f smooth=%.4f entryYaw=%.4f entryPitch=%.4f "
@@ -1800,6 +1939,13 @@ int __fastcall Hooked_FillCamera(void* thisPtr, void* edx_unused, void* cameraPr
                 horizDist,
                 dist3d,
                 camDz,
+                tpvDebug.killLookDistanceActive ? 1 : 0,
+                tpvDebug.killLookDistanceBlocked ? 1 : 0,
+                tpvDebug.distanceOriginal,
+                tpvDebug.distanceDesired,
+                tpvDebug.distanceCollisionCap,
+                tpvDebug.distanceSmoothed,
+                tpvDebug.targetSeparation,
                 playerPos[0], playerPos[1], playerPos[2],
                 camPos[0], camPos[1], camPos[2],
                 forwardX, forwardY,

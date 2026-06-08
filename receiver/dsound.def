@@ -12,3 +12,4 @@ EXPORTS
     DirectSoundFullDuplexCreate=proxy_DirectSoundFullDuplexCreate @10
     DirectSoundCreate8=proxy_DirectSoundCreate8 @11
     DirectSoundCaptureCreate8=proxy_DirectSoundCaptureCreate8 @12
+    VCStreamer_CopyActiveCameraModeName

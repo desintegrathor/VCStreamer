@@ -1069,6 +1069,33 @@ static bool IsDebugCameraModeActive() {
     return ActiveDebugCameraMode() != DebugCameraMode::Auto;
 }
 
+static bool ShouldExposeActiveCameraModeName() {
+    return g_config.debugMode || DelayManager::IsDebugMode() || IsDebugCameraModeActive();
+}
+
+static const char* ActivePlayerCameraModeName() {
+    switch (WorldCameraTracker_GetCurrentCamType()) {
+        case 0: return "World Static";
+        case 1: return "World Dynamic";
+        case 2: return g_currentShotUseFpv ? "Player FPV" : "Player 3PV";
+        case -1:
+            if (g_committedPreference == CAM_WORLD) return "World";
+            return g_currentShotUseFpv ? "Player FPV" : "Player 3PV";
+        default:
+            return "Unknown";
+    }
+}
+
+static const char* ActiveFlagCameraModeName() {
+    switch (WorldCameraTracker_GetCurrentCamType()) {
+        case 0: return "Flag World Static";
+        case 1: return "Flag World Dynamic";
+        case 2: return g_currentShotUseFpv ? "Flag FPV" : "Flag 3PV";
+        case -1: return g_currentShotUseFpv ? "Flag FPV" : "Flag 3PV";
+        default: return "Unknown";
+    }
+}
+
 static bool ShouldDropDirectorEventForDebug(const DirectorEvent& event) {
     (void)event;
     return false;
@@ -2953,6 +2980,43 @@ bool CameraDirector_GetKillCamVictimAimPoint(float out[3]) {
 float CameraDirector_GetKillCamElapsed() { return GetKillCamElapsedInternal(); }
 const CameraConfig& CameraDirector_GetConfig() { return g_config; }
 bool CameraDirector_ShouldUseFpv() { return g_currentShotUseFpv; }
+const char* CameraDirector_GetActiveCameraModeName() {
+    switch (g_state) {
+        case CameraState::Idle:
+            return "Idle";
+        case CameraState::FollowPlayer:
+            return ActivePlayerCameraModeName();
+        case CameraState::KillCam:
+            return g_kcStyle == KillCamStyle::BulletTravel
+                ? "KillCam Bullet"
+                : "KillCam Victim 3PV";
+        case CameraState::FlagWatch:
+            return ActiveFlagCameraModeName();
+        case CameraState::Drone:
+            return "Drone";
+        default:
+            return "Unknown";
+    }
+}
+
+extern "C" __declspec(dllexport) int __cdecl VCStreamer_CopyActiveCameraModeName(char* out, int outSize) {
+    if (out && outSize > 0) {
+        out[0] = '\0';
+    }
+
+    if (!out || outSize <= 0 || !ShouldExposeActiveCameraModeName()) {
+        return 0;
+    }
+
+    const char* name = CameraDirector_GetActiveCameraModeName();
+    if (!name || name[0] == '\0') {
+        return 0;
+    }
+
+    strncpy_s(out, static_cast<size_t>(outSize), name, _TRUNCATE);
+    return 1;
+}
+
 bool CameraDirector_GetFlagCarrierKillLook(int* killerHandle,
                                            int* victimHandle,
                                            float* elapsed,

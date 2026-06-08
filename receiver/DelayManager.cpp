@@ -284,6 +284,40 @@ static int ReadIniInt(const std::string& iniPath, const char* key, int defaultVa
     try { return std::stoi(buf); } catch (...) { return defaultVal; }
 }
 
+static int ReadRootIniInt(const std::string& iniPath, const char* key, int defaultVal) {
+    std::ifstream iniFile(iniPath);
+    if (!iniFile.is_open()) return defaultVal;
+
+    std::string line;
+    while (std::getline(iniFile, line)) {
+        std::string trimmed = line;
+        trimmed.erase(0, trimmed.find_first_not_of(" \t\r\n"));
+        if (trimmed.empty() || trimmed[0] == ';' || trimmed[0] == '#') {
+            continue;
+        }
+        if (trimmed[0] == '[') {
+            break;
+        }
+
+        size_t equalPos = trimmed.find('=');
+        if (equalPos == std::string::npos) {
+            continue;
+        }
+
+        std::string currentKey = trimmed.substr(0, equalPos);
+        std::string value = trimmed.substr(equalPos + 1);
+        currentKey.erase(currentKey.find_last_not_of(" \t\r\n") + 1);
+        value.erase(0, value.find_first_not_of(" \t\r\n"));
+        value.erase(value.find_last_not_of(" \t\r\n") + 1);
+
+        if (currentKey == key) {
+            try { return std::stoi(value); } catch (...) { return defaultVal; }
+        }
+    }
+
+    return defaultVal;
+}
+
 static std::string ReadIniString(const std::string& iniPath, const char* key, const char* defaultVal) {
     char buf[96];
     GetPrivateProfileStringA("CameraDirector", key, defaultVal, buf, sizeof(buf), iniPath.c_str());
@@ -425,7 +459,10 @@ void LoadCameraDirectorConfig(CameraConfig& cfg) {
     cfg.droneVantageRadius        = ReadIniFloat(iniPath, "drone_vantage_radius", 10.0f);
     cfg.droneVantageRecomputeDist = ReadIniFloat(iniPath, "drone_vantage_recompute_dist", 5.0f);
 
-    cfg.debugMode                 = (ReadIniInt(iniPath, "debug_mode", 0) != 0);
+    int directorDebugMode = ReadIniInt(iniPath, "debug_mode", -1);
+    cfg.debugMode = (directorDebugMode >= 0
+        ? directorDebugMode
+        : ReadRootIniInt(iniPath, "debug_mode", 0)) != 0;
     std::string debugCameraMode = ReadIniString(iniPath, "debug_camera_mode", "");
     cfg.debugCameraMode = ParseDebugCameraMode(debugCameraMode);
     if (debugCameraMode.empty()

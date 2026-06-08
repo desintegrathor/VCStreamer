@@ -380,6 +380,9 @@ void ServerTelemetry_Poll() {
         ev.receivedTick = receivedTick;
         g_lastHitSeq = (std::max)(g_lastHitSeq, ev.sequence);
         PushBounded(g_hits, ev);
+        DiagnosticsLog_Append("server_telemetry_debug.log",
+            "[ServerTelemetry] hit seq=%llu attacker=%d victim=%d damage=%.1f dist=%.1f weapon=%d %s\n",
+            ev.sequence, ev.attackerId, ev.victimId, ev.damageHP, ev.distanceMeters, ev.weaponId, ev.weaponName);
     }
     for (unsigned int i = 0; i < statsCount; ++i) {
         if (statsRecords[i].payload.payloadVersion != TELEMETRY_PAYLOAD_VERSION) {
@@ -389,6 +392,21 @@ void ServerTelemetry_Poll() {
         ev.receivedTick = receivedTick;
         g_lastStatsSeq = (std::max)(g_lastStatsSeq, ev.sequence);
         PushBounded(g_stats, ev);
+        DiagnosticsLog_Append("server_telemetry_debug.log",
+            "[ServerTelemetry] stats seq=%llu player=%d team=%d dmg=%u shots=%u hits=%u head=%u dist=%u flagDist=%u flagAttempts=%u flagTime=%u alive=%u teamkills=%u\n",
+            ev.sequence,
+            ev.playerId,
+            ev.team,
+            ev.totalDamage,
+            ev.accuracyShots,
+            ev.accuracyHits,
+            ev.accuracyHeadshots,
+            ev.distanceMeters,
+            ev.flagDistanceMeters,
+            ev.flagAttempts,
+            ev.flagTimeSec,
+            ev.aliveTimeSec,
+            ev.teamkills);
     }
     for (unsigned int i = 0; i < flagCount; ++i) {
         if (flagRecords[i].payload.payloadVersion != TELEMETRY_PAYLOAD_VERSION) {

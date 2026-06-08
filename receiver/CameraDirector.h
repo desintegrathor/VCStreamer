@@ -178,6 +178,7 @@ bool CameraDirector_GetFlagCarrierKillLook(int* killerHandle,
                                            float* elapsed,
                                            float* duration);
 bool CameraDirector_GetFlagCarrierKillLookAimPoint(float out[3]);
+const char* CameraDirector_GetActiveCameraModeName();
 
 // Config loading (implemented in DelayManager.cpp, follows existing INI pattern)
 void LoadCameraDirectorConfig(CameraConfig& config);

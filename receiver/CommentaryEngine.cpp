@@ -32,7 +32,8 @@ constexpr DWORD kFadeInMs = 180;
 constexpr DWORD kFadeOutMs = 900;
 constexpr DWORD kLateKillDropMs = 1500;
 constexpr DWORD kLateFlagDropMs = 2500;
-constexpr DWORD kStatStableTargetMs = 2000;
+constexpr DWORD kFlagDropScoreGraceMs = 1800;
+constexpr DWORD kStatStableTargetMs = 1500;
 constexpr DWORD kStatMinIntervalMs = 4000;
 constexpr DWORD kStableFlavorStableTargetMs = 7000;
 constexpr DWORD kStableFlavorMinIntervalMs = 22000;
@@ -44,8 +45,8 @@ constexpr DWORD kScoreCommentMaxDelayMs = 8000;
 constexpr DWORD kScoreCommentMinIntervalMs = 20000;
 constexpr DWORD kStableScoreMinIntervalMs = 120000;
 constexpr DWORD kStableScoreMaxIntervalMs = 240000;
-constexpr DWORD kAggregateStatMinIntervalMs = 60000;
-constexpr DWORD kAggregateStatMaxIntervalMs = 120000;
+constexpr DWORD kAggregateStatMinIntervalMs = 35000;
+constexpr DWORD kAggregateStatMaxIntervalMs = 70000;
 constexpr size_t kTargetBacklogMax = 64;
 constexpr size_t kRecentGeneralTemplateCount = 5;
 constexpr unsigned int kHitFlagKill = 1u << 0;
@@ -197,6 +198,8 @@ HMODULE g_vchdModule = nullptr;
 VchdSetCommentaryLineFn g_setVchdCommentaryLine = nullptr;
 bool g_vchdResolveAttempted = false;
 bool g_lastPublishedVisible = false;
+
+void SetPendingLocked(const PendingLine& line, DWORD now, const char* reason);
 
 void CommentaryLog(const char* fmt, ...) {
     FILE* file = fopen("commentary_debug.log", "a");
@@ -651,6 +654,13 @@ bool IsDeathOrKillCategory(const std::string& category) {
         || category == "teamkill";
 }
 
+bool IsKillOrFlagCategory(const std::string& category) {
+    return category.find("kill") != std::string::npos
+        || category.find("flag") != std::string::npos
+        || category == "suicide"
+        || category == "teamkill";
+}
+
 bool IsKnownUnavailableSubject(int handle) {
     if (handle == 0) return false;
     PlayerLifeState life = PlayerLifeTracker_Get(handle);
@@ -719,6 +729,55 @@ bool IsDuplicateDeathLineLocked(const PendingLine& line) {
     return !PlayerLifeTracker_IsAlive(line.deathVictimHandle);
 }
 
+bool IsFlagDropCategory(const std::string& category) {
+    return category == "flag-drop" || category == "target-flag-drop";
+}
+
+bool IsFlagScoreCategory(const std::string& category) {
+    return category == "flag-score" || category == "target-flag-score";
+}
+
+bool SameFlagSubject(const PendingLine& lhs, const PendingLine& rhs) {
+    int lhsHandle = lhs.subjectHandle != 0 ? lhs.subjectHandle : lhs.requiredTarget;
+    int rhsHandle = rhs.subjectHandle != 0 ? rhs.subjectHandle : rhs.requiredTarget;
+    return lhsHandle != 0 && lhsHandle == rhsHandle;
+}
+
+void DelayFlagDropForScoreGrace(PendingLine& line, DWORD now) {
+    if (!IsFlagDropCategory(line.category)) return;
+
+    DWORD delayedActivation = now + kFlagDropScoreGraceMs;
+    if (TickReached(delayedActivation, line.activationTick)) {
+        line.activationTick = delayedActivation;
+    }
+    if (TickReached(line.activationTick + kLiveTargetEventFreshMs, line.expireTick)) {
+        line.expireTick = line.activationTick + kLiveTargetEventFreshMs;
+    }
+}
+
+void DropQueuedFlagDropsForScoreLocked(const PendingLine& scoreLine) {
+    if (!IsFlagScoreCategory(scoreLine.category)) return;
+
+    if (g_pending.pending
+        && IsFlagDropCategory(g_pending.category)
+        && SameFlagSubject(g_pending, scoreLine)) {
+        CommentaryLog("drop-pending seq=%llu category=%s reason=score-supersedes-drop text=%s\n",
+                      g_pending.eventSequence,
+                      g_pending.category.c_str(),
+                      g_pending.text.c_str());
+        g_pending = PendingLine();
+    }
+
+    g_targetBacklog.erase(
+        std::remove_if(g_targetBacklog.begin(),
+                       g_targetBacklog.end(),
+                       [&scoreLine](const PendingLine& existing) {
+                           return IsFlagDropCategory(existing.category)
+                               && SameFlagSubject(existing, scoreLine);
+                       }),
+        g_targetBacklog.end());
+}
+
 void MarkDeathAnnouncementLocked(const PendingLine& line, DWORD now) {
     if (line.deathVictimHandle <= 0) return;
     g_announcedDeathTicks[line.deathVictimHandle] = line.deathTick != 0 ? line.deathTick : now;
@@ -730,6 +789,124 @@ bool HasWatchedPlayerEventBacklogLocked() {
         return true;
     }
     return !g_targetBacklog.empty();
+}
+
+bool IsForeshadowIntroCandidateLocked(const PendingLine& line, int activeCameraTarget, DWORD now) {
+    return line.pending
+        && activeCameraTarget != 0
+        && line.requiredTarget == activeCameraTarget
+        && line.eventSequence != 0
+        && IsKillOrFlagCategory(line.category)
+        && IsLineTargetStillActive(line, activeCameraTarget)
+        && !TickReached(now, line.activationTick)
+        && !TickReached(now, line.expireTick)
+        && !line.text.empty();
+}
+
+bool TryTakeForeshadowIntroLineLocked(int activeCameraTarget,
+                                      DWORD now,
+                                      PendingLine* outLine) {
+    if (!outLine || activeCameraTarget == 0) return false;
+
+    if (g_pending.pending
+        && IsForeshadowIntroCandidateLocked(g_pending, activeCameraTarget, now)) {
+        *outLine = g_pending;
+        CommentaryLog("intro-consume-pending seq=%llu category=%s target=%d activation=%lu now=%lu text=%s\n",
+                      g_pending.eventSequence,
+                      g_pending.category.c_str(),
+                      activeCameraTarget,
+                      g_pending.activationTick,
+                      now,
+                      g_pending.text.c_str());
+        g_pending = PendingLine();
+        return true;
+    }
+
+    auto best = g_targetBacklog.end();
+    for (auto it = g_targetBacklog.begin(); it != g_targetBacklog.end(); ++it) {
+        if (!IsForeshadowIntroCandidateLocked(*it, activeCameraTarget, now)) {
+            continue;
+        }
+        if (best == g_targetBacklog.end()
+            || it->priority > best->priority
+            || (it->priority == best->priority
+                && TickReached(best->activationTick, it->activationTick))) {
+            best = it;
+        }
+    }
+
+    if (best == g_targetBacklog.end()) {
+        return false;
+    }
+
+    *outLine = *best;
+    CommentaryLog("intro-consume-backlog seq=%llu category=%s target=%d activation=%lu now=%lu text=%s\n",
+                  best->eventSequence,
+                  best->category.c_str(),
+                  activeCameraTarget,
+                  best->activationTick,
+                  now,
+                  best->text.c_str());
+    g_targetBacklog.erase(best);
+    return true;
+}
+
+bool BuildWatchedPlayerIntroLineLocked(const CommentaryCameraContext& context,
+                                       PendingLine* outLine) {
+    if (!outLine || context.activeCameraTarget == 0) return false;
+    if (!context.targetAlive || context.targetRecentlyDied) return false;
+    if (IsKnownUnavailableSubject(context.activeCameraTarget)) return false;
+    if (HasReservedWatchedIntroLocked(context.activeCameraTarget)) return false;
+
+    ResolvedName name = ResolveWatchedSubjectName(context.activeCameraTarget,
+                                                  IsKnownFlagCarrier(context.activeCameraTarget) ? "carrier" : "player");
+    if (!name.ok) return false;
+
+    char buffer[120] = {};
+    sprintf_s(buffer, "Watching %s.", name.name);
+
+    DWORD now = context.currentTick;
+    PendingLine line = {};
+    line.pending = true;
+    line.activationTick = now;
+    line.expireTick = now + 2200;
+    line.requiredTarget = context.activeCameraTarget;
+    line.priority = 90;
+    line.subjectHandle = context.activeCameraTarget;
+    line.eventSequence = 0;
+    line.introducesSubject = true;
+    line.category = "target-intro";
+    line.nameSource = name.source;
+    line.text = buffer;
+
+    *outLine = line;
+    return true;
+}
+
+bool QueueWatchedPlayerSwitchIntroLocked(const CommentaryCameraContext& context,
+                                         bool targetChanged) {
+    if (!targetChanged || context.activeCameraTarget == 0) {
+        return false;
+    }
+
+    DWORD now = context.currentTick;
+    PendingLine line = {};
+    if (TryTakeForeshadowIntroLineLocked(context.activeCameraTarget, now, &line)) {
+        line.pending = true;
+        line.activationTick = now;
+        line.expireTick = now + 3000;
+        line.priority = line.priority < 97 ? 97 : line.priority;
+        line.introducesSubject = true;
+        SetPendingLocked(line, now, "target-switch-foreshadow");
+        return true;
+    }
+
+    if (!BuildWatchedPlayerIntroLineLocked(context, &line)) {
+        return false;
+    }
+
+    SetPendingLocked(line, now, "target-switch-intro");
+    return true;
 }
 
 bool CanUseGeneralTemplate(const std::string& templateKey) {
@@ -788,20 +965,24 @@ void MarkLineStartedLocked(const PendingLine& line, DWORD now) {
 }
 
 void QueueTargetBacklogLocked(const PendingLine& line, DWORD now, const char* reason) {
-    (void)now;
     if (line.text.empty()) return;
-    if (IsDuplicateDeathLineLocked(line)) {
+
+    PendingLine queuedLine = line;
+    DelayFlagDropForScoreGrace(queuedLine, now);
+    DropQueuedFlagDropsForScoreLocked(queuedLine);
+
+    if (IsDuplicateDeathLineLocked(queuedLine)) {
         CommentaryLog("drop-backlog seq=%llu category=%s victim=%d target=%d reason=duplicate-death text=%s\n",
-                      line.eventSequence,
-                      line.category.c_str(),
-                      line.deathVictimHandle,
-                      line.requiredTarget,
-                      line.text.c_str());
+                      queuedLine.eventSequence,
+                      queuedLine.category.c_str(),
+                      queuedLine.deathVictimHandle,
+                      queuedLine.requiredTarget,
+                      queuedLine.text.c_str());
         return;
     }
     for (const PendingLine& existing : g_targetBacklog) {
-        if (existing.eventSequence == line.eventSequence
-            && existing.category == line.category) {
+        if (existing.eventSequence == queuedLine.eventSequence
+            && existing.category == queuedLine.category) {
             return;
         }
     }
@@ -817,26 +998,26 @@ void QueueTargetBacklogLocked(const PendingLine& line, DWORD now, const char* re
 
     auto insertAt = std::find_if(g_targetBacklog.begin(),
                                  g_targetBacklog.end(),
-                                 [&line](const PendingLine& existing) {
-                                     if (TickReached(existing.activationTick, line.activationTick)
-                                         && existing.activationTick != line.activationTick) {
+                                 [&queuedLine](const PendingLine& existing) {
+                                     if (TickReached(existing.activationTick, queuedLine.activationTick)
+                                         && existing.activationTick != queuedLine.activationTick) {
                                          return true;
                                      }
-                                     return existing.activationTick == line.activationTick
-                                         && existing.eventSequence > line.eventSequence;
+                                     return existing.activationTick == queuedLine.activationTick
+                                         && existing.eventSequence > queuedLine.eventSequence;
                                  });
-    g_targetBacklog.insert(insertAt, line);
+    g_targetBacklog.insert(insertAt, queuedLine);
     CommentaryLog("backlog seq=%llu category=%s activation=%lu expire=%lu target=%d cameraTarget=%d priority=%d source=%s reason=%s text=%s\n",
-                  line.eventSequence,
-                  line.category.c_str(),
-                  line.activationTick,
-                  line.expireTick,
-                  line.requiredTarget,
+                  queuedLine.eventSequence,
+                  queuedLine.category.c_str(),
+                  queuedLine.activationTick,
+                  queuedLine.expireTick,
+                  queuedLine.requiredTarget,
                   g_lastContext.activeCameraTarget,
-                  line.priority,
-                  line.nameSource.c_str(),
+                  queuedLine.priority,
+                  queuedLine.nameSource.c_str(),
                   reason ? reason : "target-event",
-                  line.text.c_str());
+                  queuedLine.text.c_str());
 }
 
 void ActivatePendingLocked(const PendingLine& line,
@@ -885,83 +1066,87 @@ void ActivatePendingLocked(const PendingLine& line,
 
 void SetPendingLocked(const PendingLine& line, DWORD now, const char* reason) {
     if (line.text.empty()) return;
+    PendingLine queuedLine = line;
+    DelayFlagDropForScoreGrace(queuedLine, now);
+    DropQueuedFlagDropsForScoreLocked(queuedLine);
+
     ClearRespawnedDeathAnnouncementsLocked(now);
-    if (IsDuplicateDeathLineLocked(line)) {
+    if (IsDuplicateDeathLineLocked(queuedLine)) {
         CommentaryLog("drop seq=%llu category=%s victim=%d target=%d cameraTarget=%d reason=duplicate-death text=%s\n",
-                      line.eventSequence,
-                      line.category.c_str(),
-                      line.deathVictimHandle,
-                      line.requiredTarget,
+                      queuedLine.eventSequence,
+                      queuedLine.category.c_str(),
+                      queuedLine.deathVictimHandle,
+                      queuedLine.requiredTarget,
                       g_lastContext.activeCameraTarget,
-                      line.text.c_str());
+                      queuedLine.text.c_str());
         return;
     }
-    if (ShouldDropLineForLifeState(line)) {
+    if (ShouldDropLineForLifeState(queuedLine)) {
         CommentaryLog("drop seq=%llu category=%s target=%d subject=%d object=%d cameraTarget=%d reason=life-state text=%s\n",
-                      line.eventSequence,
-                      line.category.c_str(),
-                      line.requiredTarget,
-                      line.subjectHandle,
-                      line.objectHandle,
+                      queuedLine.eventSequence,
+                      queuedLine.category.c_str(),
+                      queuedLine.requiredTarget,
+                      queuedLine.subjectHandle,
+                      queuedLine.objectHandle,
                       g_lastContext.activeCameraTarget,
-                      line.text.c_str());
+                      queuedLine.text.c_str());
         return;
     }
 
     if (g_active.active) {
-        if (IsTargetBacklogCategory(line.category)
-            && line.priority < 96) {
-            QueueTargetBacklogLocked(line, now, reason);
+        if (IsTargetBacklogCategory(queuedLine.category)
+            && queuedLine.priority < 96) {
+            QueueTargetBacklogLocked(queuedLine, now, reason);
             return;
         }
-        if (line.priority >= 90 && line.priority >= g_active.priority) {
+        if (queuedLine.priority >= 90 && queuedLine.priority >= g_active.priority) {
             ClearActiveLocked(now, "major-event-replace");
-        } else if (IsTargetBacklogCategory(line.category)
-                   && line.priority >= 85) {
-            QueueTargetBacklogLocked(line, now, reason);
+        } else if (IsTargetBacklogCategory(queuedLine.category)
+                   && queuedLine.priority >= 85) {
+            QueueTargetBacklogLocked(queuedLine, now, reason);
             return;
         } else {
             CommentaryLog("drop seq=%llu category=%s priority=%d activePriority=%d cameraTarget=%d source=%s reason=active-line text=%s\n",
-                          line.eventSequence,
-                          line.category.c_str(),
-                          line.priority,
+                          queuedLine.eventSequence,
+                          queuedLine.category.c_str(),
+                          queuedLine.priority,
                           g_active.priority,
                           g_lastContext.activeCameraTarget,
-                          line.nameSource.c_str(),
-                          line.text.c_str());
+                          queuedLine.nameSource.c_str(),
+                          queuedLine.text.c_str());
             return;
         }
     }
 
-    if (g_pending.pending && line.priority < g_pending.priority) {
-        if (IsTargetBacklogCategory(line.category)
-            && line.priority >= 85) {
-            QueueTargetBacklogLocked(line, now, reason);
+    if (g_pending.pending && queuedLine.priority < g_pending.priority) {
+        if (IsTargetBacklogCategory(queuedLine.category)
+            && queuedLine.priority >= 85) {
+            QueueTargetBacklogLocked(queuedLine, now, reason);
             return;
         }
         CommentaryLog("drop seq=%llu category=%s priority=%d pendingPriority=%d cameraTarget=%d source=%s reason=weaker-pending text=%s\n",
-                      line.eventSequence,
-                      line.category.c_str(),
-                      line.priority,
+                      queuedLine.eventSequence,
+                      queuedLine.category.c_str(),
+                      queuedLine.priority,
                       g_pending.priority,
                       g_lastContext.activeCameraTarget,
-                      line.nameSource.c_str(),
-                      line.text.c_str());
+                      queuedLine.nameSource.c_str(),
+                      queuedLine.text.c_str());
         return;
     }
 
-    g_pending = line;
+    g_pending = queuedLine;
     CommentaryLog("pending seq=%llu category=%s activation=%lu expire=%lu target=%d cameraTarget=%d priority=%d source=%s reason=%s text=%s\n",
-                  line.eventSequence,
-                  line.category.c_str(),
-                  line.activationTick,
-                  line.expireTick,
-                  line.requiredTarget,
+                  queuedLine.eventSequence,
+                  queuedLine.category.c_str(),
+                  queuedLine.activationTick,
+                  queuedLine.expireTick,
+                  queuedLine.requiredTarget,
                   g_lastContext.activeCameraTarget,
-                  line.priority,
-                  line.nameSource.c_str(),
+                  queuedLine.priority,
+                  queuedLine.nameSource.c_str(),
                   reason ? reason : "commit",
-                  line.text.c_str());
+                  queuedLine.text.c_str());
 }
 
 void PromoteTargetBacklogLocked(DWORD now, int activeCameraTarget, const char* shotKind) {
@@ -1413,16 +1598,15 @@ bool BuildStatLine(int handle, std::string& outText, const char** outNameSource,
     bool useIntroName = subjectName.ok && ShouldUseIntroNameForWatchedSubject(handle);
 
     std::vector<int> choices;
-    if (stat.distanceMeters >= 400) choices.push_back(0);
-    if (stat.flagDistanceMeters >= 80) choices.push_back(1);
-    if (stat.totalDamage >= 350) choices.push_back(2);
-    if (stat.accuracyShots >= 10) choices.push_back(3);
+    if (stat.distanceMeters >= 100) choices.push_back(0);
+    if (stat.flagDistanceMeters >= 20) choices.push_back(1);
+    if (stat.totalDamage >= 100) choices.push_back(2);
+    if (stat.accuracyShots >= 5) choices.push_back(3);
     if (stat.teamkills > 0) choices.push_back(4);
-    if (stat.aliveTimeSec >= 120) choices.push_back(5);
-    if (stat.flagAttempts >= 2) choices.push_back(6);
-    unsigned int kills = g_localKills[handle];
-    unsigned int deaths = g_localDeaths[handle];
-    if (kills + deaths >= 3) choices.push_back(7);
+    if (stat.aliveTimeSec >= 45) choices.push_back(5);
+    if (stat.flagAttempts >= 1) choices.push_back(6);
+    if (stat.flagTimeSec >= 20) choices.push_back(7);
+    if (stat.accuracyHeadshots > 0) choices.push_back(8);
     if (choices.empty()) return false;
 
     unsigned int& cursor = g_statCursor[handle];
@@ -1432,34 +1616,62 @@ bool BuildStatLine(int handle, std::string& outText, const char** outNameSource,
     char buffer[180] = {};
     switch (choice) {
         case 0:
-            sprintf_s(buffer, "%s has been moving all round.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s has moved %u m this round.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.distanceMeters);
             break;
         case 1:
-            sprintf_s(buffer, "%s has been doing the flag cardio.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s has carried the flag %u m.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.flagDistanceMeters);
             break;
         case 2:
-            sprintf_s(buffer, "%s has been landing shots.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s has dealt %u damage this round.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.totalDamage);
             break;
         case 3:
-            sprintf_s(buffer, "%s is shooting clean enough.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s is shooting %u%% on %u shots.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      AccuracyPercent(stat),
+                      stat.accuracyShots);
             break;
         case 4:
-            sprintf_s(buffer, "%s may want to check the uniform before firing.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s has %u teamkill%s. Uniform check recommended.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.teamkills,
+                      stat.teamkills == 1 ? "" : "s");
             break;
         case 5:
-            sprintf_s(buffer, "%s is staying alive. Useful habit.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s has stayed alive for %u seconds.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.aliveTimeSec);
             break;
         case 6:
-            sprintf_s(buffer, "%s keeps going back for the flag.", WatchedSubjectTitle(subjectName, useIntroName));
+            sprintf_s(buffer,
+                      "%s has made %u flag attempt%s.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.flagAttempts,
+                      stat.flagAttempts == 1 ? "" : "s");
             break;
         case 7:
-            if (kills > deaths) {
-                sprintf_s(buffer, "%s is winning his trades.", WatchedSubjectTitle(subjectName, useIntroName));
-            } else if (deaths > kills) {
-                sprintf_s(buffer, "%s needs a cleaner next fight.", WatchedSubjectTitle(subjectName, useIntroName));
-            } else {
-                sprintf_s(buffer, "%s is keeping it even.", WatchedSubjectTitle(subjectName, useIntroName));
-            }
+            sprintf_s(buffer,
+                      "%s has held the flag for %u seconds.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.flagTimeSec);
+            break;
+        case 8:
+            sprintf_s(buffer,
+                      "%s has %u headshot%s in the accuracy feed.",
+                      WatchedSubjectTitle(subjectName, useIntroName),
+                      stat.accuracyHeadshots,
+                      stat.accuracyHeadshots == 1 ? "" : "s");
             break;
         default:
             return false;
@@ -2438,8 +2650,7 @@ bool TryQueueGameStateLineLocked(const CommentaryCameraContext& context) {
 
     GeneralCommentCandidate candidate;
     if (!BuildScoreChangeLineLocked(now, candidate)
-        && !BuildAggregateStatLineLocked(now, candidate)
-        && !BuildStableScoreLineLocked(now, candidate)) {
+        && !BuildAggregateStatLineLocked(now, candidate)) {
         return false;
     }
     if (candidate.text.empty()) return false;
@@ -2840,27 +3051,6 @@ bool TryQueueContextLineLocked(const CommentaryCameraContext& context) {
         return false;
     }
     if (g_nextStatTick != 0 && !TickReached(now, g_nextStatTick)) {
-        std::string flavorTemplateKey;
-        text.clear();
-        nameSource = "none";
-        bool introducesSubject = false;
-        if (BuildStableWatchedPlayerFlavorLine(context, text, &nameSource, flavorTemplateKey, &introducesSubject)) {
-            PendingLine line = {};
-            line.pending = true;
-            line.activationTick = now;
-            line.expireTick = now + 1200;
-            line.requiredTarget = context.activeCameraTarget;
-            line.priority = 40;
-            line.subjectHandle = context.activeCameraTarget;
-            line.introducesSubject = introducesSubject;
-            line.category = "stable-flavor";
-            line.nameSource = nameSource;
-            line.templateKey = flavorTemplateKey;
-            line.text = text;
-            SetPendingLocked(line, now, "camera-context-flavor");
-            g_discourse.lastFlavorTick = now;
-            return true;
-        }
         return false;
     }
 
@@ -2877,7 +3067,7 @@ bool TryQueueContextLineLocked(const CommentaryCameraContext& context) {
     line.activationTick = now;
     line.expireTick = now + 1200;
     line.requiredTarget = context.activeCameraTarget;
-    line.priority = 35;
+    line.priority = 52;
     line.subjectHandle = context.activeCameraTarget;
     line.introducesSubject = introducesSubject;
     line.category = "stat-highlight";
@@ -3138,7 +3328,8 @@ void CommentaryEngine_Update(const CommentaryCameraContext& context) {
     RefreshTelemetryCachesLocked(now);
     ClearRespawnedDeathAnnouncementsLocked(now);
 
-    if (g_lastContextTarget != current.activeCameraTarget) {
+    bool targetChanged = g_lastContextTarget != current.activeCameraTarget;
+    if (targetChanged) {
         g_lastContextTarget = current.activeCameraTarget;
         g_targetSinceTick = now;
     }
@@ -3174,6 +3365,7 @@ void CommentaryEngine_Update(const CommentaryCameraContext& context) {
     }
 
     QueueLiveTargetTelemetryLocked(current);
+    QueueWatchedPlayerSwitchIntroLocked(current, targetChanged);
 
     if (g_pending.pending) {
         if (!IsLineTargetStillActive(g_pending, current.activeCameraTarget)) {
