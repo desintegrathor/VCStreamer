@@ -1,7 +1,9 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "CommentaryEngine.h"
+#include "CommentaryVoice.h"
 #include "DelayManager.h"
 #include "DiagnosticsLog.h"
+#include "PlayerLifeTracker.h"
 #include "PlayerIdentityCache.h"
 #include "ServerTelemetry.h"
 #include "SpectatorController.h"
@@ -32,6 +34,9 @@ constexpr DWORD kLateKillDropMs = 1500;
 constexpr DWORD kLateFlagDropMs = 2500;
 constexpr DWORD kStatStableTargetMs = 2000;
 constexpr DWORD kStatMinIntervalMs = 4000;
+constexpr DWORD kStableFlavorStableTargetMs = 7000;
+constexpr DWORD kStableFlavorMinIntervalMs = 22000;
+constexpr DWORD kSubjectSilenceResetMs = 30000;
 constexpr DWORD kPostKillDeathWindowMs = 7000;
 constexpr DWORD kLiveTargetEventFreshMs = 9000;
 constexpr DWORD kScoreCommentMinDelayMs = 3000;
@@ -56,6 +61,9 @@ struct ActiveLine {
     int objectHandle = 0;
     unsigned long long eventSequence = 0;
     bool cameraSwitchTolerant = false;
+    bool introducesSubject = false;
+    int deathVictimHandle = 0;
+    DWORD deathTick = 0;
     std::string category;
     std::string nameSource;
     std::string templateKey;
@@ -72,6 +80,9 @@ struct PendingLine {
     int objectHandle = 0;
     unsigned long long eventSequence = 0;
     bool cameraSwitchTolerant = false;
+    bool introducesSubject = false;
+    int deathVictimHandle = 0;
+    DWORD deathTick = 0;
     std::string category;
     std::string nameSource;
     std::string templateKey;
@@ -135,6 +146,16 @@ struct GeneralCommentCandidate {
     std::string text;
 };
 
+struct WatchedPlayerDiscourse {
+    int subjectHandle = 0;
+    DWORD subjectSinceTick = 0;
+    DWORD lastLineTick = 0;
+    DWORD lastIntroTick = 0;
+    DWORD lastFlavorTick = 0;
+    bool introduced = false;
+    bool needsIntroName = false;
+};
+
 std::mutex g_mutex;
 ActiveLine g_active;
 PendingLine g_pending;
@@ -162,10 +183,12 @@ std::unordered_set<unsigned long long> g_liveKillLineSequences;
 std::unordered_set<unsigned long long> g_liveHitLineSequences;
 std::unordered_set<unsigned long long> g_liveFlagLineSequences;
 std::unordered_set<unsigned long long> g_liveAchievementLineSequences;
+std::unordered_map<int, DWORD> g_announcedDeathTicks;
 std::deque<std::string> g_recentGeneralTemplates;
 std::string g_lastGeneralCategory;
 DWORD g_lastTelemetryCacheTick = 0;
 LastCommentedKill g_lastCommentedKill;
+WatchedPlayerDiscourse g_discourse;
 
 CommentaryCameraContext g_lastContext;
 
@@ -312,6 +335,221 @@ bool IsKnownFlagCarrier(int handle) {
             || handle == g_lastContext.flagKillLookVictimHandle);
 }
 
+bool IsWatchedSubject(int handle, int activeCameraTarget) {
+    return handle != 0 && handle == activeCameraTarget;
+}
+
+ResolvedName ResolveWatchedSubjectName(int handle, const char* fallbackRole) {
+    int team = KnownCarrierTeam(handle);
+    if (team != 0 && team != 1) {
+        team = IdentityTeamForHandle(handle);
+    }
+    return ResolveNameWithRoleFallback(handle,
+                                       nullptr,
+                                       nullptr,
+                                       team,
+                                       fallbackRole,
+                                       "watched player");
+}
+
+const char* SubjectPronoun() {
+    return "he";
+}
+
+const char* SubjectPronounTitle() {
+    return "He";
+}
+
+const char* ObjectPronoun() {
+    return "him";
+}
+
+const char* WatchedSubjectTitle(const ResolvedName& name, bool useIntroName) {
+    return useIntroName && name.ok ? name.name : SubjectPronounTitle();
+}
+
+const char* WatchedSubjectLower(const ResolvedName& name, bool useIntroName) {
+    return useIntroName && name.ok ? name.name : SubjectPronoun();
+}
+
+const char* WatchedObject(const ResolvedName& name, bool useIntroName) {
+    return useIntroName && name.ok ? name.name : ObjectPronoun();
+}
+
+void EnsureWatchedSubjectLocked(int handle, DWORD now, DWORD sinceTick) {
+    if (g_discourse.subjectHandle == handle) return;
+    g_discourse = WatchedPlayerDiscourse();
+    g_discourse.subjectHandle = handle;
+    g_discourse.subjectSinceTick = sinceTick != 0 ? sinceTick : now;
+    g_discourse.needsIntroName = handle != 0;
+}
+
+bool HasReservedWatchedIntroLocked(int handle) {
+    if (handle == 0) return false;
+    if (g_active.active
+        && g_active.introducesSubject
+        && g_active.requiredTarget == handle) {
+        return true;
+    }
+    if (g_pending.pending
+        && g_pending.introducesSubject
+        && g_pending.requiredTarget == handle) {
+        return true;
+    }
+    for (const PendingLine& line : g_targetBacklog) {
+        if (line.introducesSubject && line.requiredTarget == handle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ShouldUseIntroNameForWatchedSubject(int handle) {
+    return handle != 0
+        && handle == g_discourse.subjectHandle
+        && g_discourse.needsIntroName
+        && !HasReservedWatchedIntroLocked(handle);
+}
+
+void MarkWatchedSubjectIntroducedLocked(const PendingLine& line, DWORD now) {
+    if (!line.introducesSubject
+        || line.requiredTarget == 0
+        || line.requiredTarget != g_discourse.subjectHandle) {
+        return;
+    }
+    g_discourse.introduced = true;
+    g_discourse.needsIntroName = false;
+    g_discourse.lastIntroTick = now;
+}
+
+bool FormatTargetHitLine(bool targetAttacker,
+                         const ResolvedName& attackerName,
+                         const ResolvedName& victimName,
+                         bool useIntroName,
+                         unsigned int variant,
+                         char* buffer,
+                         size_t bufferLen) {
+    if (!buffer || bufferLen == 0) return false;
+    buffer[0] = '\0';
+
+    if (targetAttacker) {
+        if (!victimName.ok) return false;
+        switch (variant % 3) {
+            case 0:
+                sprintf_s(buffer, bufferLen, "%s attacks %s.", WatchedSubjectTitle(attackerName, useIntroName), victimName.name);
+                break;
+            case 1:
+                sprintf_s(buffer, bufferLen, "Good hit on %s.", victimName.name);
+                break;
+            default:
+                sprintf_s(buffer, bufferLen, "Pressure on %s.", victimName.name);
+                break;
+        }
+    } else {
+        switch (variant % 3) {
+            case 0:
+                if (!attackerName.ok) return false;
+                sprintf_s(buffer, bufferLen, "%s catches %s.", attackerName.name, WatchedObject(victimName, useIntroName));
+                break;
+            case 1:
+                if (!attackerName.ok) return false;
+                sprintf_s(buffer, bufferLen, "Under fire from %s.", attackerName.name);
+                break;
+            default:
+                sprintf_s(buffer, bufferLen, "%s took a hit there.", WatchedSubjectTitle(victimName, useIntroName));
+                break;
+        }
+    }
+
+    return buffer[0] != '\0';
+}
+
+bool FormatTargetKillLine(const DirectorEvent& event,
+                          bool suicide,
+                          bool targetKiller,
+                          bool targetVictim,
+                          bool victimIsFlagCarrier,
+                          const ResolvedName& killerName,
+                          const ResolvedName& victimName,
+                          bool useIntroName,
+                          char* buffer,
+                          size_t bufferLen,
+                          int& outPriority,
+                          const char** outNameSource,
+                          const char** outCategory) {
+    if (!buffer || bufferLen == 0) return false;
+    buffer[0] = '\0';
+
+    unsigned int variant = static_cast<unsigned int>(
+        (event.sequence + static_cast<unsigned long long>(event.killerHandle * 17 + event.victimHandle)) % 3);
+
+    if (targetVictim) {
+        outPriority = 97;
+        if (outNameSource) *outNameSource = killerName.ok ? killerName.source : "discourse";
+        if (outCategory) *outCategory = victimIsFlagCarrier ? "flag-carrier-kill" : (suicide ? "suicide" : "normal-kill");
+        if (suicide || !killerName.ok || variant == 0) {
+            if (useIntroName && victimName.ok) {
+                sprintf_s(buffer, bufferLen, "And %s is dead.", victimName.name);
+            } else {
+                sprintf_s(buffer, bufferLen, "And he's dead.");
+            }
+        } else {
+            sprintf_s(buffer, bufferLen, "%s got %s.", killerName.name, WatchedObject(victimName, useIntroName));
+        }
+        return buffer[0] != '\0';
+    }
+
+    if (!targetKiller || !victimName.ok) return false;
+
+    outPriority = victimIsFlagCarrier ? 96 : 91;
+    if (outNameSource) *outNameSource = "discourse";
+    if (outCategory) *outCategory = victimIsFlagCarrier ? "flag-carrier-kill-dealt" : "normal-kill";
+    if (variant == 0) {
+        sprintf_s(buffer, bufferLen, "%s kills %s. Good shot.", WatchedSubjectTitle(killerName, useIntroName), victimName.name);
+    } else if (variant == 1) {
+        sprintf_s(buffer, bufferLen, "%s is down. Nice finish.", victimName.name);
+    } else {
+        sprintf_s(buffer, bufferLen, "%s got %s. Good shot.", WatchedSubjectTitle(killerName, useIntroName), victimName.name);
+    }
+    return buffer[0] != '\0';
+}
+
+bool FormatTargetFlagLine(unsigned int action,
+                          unsigned int reasonFlags,
+                          const ResolvedName& playerName,
+                          bool useIntroName,
+                          char* buffer,
+                          size_t bufferLen,
+                          int& outPriority,
+                          const char** outNameSource,
+                          const char** outCategory) {
+    if (!buffer || bufferLen == 0) return false;
+    buffer[0] = '\0';
+
+    outPriority = 93;
+    if (outNameSource) *outNameSource = "discourse";
+    if (action == 1) {
+        sprintf_s(buffer, bufferLen, "%s has the flag.", WatchedSubjectTitle(playerName, useIntroName));
+        if (outCategory) *outCategory = "flag-take";
+    } else if (action == 2 && (reasonFlags & STREAMER_FLAG_REASON_SCORE) != 0) {
+        sprintf_s(buffer, bufferLen, "%s scores.", WatchedSubjectTitle(playerName, useIntroName));
+        outPriority = 100;
+        if (outCategory) *outCategory = "flag-score";
+    } else if (action == 2) {
+        sprintf_s(buffer, bufferLen, "%s drops it.", WatchedSubjectTitle(playerName, useIntroName));
+        outPriority = 94;
+        if (outCategory) *outCategory = "flag-drop";
+    } else if (action == 3) {
+        sprintf_s(buffer, bufferLen, "%s returns it.", WatchedSubjectTitle(playerName, useIntroName));
+        outPriority = 94;
+        if (outCategory) *outCategory = "flag-return";
+    } else {
+        return false;
+    }
+
+    return buffer[0] != '\0';
+}
+
 float ActiveAlphaLocked(DWORD now) {
     if (!g_active.active) return 0.0f;
 
@@ -406,6 +644,86 @@ bool IsGeneralGameStateCategory(const std::string& category) {
     return category.find("game-") == 0;
 }
 
+bool IsDeathOrKillCategory(const std::string& category) {
+    return category.find("kill") != std::string::npos
+        || category.find("death") != std::string::npos
+        || category == "suicide"
+        || category == "teamkill";
+}
+
+bool IsKnownUnavailableSubject(int handle) {
+    if (handle == 0) return false;
+    PlayerLifeState life = PlayerLifeTracker_Get(handle);
+    if (life.status == PlayerLifeStatus::RecentlyDied) return true;
+    return life.deathTick != 0 && !PlayerLifeTracker_IsAlive(handle);
+}
+
+bool ShouldDropLineForLifeState(const PendingLine& line) {
+    if (line.category == "focus-death") return false;
+    if (IsDeathOrKillCategory(line.category)) return false;
+
+    if (line.subjectHandle != 0 && IsKnownUnavailableSubject(line.subjectHandle)) {
+        return true;
+    }
+    if (line.objectHandle != 0
+        && line.category.find("hit") != std::string::npos
+        && IsKnownUnavailableSubject(line.objectHandle)) {
+        return true;
+    }
+    return false;
+}
+
+bool IsSameDeathVictim(const ActiveLine& line, int victimHandle) {
+    return line.active && victimHandle != 0 && line.deathVictimHandle == victimHandle;
+}
+
+bool IsSameDeathVictim(const PendingLine& line, int victimHandle) {
+    return line.pending && victimHandle != 0 && line.deathVictimHandle == victimHandle;
+}
+
+void ClearRespawnedDeathAnnouncementsLocked(DWORD now) {
+    for (auto it = g_announcedDeathTicks.begin(); it != g_announcedDeathTicks.end();) {
+        PlayerLifeState life = PlayerLifeTracker_Get(it->first);
+        if (PlayerLifeTracker_IsAlive(it->first)
+            && life.status == PlayerLifeStatus::Alive
+            && life.lastConfirmedAliveTick != 0
+            && TickReached(life.lastConfirmedAliveTick, it->second)) {
+            CommentaryLog("death-dedupe-clear victim=%d announced=%lu alive=%lu now=%lu\n",
+                          it->first,
+                          it->second,
+                          life.lastConfirmedAliveTick,
+                          now);
+            it = g_announcedDeathTicks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool HasQueuedDeathLineLocked(int victimHandle) {
+    if (victimHandle <= 0) return false;
+    if (IsSameDeathVictim(g_active, victimHandle)) return true;
+    if (IsSameDeathVictim(g_pending, victimHandle)) return true;
+    for (const PendingLine& existing : g_targetBacklog) {
+        if (IsSameDeathVictim(existing, victimHandle)) return true;
+    }
+    return false;
+}
+
+bool IsDuplicateDeathLineLocked(const PendingLine& line) {
+    if (line.deathVictimHandle <= 0) return false;
+    if (HasQueuedDeathLineLocked(line.deathVictimHandle)) return true;
+
+    auto it = g_announcedDeathTicks.find(line.deathVictimHandle);
+    if (it == g_announcedDeathTicks.end()) return false;
+    return !PlayerLifeTracker_IsAlive(line.deathVictimHandle);
+}
+
+void MarkDeathAnnouncementLocked(const PendingLine& line, DWORD now) {
+    if (line.deathVictimHandle <= 0) return;
+    g_announcedDeathTicks[line.deathVictimHandle] = line.deathTick != 0 ? line.deathTick : now;
+}
+
 bool HasWatchedPlayerEventBacklogLocked() {
     if (g_pending.pending
         && (IsTargetBacklogCategory(g_pending.category) || g_pending.priority >= 85)) {
@@ -421,7 +739,10 @@ bool CanUseGeneralTemplate(const std::string& templateKey) {
 }
 
 void MarkGeneralTemplateUsedLocked(const PendingLine& line) {
-    if (!IsGeneralGameStateCategory(line.category)) return;
+    if (!IsGeneralGameStateCategory(line.category)
+        && line.category != "stable-flavor") {
+        return;
+    }
     g_lastGeneralCategory = line.category;
     if (!line.templateKey.empty()) {
         g_recentGeneralTemplates.push_back(line.templateKey);
@@ -433,6 +754,14 @@ void MarkGeneralTemplateUsedLocked(const PendingLine& line) {
 
 void MarkLineStartedLocked(const PendingLine& line, DWORD now) {
     g_lastGlobalLineStart = now;
+    if (line.subjectHandle != 0 && line.subjectHandle == g_discourse.subjectHandle) {
+        g_discourse.lastLineTick = now;
+    }
+    if (line.requiredTarget != 0 && line.requiredTarget == g_discourse.subjectHandle) {
+        g_discourse.lastLineTick = now;
+    }
+    MarkWatchedSubjectIntroducedLocked(line, now);
+    MarkDeathAnnouncementLocked(line, now);
     MarkGeneralTemplateUsedLocked(line);
     if (line.category.find("kill") != std::string::npos) {
         g_lastGlobalKillLine = now;
@@ -461,6 +790,15 @@ void MarkLineStartedLocked(const PendingLine& line, DWORD now) {
 void QueueTargetBacklogLocked(const PendingLine& line, DWORD now, const char* reason) {
     (void)now;
     if (line.text.empty()) return;
+    if (IsDuplicateDeathLineLocked(line)) {
+        CommentaryLog("drop-backlog seq=%llu category=%s victim=%d target=%d reason=duplicate-death text=%s\n",
+                      line.eventSequence,
+                      line.category.c_str(),
+                      line.deathVictimHandle,
+                      line.requiredTarget,
+                      line.text.c_str());
+        return;
+    }
     for (const PendingLine& existing : g_targetBacklog) {
         if (existing.eventSequence == line.eventSequence
             && existing.category == line.category) {
@@ -515,6 +853,9 @@ void ActivatePendingLocked(const PendingLine& line,
     g_active.objectHandle = line.objectHandle;
     g_active.eventSequence = line.eventSequence;
     g_active.cameraSwitchTolerant = line.cameraSwitchTolerant;
+    g_active.introducesSubject = line.introducesSubject;
+    g_active.deathVictimHandle = line.deathVictimHandle;
+    g_active.deathTick = line.deathTick;
     g_active.category = line.category;
     g_active.nameSource = line.nameSource;
     g_active.templateKey = line.templateKey;
@@ -539,10 +880,33 @@ void ActivatePendingLocked(const PendingLine& line,
                           activeCameraTarget,
                           g_active.nameSource.c_str(),
                           g_active.text.c_str());
+    CommentaryVoice_Queue(g_active.text.c_str(), g_active.priority, g_active.eventSequence);
 }
 
 void SetPendingLocked(const PendingLine& line, DWORD now, const char* reason) {
     if (line.text.empty()) return;
+    ClearRespawnedDeathAnnouncementsLocked(now);
+    if (IsDuplicateDeathLineLocked(line)) {
+        CommentaryLog("drop seq=%llu category=%s victim=%d target=%d cameraTarget=%d reason=duplicate-death text=%s\n",
+                      line.eventSequence,
+                      line.category.c_str(),
+                      line.deathVictimHandle,
+                      line.requiredTarget,
+                      g_lastContext.activeCameraTarget,
+                      line.text.c_str());
+        return;
+    }
+    if (ShouldDropLineForLifeState(line)) {
+        CommentaryLog("drop seq=%llu category=%s target=%d subject=%d object=%d cameraTarget=%d reason=life-state text=%s\n",
+                      line.eventSequence,
+                      line.category.c_str(),
+                      line.requiredTarget,
+                      line.subjectHandle,
+                      line.objectHandle,
+                      g_lastContext.activeCameraTarget,
+                      line.text.c_str());
+        return;
+    }
 
     if (g_active.active) {
         if (IsTargetBacklogCategory(line.category)
@@ -618,6 +982,15 @@ void PromoteTargetBacklogLocked(DWORD now, int activeCameraTarget, const char* s
                           line.activationTick,
                           line.expireTick,
                           now,
+                          line.text.c_str());
+            g_targetBacklog.erase(g_targetBacklog.begin() + i);
+        } else if (ShouldDropLineForLifeState(line)) {
+            CommentaryLog("drop-backlog seq=%llu category=%s requiredTarget=%d subject=%d object=%d reason=life-state text=%s\n",
+                          line.eventSequence,
+                          line.category.c_str(),
+                          line.requiredTarget,
+                          line.subjectHandle,
+                          line.objectHandle,
                           line.text.c_str());
             g_targetBacklog.erase(g_targetBacklog.begin() + i);
         } else {
@@ -1028,19 +1401,16 @@ bool BuildTeamRankStatLine(int handle,
     return buffer[0] != '\0';
 }
 
-bool BuildStatLine(int handle, std::string& outText, const char** outNameSource) {
+bool BuildStatLine(int handle, std::string& outText, const char** outNameSource, bool* outIntroducesSubject) {
+    if (outIntroducesSubject) *outIntroducesSubject = false;
     auto it = g_latestStats.find(handle);
     if (it == g_latestStats.end()) return false;
+    if (IsKnownUnavailableSubject(handle)) return false;
 
     const ServerTelemetryStatsDelta& stat = it->second;
-    int team = (stat.team == 0 || stat.team == 1) ? stat.team : IdentityTeamForHandle(handle);
-    ResolvedName name = ResolveNameWithRoleFallback(handle,
-                                                    stat.playerName,
-                                                    "stats-telemetry",
-                                                    team,
-                                                    "player",
-                                                    "watched player");
-    if (!name.ok) return false;
+    bool isFlagCarrier = IsKnownFlagCarrier(handle);
+    ResolvedName subjectName = ResolveWatchedSubjectName(handle, isFlagCarrier ? "carrier" : "player");
+    bool useIntroName = subjectName.ok && ShouldUseIntroNameForWatchedSubject(handle);
 
     std::vector<int> choices;
     if (stat.distanceMeters >= 400) choices.push_back(0);
@@ -1059,99 +1429,45 @@ bool BuildStatLine(int handle, std::string& outText, const char** outNameSource)
     int choice = choices[cursor % choices.size()];
     ++cursor;
 
-    char buffer[260] = {};
-    if ((cursor % 3) == 0
-        && BuildTeamRankStatLine(handle,
-                                 team,
-                                 name,
-                                 stat,
-                                 kills,
-                                 deaths,
-                                 cursor / 3,
-                                 buffer,
-                                 sizeof(buffer))) {
-        outText = buffer;
-        if (outNameSource) *outNameSource = name.source;
-        return !outText.empty();
-    }
-
-    buffer[0] = '\0';
+    char buffer[180] = {};
     switch (choice) {
-        case 0: {
-            int rank = MetricRank(stat.distanceMeters, &ServerTelemetryStatsDelta::distanceMeters);
-            sprintf_s(buffer,
-                      "%s has run %u m this round. %s legs on the server.",
-                      name.name,
-                      stat.distanceMeters,
-                      RankPhrase(rank));
+        case 0:
+            sprintf_s(buffer, "%s has been moving all round.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
-        }
         case 1:
-            sprintf_s(buffer,
-                      "%s dragged the flag %u m. The cardio is doing the carrying.",
-                      name.name,
-                      stat.flagDistanceMeters);
+            sprintf_s(buffer, "%s has been doing the flag cardio.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
         case 2:
-            sprintf_s(buffer,
-                      "%s has dealt %u damage. Subtle as a brick.",
-                      name.name,
-                      stat.totalDamage);
+            sprintf_s(buffer, "%s has been landing shots.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
-        case 3: {
-            unsigned int pct = AccuracyPercent(stat);
-            sprintf_s(buffer,
-                      "%s has %u%% accuracy. Not bad, suspiciously competent.",
-                      name.name,
-                      pct);
+        case 3:
+            sprintf_s(buffer, "%s is shooting clean enough.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
-        }
         case 4:
-            sprintf_s(buffer,
-                      "%s has %u teamkill%s. Put the safety back on.",
-                      name.name,
-                      stat.teamkills,
-                      stat.teamkills == 1 ? "" : "s");
+            sprintf_s(buffer, "%s may want to check the uniform before firing.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
         case 5:
-            sprintf_s(buffer,
-                      "%s stayed alive %u min. Cowardice with results.",
-                      name.name,
-                      stat.aliveTimeSec / 60);
+            sprintf_s(buffer, "%s is staying alive. Useful habit.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
         case 6:
-            sprintf_s(buffer,
-                      "%s has %u flag attempts. Persistence, or no short-term memory.",
-                      name.name,
-                      stat.flagAttempts);
+            sprintf_s(buffer, "%s keeps going back for the flag.", WatchedSubjectTitle(subjectName, useIntroName));
             break;
-        case 7: {
-            float kd = deaths == 0 ? static_cast<float>(kills) : static_cast<float>(kills) / static_cast<float>(deaths);
-            if (kd < 0.5f) {
-                sprintf_s(buffer,
-                          "%s has a %.1f KD. Get your shit together, %s.",
-                          name.name,
-                          kd,
-                          name.name);
-            } else if (kd >= 2.0f) {
-                sprintf_s(buffer,
-                          "%s has a %.1f KD. Annoying, but effective.",
-                          name.name,
-                          kd);
+        case 7:
+            if (kills > deaths) {
+                sprintf_s(buffer, "%s is winning his trades.", WatchedSubjectTitle(subjectName, useIntroName));
+            } else if (deaths > kills) {
+                sprintf_s(buffer, "%s needs a cleaner next fight.", WatchedSubjectTitle(subjectName, useIntroName));
             } else {
-                sprintf_s(buffer,
-                          "%s has a %.1f KD. Perfectly mid, professionally delivered.",
-                          name.name,
-                          kd);
+                sprintf_s(buffer, "%s is keeping it even.", WatchedSubjectTitle(subjectName, useIntroName));
             }
             break;
-        }
         default:
             return false;
     }
 
     outText = buffer;
-    if (outNameSource) *outNameSource = name.source;
+    if (outNameSource) *outNameSource = "discourse";
+    if (outIntroducesSubject && useIntroName) *outIntroducesSubject = true;
     return !outText.empty();
 }
 
@@ -1162,8 +1478,10 @@ bool BuildKillLine(const DirectorEvent& event,
                    std::string& outText,
                    int& outPriority,
                    const char** outNameSource,
-                   const char** outCategory) {
+                   const char** outCategory,
+                   bool* outIntroducesSubject) {
     if (event.victimHandle <= 0) return false;
+    if (outIntroducesSubject) *outIntroducesSubject = false;
 
     ServerTelemetryKillEvent kill = {};
     bool hasKill = ServerTelemetry_TryFindKill(event.killerHandle, event.victimHandle, event.rawTick, &kill);
@@ -1201,6 +1519,11 @@ bool BuildKillLine(const DirectorEvent& event,
                                                           victimIsFlagCarrier ? "carrier" : "defender",
                                                           event.victimHandle == activeCameraTarget ? "watched player" : (victimIsFlagCarrier ? "flag carrier" : "defender"));
 
+    bool targetKiller = IsWatchedSubject(event.killerHandle, activeCameraTarget);
+    bool targetVictim = IsWatchedSubject(event.victimHandle, activeCameraTarget);
+    bool useIntroName = (targetKiller || targetVictim)
+        && ShouldUseIntroNameForWatchedSubject(activeCameraTarget);
+
     bool recentCommentedKillerDied = !suicide
         && g_lastCommentedKill.valid
         && event.victimHandle == g_lastCommentedKill.killerHandle
@@ -1215,25 +1538,58 @@ bool BuildKillLine(const DirectorEvent& event,
         unsigned int variant = static_cast<unsigned int>(
             (event.sequence + static_cast<unsigned long long>(event.killerHandle)) % 5);
         if (variant == 0) {
-            sprintf_s(buffer, "And he's gone. %s kills him right back.", killerName.name);
+            sprintf_s(buffer, "%s kills %s right back.", killerName.name, WatchedObject(victimName, useIntroName));
         } else if (variant == 1) {
-            sprintf_s(buffer, "And he just got killed by %s. Short victory lap.", killerName.name);
+            sprintf_s(buffer, "%s just got killed by %s. Short victory lap.", WatchedSubjectTitle(victimName, useIntroName), killerName.name);
         } else if (variant == 2) {
-            sprintf_s(buffer, "Nice kill, shame about immediately dying to %s.", killerName.name);
+            if (useIntroName && victimName.ok) {
+                sprintf_s(buffer, "Nice kill, shame about %s immediately dying to %s.", victimName.name, killerName.name);
+            } else {
+                sprintf_s(buffer, "Nice kill, shame about immediately dying to %s.", killerName.name);
+            }
         } else if (variant == 3) {
-            sprintf_s(buffer, "%s trades him out. Celebration cancelled.", killerName.name);
+            sprintf_s(buffer, "%s trades %s out. Celebration cancelled.", killerName.name, WatchedObject(victimName, useIntroName));
         } else {
-            sprintf_s(buffer, "And there goes the hero. %s shuts that down.", killerName.name);
+            if (useIntroName && victimName.ok) {
+                sprintf_s(buffer, "And there goes %s. %s shuts that down.", victimName.name, killerName.name);
+            } else {
+                sprintf_s(buffer, "And there goes the hero. %s shuts that down.", killerName.name);
+            }
         }
         outText = buffer;
         outPriority = 96;
         if (outNameSource) *outNameSource = killerName.source;
         if (outCategory) *outCategory = "post-kill-death";
         g_lastCommentedKill.valid = false;
+        if (outIntroducesSubject && event.victimHandle == activeCameraTarget && useIntroName) {
+            *outIntroducesSubject = true;
+        }
         return !outText.empty();
     }
 
+    char buffer[320] = {};
     unsigned int rapidKills = UpdateRapidKillCount(event, hasKill ? &kill : nullptr);
+    if (watchedTargetInvolved
+        && FormatTargetKillLine(event,
+                                suicide,
+                                targetKiller,
+                                targetVictim,
+                                victimIsFlagCarrier,
+                                killerName,
+                                victimName,
+                                useIntroName,
+                                buffer,
+                                sizeof(buffer),
+                                outPriority,
+                                outNameSource,
+                                outCategory)) {
+        outText = buffer;
+        if (outIntroducesSubject && useIntroName) {
+            *outIntroducesSubject = true;
+        }
+        return !outText.empty();
+    }
+
     ServerTelemetryAchievementEvent achievement = {};
     bool hasAchievement = ServerTelemetry_TryFindAchievement(event.killerHandle, event.rawTick, &achievement);
     unsigned int achievementId = hasAchievement ? achievement.achievementId : 0;
@@ -1241,10 +1597,9 @@ bool BuildKillLine(const DirectorEvent& event,
         achievementId = rapidKills == 2 ? 1 : (rapidKills == 3 ? 2 : 0);
     }
 
-    char buffer[320] = {};
     outPriority = 45;
     if (victimIsFlagCarrier && event.killerHandle > 0 && killerName.ok && victimName.ok) {
-        sprintf_s(buffer, "%s kills the flag carrier %s", killerName.name, victimName.name);
+        sprintf_s(buffer, "%s stops %s.", killerName.name, victimName.name);
         outPriority = 100;
         if (outNameSource) *outNameSource = killerName.source;
         if (outCategory) *outCategory = "flag-carrier-kill";
@@ -1290,7 +1645,7 @@ bool BuildKillLine(const DirectorEvent& event,
         } else if (headshot) {
             if (killerIsFlagCarrier) {
                 sprintf_s(buffer,
-                          "%s headshots %s while carrying the flag. Absolute Rambo nonsense.",
+                          "%s drops %s. Still has the flag.",
                           killerName.name,
                           victimName.name);
                 outPriority = 95;
@@ -1304,17 +1659,9 @@ bool BuildKillLine(const DirectorEvent& event,
             if (!watchedTargetInvolved && !ShouldEmitNormalKill(event, now)) {
                 return false;
             }
-            if (killerIsFlagCarrier && weapon) {
+            if (killerIsFlagCarrier) {
                 sprintf_s(buffer,
-                          "%s kills %s with %s while carrying the flag. Rambo with paperwork.",
-                          killerName.name,
-                          victimName.name,
-                          weapon);
-                if (outCategory) *outCategory = "flag-carrier-kill-dealt";
-                outPriority = 95;
-            } else if (killerIsFlagCarrier) {
-                sprintf_s(buffer,
-                          "%s kills %s while carrying the flag. Rambo called, he approves.",
+                          "%s gets %s. Still has the flag.",
                           killerName.name,
                           victimName.name);
                 if (outCategory) *outCategory = "flag-carrier-kill-dealt";
@@ -1412,10 +1759,13 @@ bool InferFlagActionForLine(const DirectorEvent& event,
 }
 
 bool BuildFlagLine(const DirectorEvent& event,
+                   int activeCameraTarget,
                    std::string& outText,
                    int& outPriority,
                    const char** outNameSource,
-                   const char** outCategory) {
+                   const char** outCategory,
+                   bool* outIntroducesSubject) {
+    if (outIntroducesSubject) *outIntroducesSubject = false;
     unsigned int action = 0;
     int playerHandle = 0;
     int playerTeam = -1;
@@ -1442,6 +1792,25 @@ bool BuildFlagLine(const DirectorEvent& event,
 
     char buffer[220] = {};
     outPriority = 92;
+    bool useIntroName = IsWatchedSubject(playerHandle, activeCameraTarget)
+        && ShouldUseIntroNameForWatchedSubject(activeCameraTarget);
+    if (IsWatchedSubject(playerHandle, activeCameraTarget)
+        && FormatTargetFlagLine(action,
+                                event.flagReasonFlags,
+                                playerName,
+                                useIntroName,
+                                buffer,
+                                sizeof(buffer),
+                                outPriority,
+                                outNameSource,
+                                outCategory)) {
+        outText = buffer;
+        if (outIntroducesSubject && useIntroName) {
+            *outIntroducesSubject = true;
+        }
+        return !outText.empty();
+    }
+
     if (action == 1) {
         auto statIt = g_latestStats.find(playerHandle);
         unsigned int flagAttempts = statIt != g_latestStats.end() ? statIt->second.flagAttempts : 0;
@@ -1562,27 +1931,125 @@ bool BuildFlagLoopLine(const CommentaryCameraContext& context,
     unsigned int variant = (now / 1000 + handle) % 4;
     if (camping) {
         if (variant % 2 == 0) {
-            sprintf_s(buffer, "%s is camping with the flag. Bold choice, if boredom is the plan.", name.name);
+            sprintf_s(buffer, "Still holding the flag, mostly by standing still.");
         } else {
-            sprintf_s(buffer, "%s has the flag and has stopped moving. Terrific, a hostage situation.", name.name);
+            sprintf_s(buffer, "Still sitting on the flag. Bold clock management.");
         }
     } else if (moving) {
         if (variant == 0) {
-            sprintf_s(buffer, "%s is running with the flag", name.name);
+            sprintf_s(buffer, "Still moving with the flag.");
         } else if (variant == 1) {
-            sprintf_s(buffer, "%s is running with the flag like cardio pays rent.", name.name);
+            sprintf_s(buffer, "Still moving with the flag.");
         } else if (variant == 2) {
-            sprintf_s(buffer, "%s still has the flag. The defense may want to wake up.", name.name);
+            sprintf_s(buffer, "Still holding the flag.");
         } else {
-            sprintf_s(buffer, "%s is dragging the flag across the map. Subtle work.", name.name);
+            sprintf_s(buffer, "%s is still dragging the flag across the map.", SubjectPronounTitle());
         }
     } else {
-        sprintf_s(buffer, "%s has the flag. Move it or frame it, your call.", name.name);
+        sprintf_s(buffer, "%s has the flag.", SubjectPronounTitle());
     }
 
     outText = buffer;
-    if (outNameSource) *outNameSource = name.source;
+    if (outNameSource) *outNameSource = "discourse";
     g_nextFlagLoopTick[handle] = now + NextFlagLoopDelay(now, handle);
+    return !outText.empty();
+}
+
+bool BuildStableWatchedPlayerFlavorLine(const CommentaryCameraContext& context,
+                                        std::string& outText,
+                                        const char** outNameSource,
+                                        std::string& outTemplateKey,
+                                        bool* outIntroducesSubject) {
+    if (outIntroducesSubject) *outIntroducesSubject = false;
+    int handle = context.activeCameraTarget;
+    if (handle == 0 || !context.targetAlive || context.targetRecentlyDied) return false;
+    if (IsKnownUnavailableSubject(handle)) return false;
+    if (HasWatchedPlayerEventBacklogLocked()) return false;
+
+    DWORD now = context.currentTick;
+    DWORD since = context.targetSinceTick != 0 ? context.targetSinceTick : g_discourse.subjectSinceTick;
+    if (since == 0 || !TickReached(now, since + kStableFlavorStableTargetMs)) return false;
+    if (g_discourse.lastFlavorTick != 0
+        && !TickReached(now, g_discourse.lastFlavorTick + kStableFlavorMinIntervalMs)) {
+        return false;
+    }
+
+    bool isFlagCarrier = handle == context.usCarrier || handle == context.vcCarrier;
+    bool camping = (handle == context.usCarrier && context.usCarrierCamping)
+        || (handle == context.vcCarrier && context.vcCarrierCamping);
+    bool moving = (handle == context.usCarrier && context.usCarrierMoving)
+        || (handle == context.vcCarrier && context.vcCarrierMoving);
+
+    const char* category = isFlagCarrier ? "stable-flag" : "stable-player";
+    unsigned int variant = static_cast<unsigned int>((now / 1000 + handle * 17) % 5);
+    ResolvedName subjectName = ResolveWatchedSubjectName(handle, isFlagCarrier ? "carrier" : "player");
+    bool useIntroName = subjectName.ok && ShouldUseIntroNameForWatchedSubject(handle);
+
+    char key[64] = {};
+    sprintf_s(key, "%s:%u", category, variant);
+    if (!CanUseGeneralTemplate(key)) return false;
+
+    char buffer[220] = {};
+    if (isFlagCarrier && camping) {
+        if (variant % 2 == 0) {
+            if (useIntroName) {
+                sprintf_s(buffer, "%s is holding the flag, mostly by standing still.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Still holding the flag, mostly by standing still.");
+            }
+        } else {
+            if (useIntroName) {
+                sprintf_s(buffer, "%s is sitting on the flag. Bold clock management.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Still sitting on the flag. Bold clock management.");
+            }
+        }
+    } else if (isFlagCarrier && moving) {
+        if (variant == 0) {
+            if (useIntroName) {
+                sprintf_s(buffer, "%s is moving with the flag.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Still moving with the flag.");
+            }
+        } else if (variant == 1) {
+            if (useIntroName) {
+                sprintf_s(buffer, "%s is still holding the flag. The defense has paperwork now.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Still holding the flag. The defense has paperwork now.");
+            }
+        } else {
+            sprintf_s(buffer, "%s is still dragging the flag across the map.", WatchedSubjectTitle(subjectName, useIntroName));
+        }
+    } else {
+        if (variant == 0) {
+            sprintf_s(buffer, "%s is still alive, which is already above average.", WatchedSubjectTitle(subjectName, useIntroName));
+        } else if (variant == 1) {
+            if (useIntroName) {
+                sprintf_s(buffer, "Still on %s. Quiet stretch, dangerous stretch.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Still on him. Quiet stretch, dangerous stretch.");
+            }
+        } else if (variant == 2) {
+            sprintf_s(buffer, "%s is rotating without making it everyone's problem.", WatchedSubjectTitle(subjectName, useIntroName));
+        } else if (variant == 3) {
+            if (useIntroName) {
+                sprintf_s(buffer, "Still watching %s look for the next mistake.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Still watching him look for the next mistake.");
+            }
+        } else {
+            if (useIntroName) {
+                sprintf_s(buffer, "%s has nothing flashy yet. That usually means trouble is loading.", subjectName.name);
+            } else {
+                sprintf_s(buffer, "Nothing flashy yet. That usually means trouble is loading.");
+            }
+        }
+    }
+
+    outText = buffer;
+    outTemplateKey = key;
+    if (outNameSource) *outNameSource = "discourse";
+    if (outIntroducesSubject && useIntroName) *outIntroducesSubject = true;
     return !outText.empty();
 }
 
@@ -2031,6 +2498,7 @@ bool QueueTargetKillTelemetryLocked(const CommentaryCameraContext& context,
     int target = context.activeCameraTarget;
     if (target == 0 || kill.sequence == 0) return false;
     if (kill.killerId != target && kill.victimId != target) return false;
+    if ((!context.targetAlive || context.targetRecentlyDied) && kill.victimId != target) return false;
     if (g_liveKillLineSequences.find(kill.sequence) != g_liveKillLineSequences.end()) return false;
 
     DWORD eventTick = kill.receivedTick != 0 ? kill.receivedTick : kill.eventTick;
@@ -2048,6 +2516,7 @@ bool QueueTargetKillTelemetryLocked(const CommentaryCameraContext& context,
     int priority = 0;
     const char* nameSource = "none";
     const char* category = "target-kill";
+    bool introducesSubject = false;
     if (!BuildKillLine(event,
                        now,
                        target,
@@ -2055,7 +2524,8 @@ bool QueueTargetKillTelemetryLocked(const CommentaryCameraContext& context,
                        text,
                        priority,
                        &nameSource,
-                       &category)) {
+                       &category,
+                       &introducesSubject)) {
         return false;
     }
 
@@ -2079,6 +2549,9 @@ bool QueueTargetKillTelemetryLocked(const CommentaryCameraContext& context,
     line.subjectHandle = kill.killerId;
     line.objectHandle = kill.victimId;
     line.eventSequence = kill.sequence;
+    line.introducesSubject = introducesSubject;
+    line.deathVictimHandle = kill.victimId;
+    line.deathTick = kill.eventTick != 0 ? kill.eventTick : line.activationTick;
     line.cameraSwitchTolerant = targetDied;
     line.category = std::string("target-") + category;
     line.nameSource = nameSource;
@@ -2098,6 +2571,7 @@ bool QueueTargetHitTelemetryLocked(const CommentaryCameraContext& context,
                                    DWORD now) {
     int target = context.activeCameraTarget;
     if (target == 0 || hit.sequence == 0) return false;
+    if (!context.targetAlive || context.targetRecentlyDied) return false;
     if (hit.attackerId != target && hit.victimId != target) return false;
     if ((hit.flags & kHitFlagKill) != 0) return false;
     if (hit.damageHP < 15.0f) return false;
@@ -2128,94 +2602,21 @@ bool QueueTargetHitTelemetryLocked(const CommentaryCameraContext& context,
                                                           hit.victimId == target ? "watched player" : "target");
     if (!attackerName.ok || !victimName.ok) return false;
 
-    const char* weapon = hit.weaponName[0] ? hit.weaponName : nullptr;
-    unsigned int damage = static_cast<unsigned int>(hit.damageHP + 0.5f);
-    unsigned int distance = static_cast<unsigned int>(hit.distanceMeters + 0.5f);
     unsigned int variant = static_cast<unsigned int>((hit.sequence + static_cast<unsigned long long>(target)) % 4);
     bool targetIsFlagCarrier = target == context.usCarrier
         || target == context.vcCarrier
         || IsFlagShot(context.shotKind);
+    bool useIntroName = ShouldUseIntroNameForWatchedSubject(target);
 
     char buffer[260] = {};
-    if (targetIsFlagCarrier && targetAttacker) {
-        if (weapon && distance >= 20) {
-            sprintf_s(buffer,
-                      "%s tags %s for %u HP with %s while carrying the flag. Multitasking like a lunatic.",
-                      attackerName.name,
-                      victimName.name,
-                      damage,
-                      weapon);
-        } else {
-            sprintf_s(buffer,
-                      "%s hits %s for %u HP while carrying the flag. Rambo behavior, frankly.",
-                      attackerName.name,
-                      victimName.name,
-                      damage);
-        }
-    } else if (targetIsFlagCarrier) {
-        if (weapon) {
-            sprintf_s(buffer,
-                      "%s is attacked by %s while carrying the flag, eating %u HP from %s.",
-                      victimName.name,
-                      attackerName.name,
-                      damage,
-                      weapon);
-        } else {
-            sprintf_s(buffer,
-                      "%s is attacked by %s while carrying the flag. %u HP gone, lovely.",
-                      victimName.name,
-                      attackerName.name,
-                      damage);
-        }
-    } else if (targetAttacker) {
-        if (weapon && distance >= 25) {
-            sprintf_s(buffer,
-                      "%s tags %s for %u HP with %s from %u m.",
-                      attackerName.name,
-                      victimName.name,
-                      damage,
-                      weapon,
-                      distance);
-        } else if (variant == 0) {
-            sprintf_s(buffer,
-                      "%s chunks %s for %u HP. Rude but productive.",
-                      attackerName.name,
-                      victimName.name,
-                      damage);
-        } else if (variant == 1) {
-            sprintf_s(buffer,
-                      "%s hits %s for %u HP. Keep bullying that health bar.",
-                      attackerName.name,
-                      victimName.name,
-                      damage);
-        } else {
-            sprintf_s(buffer,
-                      "%s lands %u damage on %s.",
-                      attackerName.name,
-                      damage,
-                      victimName.name);
-        }
-    } else {
-        if (weapon) {
-            sprintf_s(buffer,
-                      "%s just ate %u HP from %s's %s.",
-                      victimName.name,
-                      damage,
-                      attackerName.name,
-                      weapon);
-        } else if (variant == 0) {
-            sprintf_s(buffer,
-                      "%s gets tagged for %u HP by %s. That one counted.",
-                      victimName.name,
-                      damage,
-                      attackerName.name);
-        } else {
-            sprintf_s(buffer,
-                      "%s hits %s for %u HP. Not ideal.",
-                      attackerName.name,
-                      victimName.name,
-                      damage);
-        }
+    if (!FormatTargetHitLine(targetAttacker,
+                             attackerName,
+                             victimName,
+                             useIntroName,
+                             variant,
+                             buffer,
+                             sizeof(buffer))) {
+        return false;
     }
 
     PendingLine line = {};
@@ -2228,6 +2629,7 @@ bool QueueTargetHitTelemetryLocked(const CommentaryCameraContext& context,
     line.subjectHandle = hit.attackerId;
     line.objectHandle = hit.victimId;
     line.eventSequence = hit.sequence;
+    line.introducesSubject = useIntroName;
     line.category = targetIsFlagCarrier
         ? (targetAttacker ? "target-flag-carrier-hit-dealt" : "target-flag-carrier-hit-taken")
         : (targetAttacker ? "target-hit-dealt" : "target-hit-taken");
@@ -2248,6 +2650,7 @@ bool QueueTargetFlagTelemetryLocked(const CommentaryCameraContext& context,
                                     DWORD now) {
     int target = context.activeCameraTarget;
     if (target == 0 || flag.sequence == 0 || flag.playerId != target) return false;
+    if (!context.targetAlive || context.targetRecentlyDied) return false;
     if (g_liveFlagLineSequences.find(flag.sequence) != g_liveFlagLineSequences.end()) return false;
 
     DWORD eventTick = flag.receivedTick != 0 ? flag.receivedTick : flag.eventTick;
@@ -2265,7 +2668,8 @@ bool QueueTargetFlagTelemetryLocked(const CommentaryCameraContext& context,
     int priority = 0;
     const char* nameSource = "none";
     const char* category = "target-flag";
-    if (!BuildFlagLine(event, text, priority, &nameSource, &category)) {
+    bool introducesSubject = false;
+    if (!BuildFlagLine(event, target, text, priority, &nameSource, &category, &introducesSubject)) {
         return false;
     }
 
@@ -2277,6 +2681,7 @@ bool QueueTargetFlagTelemetryLocked(const CommentaryCameraContext& context,
     line.priority = priority < 93 ? 93 : priority;
     line.subjectHandle = flag.playerId;
     line.eventSequence = flag.sequence;
+    line.introducesSubject = introducesSubject;
     line.category = std::string("target-") + category;
     line.nameSource = nameSource;
     line.text = text;
@@ -2300,6 +2705,7 @@ bool QueueTargetAchievementTelemetryLocked(const CommentaryCameraContext& contex
         || achievement.achievementId == 0) {
         return false;
     }
+    if (!context.targetAlive || context.targetRecentlyDied) return false;
     if (g_liveAchievementLineSequences.find(achievement.sequence) != g_liveAchievementLineSequences.end()) {
         return false;
     }
@@ -2314,21 +2720,15 @@ bool QueueTargetAchievementTelemetryLocked(const CommentaryCameraContext& contex
         return false;
     }
 
-    ResolvedName name = ResolveNameWithRoleFallback(target,
-                                                    achievement.playerName,
-                                                    "achievement-telemetry",
-                                                    achievement.playerTeam,
-                                                    "attacker",
-                                                    "watched player");
-    if (!name.ok) return false;
-
+    ResolvedName targetName = ResolveWatchedSubjectName(target, "player");
+    bool useIntroName = ShouldUseIntroNameForWatchedSubject(target);
     char buffer[220] = {};
     if (achievement.achievementId == 1) {
-        sprintf_s(buffer, "%s gets a double kill. The server noticed, unfortunately.", name.name);
+        sprintf_s(buffer, "%s gets a double kill. The server noticed.", WatchedSubjectTitle(targetName, useIntroName));
     } else if (achievement.achievementId == 2) {
-        sprintf_s(buffer, "%s gets a triple kill. Someone stop feeding him.", name.name);
+        sprintf_s(buffer, "%s gets a triple kill. Someone stop feeding him.", WatchedSubjectTitle(targetName, useIntroName));
     } else {
-        sprintf_s(buffer, "%s triggers achievement %u. Fancy little badge moment.", name.name, achievement.achievementId);
+        sprintf_s(buffer, "%s gets an achievement.", WatchedSubjectTitle(targetName, useIntroName));
     }
 
     PendingLine line = {};
@@ -2339,8 +2739,9 @@ bool QueueTargetAchievementTelemetryLocked(const CommentaryCameraContext& contex
     line.priority = 95;
     line.subjectHandle = target;
     line.eventSequence = achievement.sequence;
+    line.introducesSubject = useIntroName;
     line.category = "target-achievement";
-    line.nameSource = name.source;
+    line.nameSource = "discourse";
     line.text = buffer;
 
     g_liveAchievementLineSequences.insert(achievement.sequence);
@@ -2417,26 +2818,15 @@ bool TryQueueContextLineLocked(const CommentaryCameraContext& context) {
 
     std::string text;
     const char* nameSource = "none";
-    if (BuildFlagLoopLine(context, text, &nameSource)) {
-        PendingLine line = {};
-        line.pending = true;
-        line.activationTick = now;
-        line.expireTick = now + 1200;
-        line.requiredTarget = context.activeCameraTarget;
-        line.priority = 58;
-        line.subjectHandle = context.activeCameraTarget;
-        line.category = "flag-loop";
-        line.nameSource = nameSource;
-        line.text = text;
-        SetPendingLocked(line, now, "camera-context");
-        return true;
-    }
 
     if (TryQueueGameStateLineLocked(context)) {
         return true;
     }
 
     if (context.activeCameraTarget == 0) return false;
+    if (!context.targetAlive || context.targetRecentlyDied) return false;
+    if (IsKnownUnavailableSubject(context.activeCameraTarget)) return false;
+    if (HasWatchedPlayerEventBacklogLocked()) return false;
     if (context.activeCameraTarget != g_lastContextTarget) {
         g_lastContextTarget = context.activeCameraTarget;
         g_targetSinceTick = now;
@@ -2450,12 +2840,34 @@ bool TryQueueContextLineLocked(const CommentaryCameraContext& context) {
         return false;
     }
     if (g_nextStatTick != 0 && !TickReached(now, g_nextStatTick)) {
+        std::string flavorTemplateKey;
+        text.clear();
+        nameSource = "none";
+        bool introducesSubject = false;
+        if (BuildStableWatchedPlayerFlavorLine(context, text, &nameSource, flavorTemplateKey, &introducesSubject)) {
+            PendingLine line = {};
+            line.pending = true;
+            line.activationTick = now;
+            line.expireTick = now + 1200;
+            line.requiredTarget = context.activeCameraTarget;
+            line.priority = 40;
+            line.subjectHandle = context.activeCameraTarget;
+            line.introducesSubject = introducesSubject;
+            line.category = "stable-flavor";
+            line.nameSource = nameSource;
+            line.templateKey = flavorTemplateKey;
+            line.text = text;
+            SetPendingLocked(line, now, "camera-context-flavor");
+            g_discourse.lastFlavorTick = now;
+            return true;
+        }
         return false;
     }
 
     text.clear();
     nameSource = "none";
-    if (!BuildStatLine(context.activeCameraTarget, text, &nameSource)) {
+    bool introducesSubject = false;
+    if (!BuildStatLine(context.activeCameraTarget, text, &nameSource, &introducesSubject)) {
         g_nextStatTick = now + 5000;
         return false;
     }
@@ -2467,6 +2879,7 @@ bool TryQueueContextLineLocked(const CommentaryCameraContext& context) {
     line.requiredTarget = context.activeCameraTarget;
     line.priority = 35;
     line.subjectHandle = context.activeCameraTarget;
+    line.introducesSubject = introducesSubject;
     line.category = "stat-highlight";
     line.nameSource = nameSource;
     line.text = text;
@@ -2480,6 +2893,7 @@ bool TryQueueContextLineLocked(const CommentaryCameraContext& context) {
 void CommentaryEngine_Init(uintptr_t gameBase) {
     PlayerIdentityCache_Init(gameBase);
     CommentaryEngine_Reset();
+    CommentaryVoice_Init();
     CommentaryLog("initialized\n");
 }
 
@@ -2511,12 +2925,15 @@ void CommentaryEngine_Reset() {
     g_liveHitLineSequences.clear();
     g_liveFlagLineSequences.clear();
     g_liveAchievementLineSequences.clear();
+    g_announcedDeathTicks.clear();
     g_recentGeneralTemplates.clear();
     g_lastGeneralCategory.clear();
     g_lastTelemetryCacheTick = 0;
     g_lastCommentedKill = LastCommentedKill();
+    g_discourse = WatchedPlayerDiscourse();
     g_lastContext = CommentaryCameraContext();
     g_lastPublishedVisible = false;
+    CommentaryVoice_Reset();
 }
 
 void CommentaryEngine_UpdateScoreboard(const std::vector<PlayerInfo>& players) {
@@ -2581,14 +2998,17 @@ void CommentaryEngine_OnCommittedDirectorEvent(const DirectorEvent& event,
     std::lock_guard<std::mutex> lock(g_mutex);
     PlayerIdentityCache_Poll();
     RefreshTelemetryCachesLocked(now);
+    EnsureWatchedSubjectLocked(activeCameraTarget, now, 0);
+    ClearRespawnedDeathAnnouncementsLocked(now);
 
     std::string text;
     int priority = 0;
     const char* nameSource = "none";
     const char* category = "event";
+    bool introducesSubject = false;
     bool built = event.type == DirectorEventType::Kill
-        ? BuildKillLine(event, now, activeCameraTarget, shotKind, text, priority, &nameSource, &category)
-        : BuildFlagLine(event, text, priority, &nameSource, &category);
+        ? BuildKillLine(event, now, activeCameraTarget, shotKind, text, priority, &nameSource, &category, &introducesSubject)
+        : BuildFlagLine(event, activeCameraTarget, text, priority, &nameSource, &category, &introducesSubject);
     if (!built) {
         CommentaryLog("suppress seq=%llu type=%s target=%d cameraTarget=%d shot=%s reason=no-resolved-line\n",
                       event.sequence,
@@ -2625,6 +3045,11 @@ void CommentaryEngine_OnCommittedDirectorEvent(const DirectorEvent& event,
     line.subjectHandle = event.type == DirectorEventType::Kill ? event.killerHandle : event.flagPlayerHandle;
     line.objectHandle = event.type == DirectorEventType::Kill ? event.victimHandle : 0;
     line.eventSequence = event.sequence;
+    line.introducesSubject = introducesSubject;
+    if (event.type == DirectorEventType::Kill) {
+        line.deathVictimHandle = event.victimHandle;
+        line.deathTick = event.visibleTick != 0 ? event.visibleTick : activationTick;
+    }
     line.category = category;
     line.nameSource = nameSource;
     line.text = text;
@@ -2646,6 +3071,62 @@ void CommentaryEngine_OnCommittedDirectorEvent(const DirectorEvent& event,
     SetPendingLocked(line, now, nameSource);
 }
 
+void CommentaryEngine_OnFocusDeath(int victimHandle,
+                                   int killerHandle,
+                                   DWORD deathTick,
+                                   DWORD now) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    PlayerIdentityCache_Poll();
+
+    if (victimHandle <= 0) return;
+    if (now == 0) now = GetTickCount();
+    EnsureWatchedSubjectLocked(victimHandle, now, 0);
+    ClearRespawnedDeathAnnouncementsLocked(now);
+
+    ResolvedName killerName = ResolveNameWithRoleFallback(killerHandle,
+                                                          nullptr,
+                                                          nullptr,
+                                                          IdentityTeamForHandle(killerHandle),
+                                                          "attacker",
+                                                          "someone");
+    ResolvedName victimName = ResolveWatchedSubjectName(victimHandle, "player");
+    bool useIntroName = victimName.ok && ShouldUseIntroNameForWatchedSubject(victimHandle);
+
+    char buffer[220] = {};
+    unsigned int variant = static_cast<unsigned int>((now / 1000 + victimHandle * 13) % 4);
+    if (killerHandle > 0 && killerName.ok && variant % 2 == 0) {
+        sprintf_s(buffer, "%s got %s.", killerName.name, WatchedObject(victimName, useIntroName));
+    } else if (killerHandle > 0 && killerName.ok) {
+        sprintf_s(buffer, "%s got %s.", killerName.name, WatchedObject(victimName, useIntroName));
+    } else {
+        if (useIntroName) {
+            sprintf_s(buffer, "And %s is dead.", victimName.name);
+        } else {
+            sprintf_s(buffer, "And he's dead.");
+        }
+    }
+
+    PendingLine line = {};
+    line.pending = true;
+    line.activationTick = deathTick != 0 && TickReached(now, deathTick) ? now : deathTick;
+    if (line.activationTick == 0) line.activationTick = now;
+    line.expireTick = line.activationTick + 2500;
+    line.requiredTarget = victimHandle;
+    line.priority = 99;
+    line.subjectHandle = victimHandle;
+    line.objectHandle = killerHandle;
+    line.eventSequence = ++g_generalSequence;
+    line.cameraSwitchTolerant = true;
+    line.introducesSubject = useIntroName;
+    line.deathVictimHandle = victimHandle;
+    line.deathTick = deathTick != 0 ? deathTick : line.activationTick;
+    line.category = "focus-death";
+    line.nameSource = killerName.ok ? killerName.source : "life-tracker";
+    line.text = buffer;
+
+    SetPendingLocked(line, now, "focus-death");
+}
+
 void CommentaryEngine_Update(const CommentaryCameraContext& context) {
     std::lock_guard<std::mutex> lock(g_mutex);
     DWORD now = context.currentTick != 0 ? context.currentTick : GetTickCount();
@@ -2655,14 +3136,34 @@ void CommentaryEngine_Update(const CommentaryCameraContext& context) {
 
     PlayerIdentityCache_Poll();
     RefreshTelemetryCachesLocked(now);
+    ClearRespawnedDeathAnnouncementsLocked(now);
 
     if (g_lastContextTarget != current.activeCameraTarget) {
         g_lastContextTarget = current.activeCameraTarget;
         g_targetSinceTick = now;
     }
 
+    if (g_discourse.subjectHandle != current.activeCameraTarget) {
+        EnsureWatchedSubjectLocked(current.activeCameraTarget,
+                                   now,
+                                   current.targetSinceTick);
+    } else if (g_discourse.subjectHandle != 0
+               && g_discourse.lastLineTick != 0
+               && TickReached(now, g_discourse.lastLineTick + kSubjectSilenceResetMs)) {
+        g_discourse.introduced = false;
+        g_discourse.needsIntroName = true;
+    }
+
     if (g_active.active && !IsLineTargetStillActive(g_active, current.activeCameraTarget)) {
         ClearActiveLocked(now, "camera-target-changed");
+    } else if (g_active.active) {
+        PendingLine activeAsPending = {};
+        activeAsPending.subjectHandle = g_active.subjectHandle;
+        activeAsPending.objectHandle = g_active.objectHandle;
+        activeAsPending.category = g_active.category;
+        if (ShouldDropLineForLifeState(activeAsPending)) {
+            ClearActiveLocked(now, "life-state");
+        }
     }
 
     if (g_active.active) {
@@ -2684,6 +3185,14 @@ void CommentaryEngine_Update(const CommentaryCameraContext& context) {
                           g_pending.priority,
                           g_pending.nameSource.c_str(),
                           current.shotKind ? current.shotKind : "unknown",
+                          g_pending.text.c_str());
+            g_pending = PendingLine();
+        } else if (ShouldDropLineForLifeState(g_pending)) {
+            CommentaryLog("drop-pending seq=%llu category=%s requiredTarget=%d cameraTarget=%d reason=life-state text=%s\n",
+                          g_pending.eventSequence,
+                          g_pending.category.c_str(),
+                          g_pending.requiredTarget,
+                          current.activeCameraTarget,
                           g_pending.text.c_str());
             g_pending = PendingLine();
         } else if (TickReached(now, g_pending.expireTick)) {

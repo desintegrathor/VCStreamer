@@ -1,6 +1,7 @@
 #include "SpectatorController.h"
 #include "CommentaryEngine.h"
 #include "DiagnosticsLog.h"
+#include "PlayerLifeTracker.h"
 #include <mutex>
 
 static uintptr_t baseGame = 0;
@@ -52,6 +53,7 @@ void UpdateScoreboard(const std::vector<PlayerInfo>& players) {
             continue;
         currentPlayers.push_back(p);
     }
+    PlayerLifeTracker_UpdateFromScoreboard(currentPlayers);
     CommentaryEngine_UpdateScoreboard(currentPlayers);
 }
 

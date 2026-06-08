@@ -6,6 +6,7 @@
 #include "DiagnosticsLog.h"
 #include "DroneCamera.h"
 #include "PathGrid.h"
+#include "PlayerLifeTracker.h"
 #include "ServerTelemetry.h"
 #include "ServerStateSniffer.h"
 #include "SpectatedPlayerData.h"
@@ -40,6 +41,7 @@ static constexpr float NORMAL_SHOT_MAX_HOLD_SEC = 18.0f;
 static constexpr float FLAG_ALTERNATE_MIN_SEC = 8.0f;
 static constexpr float FLAG_ALTERNATE_MAX_SEC = 12.0f;
 static constexpr DWORD FLAG_SCORE_POST_HOLD_MS = 3000;
+static constexpr DWORD FOCUS_DEATH_HOLD_MS = 1800;
 
 // KillCam state
 static KillCamPhase g_killCamPhase = KillCamPhase::Wait;
@@ -138,6 +140,10 @@ static CamBudgetType g_committedPreference = CAM_WORLD;
 static std::vector<PendingDirectorEvent> g_eventQueue;
 static DWORD g_currentInvalidSince = 0;
 static unsigned long long g_compatEventSequence = 0;
+static int g_focusDeathTargetHandle = 0;
+static int g_focusDeathKillerHandle = 0;
+static DWORD g_focusDeathTick = 0;
+static DWORD g_focusDeathHoldUntil = 0;
 
 constexpr DWORD KILL_EVENT_STALE_GRACE_MS = 3000;
 constexpr DWORD FLAG_EVENT_STALE_GRACE_MS = 30000;
@@ -241,6 +247,10 @@ static bool CD_IsUsablePlayerEntry(void* entry) {
 
 static bool CD_IsUsablePlayerHandle(int handle) {
     return CD_IsUsablePlayerEntry(CD_FindPlayerEntryByHandle(handle));
+}
+
+static bool CD_IsAliveUsablePlayerHandle(int handle) {
+    return CD_IsUsablePlayerHandle(handle) && PlayerLifeTracker_IsAlive(handle);
 }
 
 struct PlayerLabel {
@@ -421,7 +431,7 @@ static void UpdateFlagCarrierMotionState(FlagCarrierMotion& motion,
                                          int handle,
                                          DWORD now,
                                          const char* label) {
-    if (handle == 0 || !CD_IsUsablePlayerHandle(handle)) {
+    if (handle == 0 || !CD_IsAliveUsablePlayerHandle(handle)) {
         if (motion.initialized) {
             motion = FlagCarrierMotion();
         }
@@ -498,7 +508,7 @@ static bool IsCurrentFlagCarrierHandle(int handle) {
 
 static bool IsUsableActiveFlagCarrier(int handle) {
     return IsCurrentFlagCarrierHandle(handle)
-        && CD_IsUsablePlayerHandle(handle)
+        && CD_IsAliveUsablePlayerHandle(handle)
         && !IsCampingFlagCarrier(handle);
 }
 
@@ -516,10 +526,10 @@ static FlagCarrierMotion* FlagMotionForHandle(int handle) {
 
 static int PickMovingFlagCarrierTarget() {
     bool usMoving = g_flagCarrierUS != 0
-        && CD_IsUsablePlayerHandle(g_flagCarrierUS)
+        && CD_IsAliveUsablePlayerHandle(g_flagCarrierUS)
         && !IsCampingFlagCarrier(g_flagCarrierUS);
     bool vcMoving = g_flagCarrierVC != 0
-        && CD_IsUsablePlayerHandle(g_flagCarrierVC)
+        && CD_IsAliveUsablePlayerHandle(g_flagCarrierVC)
         && !IsCampingFlagCarrier(g_flagCarrierVC);
 
     if (usMoving && vcMoving) {
@@ -543,6 +553,7 @@ static bool HasActiveAlternative(int avoidHandle) {
         if (!CD_IsUsablePlayerEntry(entry)) continue;
 
         int handle = *(int*)entry;
+        if (!PlayerLifeTracker_IsAlive(handle)) continue;
         if (handle == avoidHandle) continue;
         if (IsCampingFlagCarrier(handle)) continue;
         if (ActivityScoreForTableIndex(i, handle) >= 0.12f) {
@@ -571,6 +582,7 @@ static int PickRandomActivePlayer(int avoidHandle) {
         if (!CD_IsUsablePlayerEntry(entry)) continue;
 
         int handle = *(int*)entry;
+        if (!PlayerLifeTracker_IsAlive(handle)) continue;
         if (handle != avoidHandle) {
             Candidate candidate = { handle, ActivityScoreForTableIndex(i, handle) };
             if (IsCampingFlagCarrier(handle)) {
@@ -585,7 +597,7 @@ static int PickRandomActivePlayer(int avoidHandle) {
         candidates.swap(fallbackCandidates);
     }
 
-    if (candidates.empty() && avoidHandle != 0 && CD_IsUsablePlayerHandle(avoidHandle)) {
+    if (candidates.empty() && avoidHandle != 0 && CD_IsAliveUsablePlayerHandle(avoidHandle)) {
         return avoidHandle;
     }
     if (candidates.empty()) return 0;
@@ -658,7 +670,7 @@ static bool RollFpvForShot() {
 }
 
 static bool CurrentViewUsable() {
-    if (!CD_IsUsablePlayerHandle(g_currentTargetHandle)) return false;
+    if (!CD_IsAliveUsablePlayerHandle(g_currentTargetHandle)) return false;
 
     int wcType = WorldCameraTracker_GetCurrentCamType();
     if (wcType == 0 || wcType == 1) {
@@ -1016,6 +1028,18 @@ static CommentaryCameraContext BuildCommentaryContext(DWORD now) {
     context.flagKillLookVictimHandle = g_flagKillLookVictimHandle;
     context.flagKillLookStartTick = g_flagKillLookStartTick;
     context.flagKillLookKillTick = g_flagKillLookKillTick;
+    context.targetSinceTick = g_currentHoldStart;
+    context.targetAlive = true;
+    context.targetRecentlyDied = false;
+    context.targetDeathKillerHandle = 0;
+    context.targetDeathTick = 0;
+    if (g_currentTargetHandle != 0) {
+        PlayerLifeState life = PlayerLifeTracker_Get(g_currentTargetHandle);
+        context.targetAlive = PlayerLifeTracker_IsAlive(g_currentTargetHandle);
+        context.targetRecentlyDied = life.status == PlayerLifeStatus::RecentlyDied;
+        context.targetDeathKillerHandle = life.killerHandle;
+        context.targetDeathTick = life.deathTick;
+    }
     return context;
 }
 
@@ -1231,6 +1255,10 @@ static void ClearCommittedShot(DWORD now, const char* reason) {
     g_shotHoldUntil = 0;
     g_currentShotUseFpv = false;
     g_currentInvalidSince = 0;
+    g_focusDeathTargetHandle = 0;
+    g_focusDeathKillerHandle = 0;
+    g_focusDeathTick = 0;
+    g_focusDeathHoldUntil = 0;
     g_kcStyle = KillCamStyle::BulletTravel;
     g_kcKillerHandle = 0;
     g_kcVictimHandle = 0;
@@ -1251,7 +1279,7 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
 
     switch (request.kind) {
         case ShotKind::FollowPlayer: {
-            if (!CD_IsUsablePlayerHandle(request.targetHandle)) return false;
+            if (!CD_IsAliveUsablePlayerHandle(request.targetHandle)) return false;
 
             g_state = CameraState::FollowPlayer;
             g_committedShotKind = ShotKind::FollowPlayer;
@@ -1282,7 +1310,7 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
         }
 
         case ShotKind::KillCam: {
-            if (!CD_IsUsablePlayerHandle(request.targetHandle)) return false;
+            if (!CD_IsAliveUsablePlayerHandle(request.targetHandle)) return false;
 
             g_state = CameraState::KillCam;
             g_committedShotKind = ShotKind::KillCam;
@@ -1363,7 +1391,7 @@ static bool CommitShot(const ShotRequest& request, DWORD now) {
         }
 
         case ShotKind::Drone: {
-            if (!CD_IsUsablePlayerHandle(request.targetHandle)) return false;
+            if (!CD_IsAliveUsablePlayerHandle(request.targetHandle)) return false;
             if (!IsDroneSuitableForTarget(request.targetHandle)) return false;
 
             if (DroneCamera_IsActive()) {
@@ -1496,7 +1524,7 @@ static bool RequestFlagWatchShot(int carrierHandle,
     if (carrierHandle != 0
         && g_state == CameraState::FlagWatch
         && g_currentTargetHandle == carrierHandle
-        && CD_IsUsablePlayerHandle(carrierHandle)) {
+        && CD_IsAliveUsablePlayerHandle(carrierHandle)) {
         return true;
     }
 
@@ -1567,7 +1595,7 @@ static bool TryStartFlagCampingGlimpse(DWORD now) {
     FlagCarrierMotion* motions[2] = { &g_flagMotionUS, &g_flagMotionVC };
     for (FlagCarrierMotion* motion : motions) {
         if (!motion->initialized || !motion->camping) continue;
-        if (!CD_IsUsablePlayerHandle(motion->handle)) continue;
+        if (!CD_IsAliveUsablePlayerHandle(motion->handle)) continue;
         if (now - motion->lastGlimpseTick < intervalMs) continue;
 
         CD_Log("[CameraDirector] Showing camping flag carrier briefly handle=%d\n",
@@ -1605,7 +1633,7 @@ static void CompleteKillCam(DWORD now) {
 
     CD_Log("[CameraDirector] KillCam ended\n");
 
-    if (CD_IsUsablePlayerHandle(nextTarget)) {
+    if (CD_IsAliveUsablePlayerHandle(nextTarget)) {
         RequestFollowPlayerShot(nextTarget,
                                 DebugModeForcesPlayerCamera() ? CAM_PLAYER : CAM_WORLD,
                                 true,
@@ -1663,7 +1691,7 @@ static CamBudgetType GetHighestDeficitType() {
 }
 
 static bool StartNextScheduledShot(DWORD now, const char* reason) {
-    int currentTarget = CD_IsUsablePlayerHandle(g_currentTargetHandle)
+    int currentTarget = CD_IsAliveUsablePlayerHandle(g_currentTargetHandle)
         && !IsCampingFlagCarrier(g_currentTargetHandle)
         ? g_currentTargetHandle
         : 0;
@@ -1883,6 +1911,9 @@ static bool ShouldSupersedePendingFlagEvent(const DirectorEvent& pending, const 
 static void QueueDirectorEvent(DirectorEvent event, const char* reason) {
     EnrichFlagEventForPlanning(event);
     AttachEventSnapshots(event);
+    if (event.type == DirectorEventType::Kill) {
+        PlayerLifeTracker_OnKill(event);
+    }
 
     if (ShouldDropDirectorEventForDebug(event)) {
         DWORD plannedStart = PlannedStartTickForEvent(event);
@@ -2108,7 +2139,7 @@ static bool CommitKillEvent(const DirectorEvent& event, DWORD now) {
                                        (style == KillCamStyle::DetachedVantage && hasFrozenVictimAimPoint)
                                            ? frozenVictimAimPoint
                                            : nullptr);
-    } else if (CD_IsUsablePlayerHandle(event.killerHandle)) {
+    } else if (CD_IsAliveUsablePlayerHandle(event.killerHandle)) {
         committed = RequestFollowPlayerShot(event.killerHandle,
                                             CAM_WORLD,
                                             false,
@@ -2440,6 +2471,126 @@ static bool PromoteQueuedEvents(DWORD now) {
     }
 }
 
+static bool RetargetAfterFocusDeath(DWORD now) {
+    int deadTarget = g_focusDeathTargetHandle;
+    int killer = g_focusDeathKillerHandle;
+
+    g_focusDeathTargetHandle = 0;
+    g_focusDeathKillerHandle = 0;
+    g_focusDeathTick = 0;
+    g_focusDeathHoldUntil = 0;
+
+    ClearCommittedShot(now, "focus death hold complete");
+
+    if (PromoteQueuedEvents(now)) {
+        TimingLog("[Director] focus-death-retarget dead=%d reason=pending-event now=%lu\n",
+                  deadTarget,
+                  now);
+        return true;
+    }
+
+    if (killer != 0
+        && killer != deadTarget
+        && CD_IsAliveUsablePlayerHandle(killer)) {
+        bool committed = RequestFollowPlayerShot(killer,
+                                                 DebugModeForcesPlayerCamera() ? CAM_PLAYER : CAM_WORLD,
+                                                 true,
+                                                 "focus death killer",
+                                                 now);
+        TimingLog("[Director] focus-death-retarget dead=%d target=%d reason=killer committed=%d now=%lu\n",
+                  deadTarget,
+                  killer,
+                  committed ? 1 : 0,
+                  now);
+        if (committed) return true;
+    }
+
+    int flagTarget = PickMovingFlagCarrierTarget();
+    if (flagTarget != 0
+        && flagTarget != deadTarget
+        && RequestFlagWatchShot(flagTarget, "focus death flag carrier", now, true)) {
+        TimingLog("[Director] focus-death-retarget dead=%d target=%d reason=flag now=%lu\n",
+                  deadTarget,
+                  flagTarget,
+                  now);
+        return true;
+    }
+
+    int picked = PickRandomActivePlayer(deadTarget);
+    if (picked != 0
+        && RequestFollowPlayerShot(picked,
+                                   DebugModeForcesPlayerCamera() ? CAM_PLAYER : CAM_WORLD,
+                                   true,
+                                   "focus death random alive",
+                                   now)) {
+        TimingLog("[Director] focus-death-retarget dead=%d target=%d reason=random-alive now=%lu\n",
+                  deadTarget,
+                  picked,
+                  now);
+        return true;
+    }
+
+    TimingLog("[Director] focus-death-retarget dead=%d reason=no-target now=%lu\n",
+              deadTarget,
+              now);
+    return false;
+}
+
+static bool HandleCurrentFocusDeath(DWORD now) {
+    if (g_currentTargetHandle == 0) return false;
+    if (g_state != CameraState::FollowPlayer
+        && g_state != CameraState::FlagWatch
+        && g_state != CameraState::Drone) {
+        return false;
+    }
+
+    PlayerLifeState life = PlayerLifeTracker_Get(g_currentTargetHandle);
+    if (life.status != PlayerLifeStatus::RecentlyDied
+        || life.deathTick == 0
+        || !TickReached(now, life.deathTick)) {
+        if (g_focusDeathTargetHandle == g_currentTargetHandle
+            && PlayerLifeTracker_IsAlive(g_currentTargetHandle)) {
+            g_focusDeathTargetHandle = 0;
+            g_focusDeathKillerHandle = 0;
+            g_focusDeathTick = 0;
+            g_focusDeathHoldUntil = 0;
+        }
+        return false;
+    }
+
+    if (g_focusDeathTargetHandle != g_currentTargetHandle
+        || g_focusDeathTick != life.deathTick) {
+        g_focusDeathTargetHandle = g_currentTargetHandle;
+        g_focusDeathKillerHandle = life.killerHandle;
+        g_focusDeathTick = life.deathTick;
+        g_focusDeathHoldUntil = life.deathTick + FOCUS_DEATH_HOLD_MS;
+        if (TickReached(now, g_focusDeathHoldUntil)) {
+            g_focusDeathHoldUntil = now + 700;
+        }
+        ExtendShotHoldTo(g_focusDeathHoldUntil);
+
+        CommentaryEngine_OnFocusDeath(g_focusDeathTargetHandle,
+                                      g_focusDeathKillerHandle,
+                                      g_focusDeathTick,
+                                      now);
+        TimingLog("[Director] focus-death target=%d killer=%d deathTick=%lu holdUntil=%lu state=%s now=%lu\n",
+                  g_focusDeathTargetHandle,
+                  g_focusDeathKillerHandle,
+                  g_focusDeathTick,
+                  g_focusDeathHoldUntil,
+                  ShotKindName(g_committedShotKind),
+                  now);
+        return true;
+    }
+
+    if (!TickReached(now, g_focusDeathHoldUntil)) {
+        return true;
+    }
+
+    RetargetAfterFocusDeath(now);
+    return true;
+}
+
 // ============================================================================
 // Event Processing
 // ============================================================================
@@ -2565,6 +2716,7 @@ void CameraDirector_Update() {
 
     DWORD now = GetTickCount();
     DrainSnifferEvents();
+    PlayerLifeTracker_UpdateFromFrame(now);
     if (g_flagScoreHoldTarget != 0 && !IsFlagScoreHoldActive(now)) {
         ClearFlagScoreHold(now, "expired");
     }
@@ -2572,6 +2724,11 @@ void CameraDirector_Update() {
 
     UpdatePlayerActivity(now);
     UpdateFlagCarrierMotion(now);
+    if (HandleCurrentFocusDeath(now)) {
+        CommentaryEngine_Update(BuildCommentaryContext(now));
+        g_lastUpdateTick = now;
+        return;
+    }
     CommentaryEngine_Update(BuildCommentaryContext(now));
 
     if (EnsureFlagScoreHoldCamera(now)) {
@@ -2708,7 +2865,7 @@ void CameraDirector_Update() {
         }
 
         case CameraState::Drone: {
-            if (!CD_IsUsablePlayerHandle(g_currentTargetHandle)) {
+            if (!CD_IsAliveUsablePlayerHandle(g_currentTargetHandle)) {
                 if (CurrentCommittedShotUsable(now)) {
                     break;
                 }
@@ -2727,7 +2884,7 @@ void CameraDirector_Update() {
         case CameraState::Idle: {
             bool noFlagPriority = IsDebugCameraModeActive()
                 || (g_flagCarrierUS == 0 && g_flagCarrierVC == 0);
-            bool currentTargetUsable = CD_IsUsablePlayerHandle(g_currentTargetHandle);
+            bool currentTargetUsable = CD_IsAliveUsablePlayerHandle(g_currentTargetHandle);
 
             if (noFlagPriority && !currentTargetUsable) {
                 if (CurrentCommittedShotUsable(now)) {
@@ -2847,6 +3004,7 @@ bool CameraDirector_GetFlagCarrierKillLookAimPoint(float out[3]) {
 
 void InitCameraDirector(uintptr_t gameBase) {
     g_gameBase = gameBase;
+    InitPlayerLifeTracker(gameBase);
     CommentaryEngine_Init(gameBase);
     srand((unsigned int)time(nullptr));
 
@@ -2868,6 +3026,10 @@ void InitCameraDirector(uintptr_t gameBase) {
     g_currentInvalidSince = 0;
     g_compatEventSequence = 0;
     g_currentShotUseFpv = false;
+    g_focusDeathTargetHandle = 0;
+    g_focusDeathKillerHandle = 0;
+    g_focusDeathTick = 0;
+    g_focusDeathHoldUntil = 0;
     g_kcStyle = KillCamStyle::BulletTravel;
     g_flagScoreHoldTarget = 0;
     g_flagScoreHoldUntil = 0;

@@ -26,6 +26,12 @@ struct CommentaryCameraContext {
     int flagKillLookVictimHandle = 0;
     DWORD flagKillLookStartTick = 0;
     DWORD flagKillLookKillTick = 0;
+
+    bool targetAlive = true;
+    bool targetRecentlyDied = false;
+    int targetDeathKillerHandle = 0;
+    DWORD targetDeathTick = 0;
+    DWORD targetSinceTick = 0;
 };
 
 void CommentaryEngine_Init(uintptr_t gameBase);
@@ -35,5 +41,9 @@ void CommentaryEngine_OnCommittedDirectorEvent(const DirectorEvent& event,
                                                DWORD now,
                                                int activeCameraTarget,
                                                const char* shotKind);
+void CommentaryEngine_OnFocusDeath(int victimHandle,
+                                   int killerHandle,
+                                   DWORD deathTick,
+                                   DWORD now);
 void CommentaryEngine_Update(const CommentaryCameraContext& context);
 bool CommentaryEngine_GetActiveLine(char* outText, size_t outTextLen, float* outAlpha);

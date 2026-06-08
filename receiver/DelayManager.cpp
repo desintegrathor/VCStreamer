@@ -153,6 +153,16 @@ int DelayManager::LoadDelayFromINI() {
                 outFile << "debug_camera_mode=auto\n";
                 outFile << "debug_only_victim_look_3pv=0\n";
                 outFile << "\n";
+                outFile << "[CommentaryVoice]\n";
+                outFile << "enabled=1\n";
+                outFile << "preset=radio\n";
+                outFile << "volume=85\n";
+                outFile << "voice=\n";
+                outFile << "rate=1\n";
+                outFile << "pitch_semitones=-2\n";
+                outFile << "interrupt_priority=90\n";
+                outFile << "queue_limit=3\n";
+                outFile << "\n";
                 outFile << "[YouTubeChat]\n";
                 outFile << "; Mirror YouTube live chat through authenticated VCHD streamer frames (0=off, 1=on)\n";
                 outFile << "enabled=0\n";
