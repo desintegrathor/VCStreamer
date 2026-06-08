@@ -156,6 +156,19 @@ std::deque<ServerTelemetryStatsDelta> g_stats;
 std::deque<ServerTelemetryFlagEvent> g_flags;
 std::deque<ServerTelemetryAchievementEvent> g_achievements;
 
+void ClearTelemetryCacheLocked() {
+    g_lastKillSeq = 0;
+    g_lastHitSeq = 0;
+    g_lastStatsSeq = 0;
+    g_lastFlagSeq = 0;
+    g_lastAchievementSeq = 0;
+    g_kills.clear();
+    g_hits.clear();
+    g_stats.clear();
+    g_flags.clear();
+    g_achievements.clear();
+}
+
 template <typename T>
 void PushBounded(std::deque<T>& queue, const T& value) {
     while (queue.size() >= MAX_CACHE_EVENTS) {
@@ -291,17 +304,8 @@ void InitServerTelemetry(uintptr_t gameBase) {
     (void)gameBase;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_started = true;
-    g_lastKillSeq = 0;
-    g_lastHitSeq = 0;
-    g_lastStatsSeq = 0;
-    g_lastFlagSeq = 0;
-    g_lastAchievementSeq = 0;
+    ClearTelemetryCacheLocked();
     g_lastEpoch = 0;
-    g_kills.clear();
-    g_hits.clear();
-    g_stats.clear();
-    g_flags.clear();
-    g_achievements.clear();
     DiagnosticsLog_Append("server_telemetry_debug.log", "[ServerTelemetry] initialized\n");
 }
 
@@ -316,21 +320,21 @@ void ServerTelemetry_Poll() {
     VchdFlagRecord flagRecords[32] = {};
     VchdAchievementRecord achievementRecords[32] = {};
 
-    g_api.isReady();
+    bool ready = g_api.isReady() != 0;
     unsigned int epoch = g_api.telemetryEpoch();
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        if (!ready) {
+            if (g_lastEpoch != 0) {
+                ClearTelemetryCacheLocked();
+                g_lastEpoch = 0;
+                DiagnosticsLog_Append("server_telemetry_debug.log",
+                    "[ServerTelemetry] VCHD not ready, cache cleared\n");
+            }
+            return;
+        }
         if (g_lastEpoch != 0 && epoch != 0 && epoch != g_lastEpoch) {
-            g_lastKillSeq = 0;
-            g_lastHitSeq = 0;
-            g_lastStatsSeq = 0;
-            g_lastFlagSeq = 0;
-            g_lastAchievementSeq = 0;
-            g_kills.clear();
-            g_hits.clear();
-            g_stats.clear();
-            g_flags.clear();
-            g_achievements.clear();
+            ClearTelemetryCacheLocked();
             DiagnosticsLog_Append("server_telemetry_debug.log",
                 "[ServerTelemetry] epoch changed %u -> %u, cache cleared\n",
                 g_lastEpoch,
